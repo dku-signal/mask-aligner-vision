@@ -1,0 +1,23 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Run outputs: camera snapshots can contain people's faces - never commit them
+out/
+
+# Large / generated
+dataset/
+runs/
+*.pt
+*.pth
+dataset.yaml
+
+# Firmware flash dumps (tools/flash.sh backups)
+*.hex
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/

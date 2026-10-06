@@ -1,0 +1,28 @@
+{
+  "SWAP_XY_COMMANDS": true,
+  "MOTOR_SIGN_X": 1,
+  "STEPS_PER_PIXEL_X": 197.5464,
+  "MOTOR_SIGN_Y": 1,
+  "STEPS_PER_PIXEL_Y": 223.2772,
+  "MAX_STEPS_PER_AXIS": 13396,
+  "DEAD_BAND_PX": 0.5,
+  "MANUAL_STEPS": 2233,
+  "_soft_limit_steps": 17862,
+  "_report": {
+    "X": {
+      "steps": 2560,
+      "px_per_step": 0.00448,
+      "image_axis": "Y",
+      "backlash_px": -0.048,
+      "skew_deg": 0.16
+    },
+    "Y": {
+      "steps": 2560,
+      "px_per_step": 0.00506,
+      "image_axis": "X",
+      "backlash_px": -0.009,
+      "skew_deg": 1.28
+    }
+  },
+  "_measured_at": "2026-10-02 12:31:37"
+}

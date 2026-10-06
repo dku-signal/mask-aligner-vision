@@ -1,0 +1,4 @@
+# Only for --detector sam2 / hybrid / opencv-sam2 (SAM2.1 hiera-small). Not needed for normal use.
+torch
+torchvision
+git+https://github.com/facebookresearch/sam2.git

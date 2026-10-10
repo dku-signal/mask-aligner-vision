@@ -67,7 +67,7 @@ Python 3.11 권장.
 
 **macOS**
 ```
-git clone https://github.com/ricky00-dev/mask-aligner-vision.git
+git clone https://github.com/dku-signal/mask-aligner-vision.git
 cd mask-aligner-vision
 python3.11 -m venv .venv
 .venv/bin/pip install -r requirements.txt
@@ -76,7 +76,7 @@ python3.11 -m venv .venv
 
 **Windows**
 ```
-git clone https://github.com/ricky00-dev/mask-aligner-vision.git
+git clone https://github.com/dku-signal/mask-aligner-vision.git
 cd mask-aligner-vision
 py -3.11 -m venv .venv
 .venv\Scripts\pip install -r requirements.txt

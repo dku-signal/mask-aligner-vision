@@ -22,14 +22,24 @@
 //   SPD <us>               set step half-period in us (min 100), reply "DONE"
 // Manual jog (team sketch letters), bounded by the soft limit and JOG_MAX_MS:
 //   F / B = X forward / backward,  f / b = Y forward / backward,  S = stop
-// T ... (theta) is answered "ERR T disabled": no theta motor on this build.
+// Theta servo (MG996R) on D30, same protocol as the 2026-09 firmware:
+//   T <id> <dir +1|-1> <ms 20..250> [speed_us 50..500]  turn, then neutral; reply "DONE T <id>"
+//   P <us 900..2100>     hold an absolute pulse width (positional-servo test); reply "DONE P <us>"
+// Any stop also returns the servo to neutral.
 
 #include <EEPROM.h>
+#include <Servo.h>
 
 const byte Y_STEP_PIN = 8;
 const byte Y_DIR_PIN = 9;
 const byte X_STEP_PIN = 10;
 const byte X_DIR_PIN = 11;
+
+const byte THETA_PIN = 30;
+const int THETA_NEUTRAL_US = 1500;
+const int THETA_SPEED_US = 100;
+const unsigned long THETA_MAX_MS = 250;
+Servo thetaServo;
 
 // Team sketch used 100 us half-period. Moves ramp down to it from RAMP_START_US
 // so the first steps are not lost.
@@ -80,6 +90,10 @@ void loadPosition() {
     posY = s.y;
     softLimit = s.limit;
   }
+}
+
+void thetaStop() {
+  thetaServo.writeMicroseconds(THETA_NEUTRAL_US);
 }
 
 void idlePins() {
@@ -187,10 +201,37 @@ void jog(Axis &a, int dir) {
   savePosition();
 }
 
+// T id dir ms [speed]: timed turn of a continuous-rotation servo, then neutral.
+void moveTheta(char *line) {
+  long id = 0, ms = 0, speed = THETA_SPEED_US;
+  int dir = 0;
+  char extra;
+  int fields = sscanf(line, "T %ld %d %ld %ld %c", &id, &dir, &ms, &speed, &extra);
+  if ((fields != 3 && fields != 4) || id <= 0 || (dir != 1 && dir != -1) ||
+      ms < 20 || ms > (long)THETA_MAX_MS || speed < 50 || speed > 500) {
+    thetaStop();
+    Serial.println("ERR T range");
+    return;
+  }
+  thetaServo.writeMicroseconds(THETA_NEUTRAL_US + dir * (int)speed);
+  unsigned long start = millis();
+  while (millis() - start < (unsigned long)ms) {
+    if (stopRequested()) {
+      thetaStop();
+      Serial.println("STOP");
+      return;
+    }
+  }
+  thetaStop();
+  Serial.print("DONE T ");
+  Serial.println(id);
+}
+
 void processLine(char *line) {
   long n = 0;
   char extra;
   if (strcmp(line, "STOP") == 0) {
+    thetaStop();
     Serial.println("STOP");
   } else if (strcmp(line, "PING") == 0) {
     Serial.println("PONG");
@@ -216,8 +257,16 @@ void processLine(char *line) {
     moveAxis(axisX, n);
   } else if (sscanf(line, "Y %ld %c", &n, &extra) == 1) {
     moveAxis(axisY, n);
-  } else if (line[0] == 'T' && (line[1] == ' ' || line[1] == 0)) {
-    Serial.println("ERR T disabled");
+  } else if (line[0] == 'T' && line[1] == ' ') {
+    moveTheta(line);
+  } else if (sscanf(line, "P %ld %c", &n, &extra) == 1) {
+    if (n >= 900 && n <= 2100) {
+      thetaServo.writeMicroseconds((int)n);
+      Serial.print("DONE P ");
+      Serial.println(n);
+    } else {
+      Serial.println("ERR P range");
+    }
   } else if (line[0] != 0) {
     Serial.print("ERR unknown ");
     Serial.println(line);
@@ -233,6 +282,8 @@ void setup() {
   digitalWrite(X_DIR_PIN, LOW);
   digitalWrite(Y_DIR_PIN, LOW);
   loadPosition();
+  thetaServo.writeMicroseconds(THETA_NEUTRAL_US);  // set before attach: no start-up twitch
+  thetaServo.attach(THETA_PIN);
   Serial.begin(9600);
   Serial.print("XY TB6560 READY pos X=");
   Serial.print(posX);
@@ -271,7 +322,10 @@ void loop() {
         else if (c == 'B') jog(axisX, -1);
         else if (c == 'f') jog(axisY, 1);
         else if (c == 'b') jog(axisY, -1);
-        else Serial.println("STOP");
+        else {
+          thetaStop();
+          Serial.println("STOP");
+        }
         continue;
       }
     }

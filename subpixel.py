@@ -158,6 +158,10 @@ def refine_cross(gray, valid, centre, size, angle):
 
 
 class PreciseKeys(CornerKeys):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.search_scale = 100.0  # whole frame: the wafer key may be anywhere in view
+
     def mask_geometry(self, gray):
         g = super().mask_geometry(gray)
         if g is None:

@@ -34,7 +34,11 @@ def find_disc(gray):
                                param1=80, param2=40, minRadius=int(.15*min(h, w)), maxRadius=int(.6*max(h, w)))
     if circles is None:
         return None
-    return max(circles[0], key=lambda c: c[2])
+    # The disc must be in view: centre inside the frame and not larger than the frame
+    # (2026-10-12: with the disc at the edge, Hough returned a frame-sized circle of
+    # static background and every rotation read 0.00 deg).
+    ok = [c for c in circles[0] if 0 <= c[0] < w and 0 <= c[1] < h and c[2] <= .5*min(h, w)]
+    return max(ok, key=lambda c: c[2]) if ok else None
 
 
 class Camera:
@@ -78,6 +82,7 @@ def main():
     ap.add_argument('--camera', type=int, default=0)
     ap.add_argument('--port', default=None)
     ap.add_argument('--speed', type=int, default=300, help='T pulse speed offset in us (firmware 50..500)')
+    ap.add_argument('--pause', type=float, default=2.0, help='seconds between commands, to watch the disc')
     args = ap.parse_args()
 
     import serial
@@ -88,12 +93,14 @@ def main():
     cam = Camera(args.camera)
     ref = cam.gray()
     disc = find_disc(ref.astype(np.uint8))
+    mask = None
     if disc is None:
-        raise SystemExit('wafer disc not found in the camera image')
-    cx, cy, r = disc
-    mask = np.zeros(ref.shape, np.uint8)
-    cv2.circle(mask, (int(cx), int(cy)), int(r*.9), 255, -1)  # stay inside the rim
-    print(f'disc at ({cx:.0f}, {cy:.0f}) r={r:.0f} px')
+        print('disc not fully in view: camera measurement SKIPPED - watch the disc by eye')
+    else:
+        cx, cy, r = disc
+        mask = np.zeros(ref.shape, np.uint8)
+        cv2.circle(mask, (int(cx), int(cy)), int(r*.9), 255, -1)  # stay inside the rim
+        print(f'disc at ({cx:.0f}, {cy:.0f}) r={r:.0f} px')
 
     ser = serial.Serial(port, 9600, timeout=.1)
     time.sleep(2.5)
@@ -110,9 +117,12 @@ def main():
 
     def measure(label, reply):
         time.sleep(.6)
-        a = rotation_deg(ref, cam.gray(), mask)
-        print(f'  {label:28s} {reply:14s} disc rotation {a:+7.2f} deg (vs start)')
-        return a
+        if mask is None:
+            print(f'  {label:28s} {reply:14s} (watch the disc)', flush=True)
+        else:
+            a = rotation_deg(ref, cam.gray(), mask)
+            print(f'  {label:28s} {reply:14s} disc rotation {a:+7.2f} deg (vs start)', flush=True)
+        time.sleep(args.pause)
 
     try:
         print('[1] positional test (P = hold pulse width)')

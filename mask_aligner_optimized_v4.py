@@ -36,6 +36,9 @@ class CornerKeys:
         self.bank_limit=max(0,int(cache_mb*1024*1024))
         self.bank_bytes=0
         self.token=None;self.shape=None
+        # Wafer search radius in mask sizes. Theta turns the disc, so the key can orbit
+        # far from the mask; PreciseKeys widens this to the whole frame.
+        self.search_scale=2.5
 
     @staticmethod
     def angle_delta(a,b):return (a-b+45)%90-45
@@ -167,7 +170,7 @@ class CornerKeys:
         valid=1-cv2.dilate(1-valid,np.ones((5,5),np.uint8))
         # Contrast, not absolute brightness, defines the wafer's dark cross/light corners.
         image=1-gray.astype(np.float32)/255
-        cx,cy=mask['center'];r=int(mask['size']*2.5)
+        cx,cy=mask['center'];r=int(mask['size']*self.search_scale)
         x0,y0=max(0,int(cx)-r),max(0,int(cy)-r)
         x1,y1=min(gray.shape[1],int(cx)+r),min(gray.shape[0],int(cy)+r)
         prior=self.previous_wafer
@@ -294,7 +297,7 @@ THETA_CONFIRM_FRAMES = 2
 THETA_JITTER_DEG = 1.5
 THETA_SETTLE_SEC = 0.35
 POST_MOVE_GUARD_SEC = 0.10
-THETA_MIN_MS = 20
+THETA_MIN_MS = 60  # MG996R + disc: pulses <= ~46 ms do not move it (theta_char, 2026-10-12)
 THETA_MAX_MS = 250  # must not exceed firmware THETA_MAX_MS (ERR T range)
 THETA_MOVE_GAIN = 0.60
 THETA_FINE_GAIN = 0.40
@@ -1047,7 +1050,7 @@ class MaskAlignerApp:
         commands = [(f'{arduino_axis(axis)} {steps}', 'DONE', 25.0, AXIS_SETTLE_SEC) for axis, steps in (('X', steps_x), ('Y', steps_y)) if steps != 0]
         return self.execute(commands, generation)
 
-    def manual_move(self, axis, steps):
+    def manual_move(self, axis, steps, exact=False):
         with self.lock:
             if self.exit_event.is_set() or self.moving or self.auto_running or axis not in ('X', 'Y'):
                 return
@@ -1057,9 +1060,12 @@ class MaskAlignerApp:
             self.generation += 1
             generation = self.generation
 
+        # Resolve here, not inside worker(): assigning `steps` there made it a
+        # worker-local name and every manual click died with UnboundLocalError.
+        if MANUAL_STEPS and not exact:
+            steps = MANUAL_STEPS if steps > 0 else -MANUAL_STEPS
+
         def worker():
-            if MANUAL_STEPS:
-                steps = MANUAL_STEPS if steps > 0 else -MANUAL_STEPS
             ok = self.move_xy_sequential(clamp_steps(steps) if axis == 'X' else 0, clamp_steps(steps) if axis == 'Y' else 0, generation)
             with self.lock:
                 if generation == self.generation:
@@ -1379,6 +1385,25 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.app.request_next_camera()
             self.send_json({'ok': True})
             return
+        if parsed.path == '/api/manual' and 'px' in query:
+            # Screen-direction jog: dir +1 = wafer moves right (X) / down (Y) on screen.
+            # Uses the calibration (steps per px, sign), so it works with no key in view.
+            axis = query.get('axis', [''])[0]
+            try:
+                px = float(query.get('px', ['0'])[0])
+                direction = 1 if int(query.get('dir', ['1'])[0]) > 0 else -1
+            except ValueError:
+                self.send_json({'ok': False, 'error': 'px must be a number, dir +1/-1'}, 400)
+                return
+            if axis not in ('X', 'Y') or not 0 < px <= 200:
+                self.send_json({'ok': False, 'error': 'axis X/Y, 0 < px <= 200'}, 400)
+                return
+            spp, sign = (STEPS_PER_PIXEL_X, MOTOR_SIGN_X) if axis == 'X' else (STEPS_PER_PIXEL_Y, MOTOR_SIGN_Y)
+            # compute_steps moves the wafer by -dx for steps = dx*spp*sign, so +px needs -px*spp*sign.
+            steps = -direction*max(1, int(round(px*spp)))*sign
+            self.app.manual_move(axis, steps, exact=True)
+            self.send_json({'ok': True, 'steps': steps})
+            return
         if parsed.path == '/api/manual':
             axis = query.get('axis', [''])[0]
             steps_text = query.get('steps', ['0'])[0]
@@ -1516,15 +1541,25 @@ pre{white-space:pre-wrap;line-height:1.7}small{display:block;margin-top:16px;lin
 <pre id="status">연결 중...</pre>
 <small id="performance"></small>
 <small>인식 표시는 작은 떨림을 완화해 보여줍니다. 정렬 제어와 위의 측정 수치는 원본 인식 결과를 사용합니다.</small>
-<p>화면 기준 Manual X / Y</p>
-<small>수동 +/−는 매핑된 Arduino 채널의 스텝 부호입니다. 화면 이동 방향은 장비에 따라 다릅니다.</small>
-<button onclick="manual('X',-30)">X -</button><button onclick="manual('X',30)">X +</button>
-<button onclick="manual('Y',-30)">Y -</button><button onclick="manual('Y',30)">Y +</button>
+<p><b>수동 이동</b> (화살표 = 웨이퍼가 화면에서 움직이는 방향)</p>
+<div id="jogsize">
+<label><input type="radio" name="px" value="1">1px</label>
+<label><input type="radio" name="px" value="5">5px</label>
+<label><input type="radio" name="px" value="10" checked>10px</label>
+<label><input type="radio" name="px" value="50">50px</label>
+</div>
+<div style="display:grid;grid-template-columns:repeat(3,64px);justify-content:center">
+<span></span><button onclick="jog('Y',-1)">↑</button><span></span>
+<button onclick="jog('X',-1)">←</button><span></span><button onclick="jog('X',1)">→</button>
+<span></span><button onclick="jog('Y',1)">↓</button><span></span>
+</div>
+<small>키가 화면 밖에 있어도 동작합니다 (보정값 기준 이동, 실제 이동량은 약간 다를 수 있음). 이동 한계는 그대로 적용됩니다.</small>
 <small>START 한 번으로 세타 구동·검증을 반복하고, ±4° 이내 확인 후 X → Y 중심 정렬로 자동 전환합니다.<br>X·Y에서는 각도 검출을 요구하지 않습니다.<br>MASK의 검은 사각형 4개 배치와 WAFER의 남은 십자 팔로 중심을 구합니다. 각 축의 중심 오차가 6px 미만인 상태로 8프레임 연속 확인되면 ALIGN FINISH입니다. MASK 3/4는 3개 실측과 1개 위치 복원을 뜻합니다.</small>
 </aside></main>
 <script>
 async function post(path){await fetch(path,{method:'POST'});await refresh()}
 function manual(axis,steps){return post(`/api/manual?axis=${axis}&steps=${steps}`)}
+function jog(axis,dir){const px=document.querySelector('input[name=px]:checked').value;return post(`/api/manual?axis=${axis}&dir=${dir}&px=${px}`)}
 let refreshing=false;
 async function refresh(){if(refreshing)return;refreshing=true;try{
 const d=await(await fetch('/api/status',{cache:'no-store',signal:AbortSignal.timeout(3000)})).json();

@@ -1,28 +1,28 @@
 {
   "SWAP_XY_COMMANDS": true,
   "MOTOR_SIGN_X": 1,
-  "STEPS_PER_PIXEL_X": 197.5464,
+  "STEPS_PER_PIXEL_X": 202.5121,
   "MOTOR_SIGN_Y": 1,
-  "STEPS_PER_PIXEL_Y": 223.2772,
-  "MAX_STEPS_PER_AXIS": 13396,
+  "STEPS_PER_PIXEL_Y": 225.5299,
+  "MAX_STEPS_PER_AXIS": 13531,
   "DEAD_BAND_PX": 0.5,
-  "MANUAL_STEPS": 2233,
-  "_soft_limit_steps": 17862,
+  "MANUAL_STEPS": 2255,
+  "_soft_limit_steps": 18042,
   "_report": {
     "X": {
       "steps": 2560,
-      "px_per_step": 0.00448,
+      "px_per_step": 0.00443,
       "image_axis": "Y",
-      "backlash_px": -0.048,
-      "skew_deg": 0.16
+      "backlash_px": 0.197,
+      "skew_deg": 0.06
     },
     "Y": {
       "steps": 2560,
-      "px_per_step": 0.00506,
+      "px_per_step": 0.00494,
       "image_axis": "X",
-      "backlash_px": -0.009,
-      "skew_deg": 1.28
+      "backlash_px": 0.029,
+      "skew_deg": -2.55
     }
   },
-  "_measured_at": "2026-10-02 12:31:37"
+  "_measured_at": "2026-10-12 12:08:26"
 }

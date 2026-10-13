@@ -1,0 +1,262 @@
+{
+  "run_id": "d48a13e70fee4531b034bc94c947aa86",
+  "status": "OBSERVED",
+  "simulation": true,
+  "calibration_id": "TB6560-XY-EXAMPLE-NOT-MEASURED",
+  "calibration_validated": false,
+  "observe_only": true,
+  "started_at": "2026-10-02T04:42:12.353628+00:00",
+  "calibration": {
+    "calibration_id": "TB6560-XY-EXAMPLE-NOT-MEASURED",
+    "validated": false,
+    "image_size": [
+      640,
+      480
+    ],
+    "mask_px_to_um": [
+      [
+        0.5,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.5,
+        0.0
+      ]
+    ],
+    "wafer_px_to_um": [
+      [
+        0.5,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.5,
+        0.0
+      ]
+    ],
+    "rotation_center_um": [
+      0.0,
+      0.0
+    ],
+    "xy_um_per_step": [
+      [
+        0.5,
+        0.0
+      ],
+      [
+        0.0,
+        0.5
+      ]
+    ],
+    "theta_deg_per_ms_positive": 0.0,
+    "theta_deg_per_ms_negative": 0.0,
+    "theta_min_ms": 0,
+    "theta_max_ms": 0,
+    "max_steps": 100,
+    "max_initial_angle_deg": 5.0,
+    "tolerance_xy_um": 5.0,
+    "tolerance_theta_deg": 0.1,
+    "roi": [
+      0,
+      0,
+      640,
+      480
+    ],
+    "max_frame_age_s": 30.0,
+    "settle_s": 0.5,
+    "motion_mode": "xy",
+    "hardware_profile": "tb6560_xy"
+  },
+  "before_frame": {
+    "frame_id": "83a58edc16dd408ea76e43694163d65b",
+    "captured_at": "2026-10-02T04:42:12.447021+00:00",
+    "started_at": 252068.20861875,
+    "image": "before.png",
+    "preview": "before-overlay.png"
+  },
+  "measurement": {
+    "frame_id": "83a58edc16dd408ea76e43694163d65b",
+    "mask": {
+      "center_px": [
+        167.52221185211914,
+        72.58929342331776
+      ],
+      "angle_deg": 0.9579901557926789,
+      "residual_px": 0.4446971194768282,
+      "observed_edges": 16
+    },
+    "wafer": {
+      "center_px": [
+        185.7169912566726,
+        239.51807119534266
+      ],
+      "angle_deg": -7.915695099308238,
+      "residual_px": 0.313394141159179,
+      "observed_edges": 4
+    },
+    "method": "yolo-sam2+original-edge-fit",
+    "model_scores": [
+      0.9701094031333923,
+      0.9734876155853271,
+      0.972257673740387,
+      0.9749166369438171,
+      0.9654328227043152
+    ],
+    "elapsed_s": 0.8131064580229577,
+    "model_revision": "ee5bba1d82bb8749febdf90f45e84b687142ba03",
+    "detector_sha256": "484b303cdb335aacde5115d5a3810d50f845782f0f787df45c4c4a0f29fbbe50",
+    "detection_scores": [
+      0.9477337002754211,
+      0.9463212490081787,
+      0.941661536693573,
+      0.9049873352050781,
+      0.9631627202033997
+    ],
+    "prompt_boxes_px": [
+      [
+        105.27192687988281,
+        89.95249938964844,
+        150.23048400878906,
+        133.77052307128906
+      ],
+      [
+        109.68376922607422,
+        11.07834243774414,
+        152.4954833984375,
+        54.528072357177734
+      ],
+      [
+        180.8711395263672,
+        88.07160949707031,
+        227.1481170654297,
+        129.80091857910156
+      ],
+      [
+        183.26702880859375,
+        15.987161636352539,
+        228.2857666015625,
+        58.85009002685547
+      ],
+      [
+        129.51486206054688,
+        183.12557983398438,
+        245.26828002929688,
+        295.40594482421875
+      ]
+    ]
+  },
+  "execution": {
+    "status": "OBSERVATION_NO_MOTION",
+    "simulation": true
+  },
+  "after_frame": {
+    "frame_id": "0945e3411fb24b0e8954c687694cfc2c",
+    "captured_at": "2026-10-02T04:42:13.834373+00:00",
+    "started_at": 252069.627906333,
+    "image": "after.png",
+    "preview": "after-overlay.png"
+  },
+  "evaluation": {
+    "status": "UNCALIBRATED",
+    "frame_id": "0945e3411fb24b0e8954c687694cfc2c",
+    "dx_um": null,
+    "dy_um": null,
+    "dtheta_deg": null,
+    "reason": "Image offsets only; physical micrometers/angle require validated calibration",
+    "measurement": {
+      "frame_id": "0945e3411fb24b0e8954c687694cfc2c",
+      "mask": {
+        "center_px": [
+          167.52264691985343,
+          72.6434412847482
+        ],
+        "angle_deg": 0.9475192431349413,
+        "residual_px": 0.4173250899248499,
+        "observed_edges": 16
+      },
+      "wafer": {
+        "center_px": [
+          185.7927324810122,
+          239.6178176362176
+        ],
+        "angle_deg": -7.881311841983489,
+        "residual_px": 0.33012850587364806,
+        "observed_edges": 4
+      },
+      "method": "yolo+original-edge-fit",
+      "model_scores": [],
+      "elapsed_s": 0.1734352080093231,
+      "model_revision": null,
+      "detector_sha256": "484b303cdb335aacde5115d5a3810d50f845782f0f787df45c4c4a0f29fbbe50",
+      "detection_scores": [
+        0.9592287540435791,
+        0.939085841178894,
+        0.9380857944488525,
+        0.9346384406089783,
+        0.9624805450439453
+      ],
+      "prompt_boxes_px": [
+        [
+          109.46790313720703,
+          11.444915771484375,
+          152.2918701171875,
+          54.43760681152344
+        ],
+        [
+          105.24259948730469,
+          89.5849609375,
+          150.35972595214844,
+          134.05067443847656
+        ],
+        [
+          183.208740234375,
+          16.369752883911133,
+          228.1793212890625,
+          58.813812255859375
+        ],
+        [
+          180.67587280273438,
+          88.0341796875,
+          226.81893920898438,
+          130.34075927734375
+        ],
+        [
+          129.2120361328125,
+          182.34933471679688,
+          245.10504150390625,
+          295.57952880859375
+        ]
+      ]
+    },
+    "calibration_validated": false,
+    "dx_px": 18.270085561158766,
+    "dy_px": 166.9743763514694,
+    "dtheta_image_deg": -8.82883108511843,
+    "distance_um": null,
+    "estimated_physical_error": {
+      "basis": "unvalidated_calibration_only",
+      "dx_um": 9.135042780579383,
+      "dy_um": 83.4871881757347,
+      "dtheta_deg": -8.82883108511843,
+      "distance_um": 83.98547253003672,
+      "hypothetical_status": "FAIL_XY"
+    },
+    "theta_controlled": false
+  },
+  "device_log": [],
+  "finished_at": "2026-10-02T04:42:14.037898+00:00",
+  "active": false,
+  "capture_source": "camera",
+  "motor_connection": "mock",
+  "serial_port": null,
+  "motion_mode": "xy",
+  "hardware_profile": "tb6560_xy",
+  "remaining_pulses": null,
+  "preview_captured_at": "2026-10-02T04:43:03.102126+00:00",
+  "preview_stale": false,
+  "camera_error": null,
+  "method": "yolo-sam2"
+}

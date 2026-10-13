@@ -1,0 +1,59 @@
+{
+  "created_at": "2026-10-13",
+  "video_source": {
+    "filename": "KakaoTalk_Video_2026-10-13-19-50-02.mp4",
+    "sha256": "96fa08ad52abfacbbfa330f4b70654ea9bf8f287bae04bf832f9f3565f282427",
+    "bytes": 15690208,
+    "duration_s": 74.041667,
+    "dimensions": [
+      1118,
+      720
+    ],
+    "audio": false
+  },
+  "preview": {
+    "start_s": 12,
+    "end_s": 70,
+    "speed": 4,
+    "fps": 7,
+    "width_px": 720
+  },
+  "assets": [
+    {
+      "path": "docs/images/align_done.jpg",
+      "sha256": "81fce01fce210701471a1d8bd95e9fdd1b142509852e14870a07be330be39abb",
+      "bytes": 38024
+    },
+    {
+      "path": "docs/images/portfolio-cover.svg",
+      "sha256": "dd9c8c0b6f8fc14c01f3813c6740039cf99d58a48cef991b2457c097871f1b3a",
+      "bytes": 3346
+    },
+    {
+      "path": "docs/images/video-alignment-finish.jpg",
+      "sha256": "35e6366ef728c7cc726d8a829361e025a8683b297f46161754ac3d004abae741",
+      "bytes": 48511
+    },
+    {
+      "path": "docs/images/xy-theta-before.jpg",
+      "sha256": "173c106f8200901141c6a1f660a3050698e091b824a9e5594ec56718cb584ed9",
+      "bytes": 40444
+    },
+    {
+      "path": "docs/images/yolo-sam2-observation.png",
+      "sha256": "f56e78db94e4cec319a1ebcc1901606324234c342f9b8ddf54e3f78d83ae3ae5",
+      "bytes": 359696
+    },
+    {
+      "path": "docs/media/alignment-demo.mp4",
+      "sha256": "4bf3ca29caa5089902684967dbab31aa21539699e132e7a50df6ebc0f73f59a0",
+      "bytes": 3984859
+    },
+    {
+      "path": "docs/media/alignment-preview.gif",
+      "sha256": "d80a5d752acf30b3b4b6a709fc7984f7cb95523018b72ed9980822acefb1a63b",
+      "bytes": 8173803
+    }
+  ],
+  "notes": "See docs/validation.md for provenance. Video model and weights are not identified."
+}

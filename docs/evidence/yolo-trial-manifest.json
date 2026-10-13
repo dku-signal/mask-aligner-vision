@@ -1,0 +1,54 @@
+{
+  "purpose": "TRIAL ONLY: current-scene runtime verification, not generalization or micron accuracy",
+  "created_at": "2026-10-02T04:33:10.207661+00:00",
+  "source_checkpoint": "artifacts/training/keys-2/weights/best.pt",
+  "sha256": "484b303cdb335aacde5115d5a3810d50f845782f0f787df45c4c4a0f29fbbe50",
+  "model": "YOLO26n detect",
+  "classes": {
+    "0": "mask_square",
+    "1": "wafer_key"
+  },
+  "training_images": 7,
+  "validation_images": 1,
+  "test_images": 1,
+  "independent_splits": false,
+  "scenes": 2,
+  "dataset_provenance": "datasets/keys_trial/provenance.json",
+  "stages": [
+    {
+      "model": "yolo26n.pt",
+      "completed_epochs": 77,
+      "output": "artifacts/training/keys"
+    },
+    {
+      "model": "artifacts/training/keys/weights/last.pt",
+      "completed_epochs": 200,
+      "output": "artifacts/training/keys-2"
+    }
+  ],
+  "training_imgsz": 640,
+  "inference_confidence": 0.5,
+  "device_for_training": "mps",
+  "python": "3.12.14",
+  "torch": "2.14.0",
+  "ultralytics": "8.4.164",
+  "warnings": [
+    "Near-duplicate frames cross splits; mAP is only a training sanity check.",
+    "No microscope-scale, Z-gap or industrial-key validation. These photos show the available printed apparatus marks.",
+    "No micron calibration. Do not treat trial weights as approval for automatic motor movement."
+  ],
+  "latest_live_trial": {
+    "run_id": "d48a13e70fee4531b034bc94c947aa86",
+    "status": "OBSERVED",
+    "report": "artifacts/yolo-sam2-live-result.json",
+    "motor_commands_sent": 0,
+    "checkpoint_matches_live_measurement": true
+  },
+  "latest_white_window_observation": {
+    "run_id": "09037168d75345e8940250f3f8f977ea",
+    "motor_motion": false,
+    "physical_calibration_validated": false,
+    "wafer_reference": "four white windows",
+    "note": "Real motor diagnostics halted: user reported loud vibration without travel."
+  }
+}

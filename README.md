@@ -1,164 +1,223 @@
-# mask-aligner-vision
+<div align="center">
 
-비전 기반 **마스크 얼라이너 자동 정렬** 시스템. 카메라로 마스크 키(사각형 4개)와 웨이퍼 키(십자)를 찾아
-서브픽셀 단위로 중심을 측정하고, 스텝모터 XY 스테이지를 폐루프로 구동해 두 키를 정렬합니다.
+![Mask Aligner — Team Si-gnal](docs/images/portfolio-cover.svg)
 
-Lab-Linked 캡스톤 디자인 (Team Si-gnal, 2026) - 소프트웨어 파트
+# Vision-guided Mask Alignment
 
-![자동 정렬 완료 화면](docs/images/align_done.jpg)
+**YOLO + SAM2 기반 키 인식과 X/Y/θ 스테이지 제어를 연결하는 비전 정렬 프로젝트**
 
-## 결과
+Lab-Linked 캡스톤 디자인 · Team Si-gnal · 2026
 
-| 항목 | 결과 |
+[프로젝트](#프로젝트-소개) · [시연](#실제-장비와-인식-화면) · [AI 파이프라인](#yolo--sam2-파이프라인) · [실험 결과](#실험-결과) · [실행 가이드](docs/team-guide.md)
+
+</div>
+
+## 프로젝트 소개
+
+마스크 얼라이너는 **고정된 마스크의 기준 표식에 웨이퍼의 표식을 맞추는 장비**입니다. 이 프로젝트는 카메라로 두 표식의 위치와 방향을 측정하고, 그 차이를 모터 명령으로 바꾸어 웨이퍼 스테이지를 정렬합니다.
+
+우리가 다루는 범위는 **촬영 → 키 인식 → 정밀 좌표 측정 → 교정값 적용 → 모터 제어 → 결과 확인**입니다. 이미지 인식 모델을 실제 기계의 동작과 연결하고, 같은 실험을 다시 확인할 수 있도록 좌표·상태·통신 기록을 남깁니다.
+
+| 구성 | 역할 |
 |---|---|
-| 실기기 XY 자동 정렬 (2026-10-02) | 어긋남 **132 px → 0.37 px**, 40초, 모터 명령 14회 |
-| 측정 정밀도 (합성 이미지, 정답 좌표 기준) | dx/dy 오차 중간값 **0.456 px → 0.079 px** (5.8배), p95 0.83 → 0.42 px |
-| 스테이지 분해능 (실측) | 1 step ≈ 0.005 px, 백래시 < 0.05 px |
+| **YOLO + SAM2** | 키의 후보 위치를 찾고 해당 영역을 분할하는 AI 검출 경로 |
+| **원본 영상의 기하 측정** | 사각형 경계·십자 중심선으로 중심과 각도를 계산 |
+| **Python 제어 앱** | 카메라, 좌표 변환, 정렬 상태 머신, 웹 화면, 시리얼 통신 |
+| **Arduino Mega + TB6560** | 정해진 펄스 수와 방향으로 X/Y 스테이지 구동 |
+| **θ 서보** | D30 신호로 회전 보정 후 영상에서 응답 확인 |
 
-## 구조
+> **현재 확인한 범위** — YOLO+SAM2 코드와 별도 SW 실험의 실제 카메라 인식 기록을 갖추었습니다. 이 저장소의 기본 실행 및 10월 12일 실장비 정렬 기록은 **OpenCV + 서브픽셀 측정 경로**입니다. AI 인식 결과와 기계 구동 결과를 각각 표시하며, 아래 실장비 수치를 YOLO+SAM2의 정렬 성능으로 해석하지 않습니다.
 
+## 실제 장비와 인식 화면
+
+[![X/Y/θ 자동 정렬 시연 · 4배속 미리보기](docs/media/alignment-preview.gif)](docs/media/alignment-demo.mp4)
+
+**[▶ 전체 시연 영상 보기 · 74초](docs/media/alignment-demo.mp4)** · 위 미리보기는 원본 12–70초 구간의 4배속입니다.
+
+시연은 **θ 회전 보정 → X/Y 위치 보정 → ALIGN FINISH** 순서로 진행됩니다. 제공 영상의 실행 모델·가중치 메타데이터는 없으므로 모델 성능 수치는 별도 실험 기록을 기준으로 소개합니다.
+
+
+<table>
+<tr>
+<td width="50%"><img src="docs/images/yolo-sam2-observation.png" alt="실제 카메라 영상에서 YOLO와 SAM2를 거쳐 마스크와 웨이퍼 중심을 측정한 결과" width="100%" /></td>
+<td width="50%"><img src="docs/images/video-alignment-finish.jpg" alt="사용자가 제공한 시연 영상의 68초 지점 정렬 완료 화면" width="100%" /></td>
+</tr>
+<tr>
+<td><b>AI 인식 실험 · 2026-10-02</b><br/>별도 SW 실험 코드의 YOLO26n → SAM2 → 원본 경계 측정. 이 실행은 관찰 전용으로 모터를 움직이지 않았습니다.</td>
+<td><b>제공 영상의 완료 화면 · 68초 지점</b><br/>θ → X/Y 보정을 마친 화면입니다. 왼쪽 인식 실험과 다른 실행이며, 아래 10월 12일 수치의 전후 비교 사진이 아닙니다.</td>
+</tr>
+</table>
+
+검은 사각형 네 개는 **마스크 키**, 웨이퍼의 십자와 흰 창 구조는 **움직일 기준 표식**입니다. 최종 목표는 두 기준의 위치와 방향을 일치시키는 것입니다. 중심이 같더라도 회전·크기 차이가 남으면 패턴 전체가 일치하지 않을 수 있습니다.
+
+## YOLO + SAM2 파이프라인
+
+```mermaid
+flowchart LR
+    A["카메라 영상"] --> B["YOLO · 키 후보 박스"]
+    B --> C["SAM2 · 박스 내부 분할"]
+    C --> D["원본 경계 피팅"]
+    A --> D
+    D --> E["중심 · 각도 · 관측 품질"]
+    E --> F["교정값 · 축 방향 적용"]
+    F --> G["Arduino · X/Y/θ 구동"]
+    G --> H["새 영상에서 잔여 오차 확인"]
 ```
-카메라 ─▶ 키 검출 (OpenCV 규칙 기반 / 선택: SAM2, YOLO→SAM2)
-        ─▶ 서브픽셀 측정 (subpixel.py: 모서리 직선 피팅, 가림 영역 제외)
-        ─▶ dx, dy (px) ─▶ 보정값으로 스텝 변환 (calibration.json)
-        ─▶ 시리얼 ─▶ Arduino Mega (firmware/xy_tb6560) ─▶ TB6560 ─▶ X/Y 스테이지
-        ◀─ 재촬영, 오차가 기준 안에 들어올 때까지 반복
+
+### 1. YOLO — 어디에 어떤 키가 있는가
+
+키의 위치와 종류를 박스로 찾습니다. 마스크 사각형과 웨이퍼 키를 구분하도록 학습한 가중치가 필요합니다. 범용 가중치만으로 이 장비의 정렬 표식을 인식한다고 가정하지 않습니다.
+
+별도 SW 초기 실험은 **YOLO26n**, 클래스 `mask_square` / `wafer_key`로 구성했습니다. 실제 사진 9장 중 학습 7장, 검증·시험 각 1장으로 추론 연결을 확인했습니다. 두 장면의 유사 프레임이 포함되어 있어 일반화 성능이나 정밀도를 입증하는 데이터셋은 아닙니다. [학습 구성과 출처](docs/evidence/yolo-trial-manifest.json)
+
+### 2. SAM2 — 후보 안에서 어떤 픽셀이 키에 속하는가
+
+**SAM 2.1 Hiera Small**에 YOLO 박스를 프롬프트로 주어 후보 영역을 분할합니다. 현재 실험에서는 사전 학습된 SAM2를 사용하며 별도의 SAM2 미세조정은 하지 않았습니다. SAM2의 분할 마스크는 물리적인 마스크 부품과 다른, 픽셀 단위 영역 정보입니다.
+
+### 3. 기하 측정 — 정렬에 쓸 기준 중심은 어디인가
+
+YOLO 박스와 SAM2 영역을 이용해 원본 영상에서 측정할 경계를 선택합니다. 마스크는 네 사각형의 기하 배치, 웨이퍼는 십자 팔의 중심선을 이용합니다. 서브픽셀 측정은 경계 주변의 밝기 기울기를 보간하고 직선을 맞춰 기준 중심을 계산합니다.
+
+**분할 점수가 높다는 것과 중심 좌표가 정확하다는 것은 별개입니다.** 검출 점수, 좌표 오차, 경계 관측 품질, 처리 시간을 구분해서 평가합니다.
+
+<details>
+<summary><b>이 저장소와 별도 SW 실험의 구현 범위</b></summary>
+
+| 항목 | 팀 저장소의 현재 구현 | 별도 SW 실험 기록 |
+|---|---|---|
+| YOLO 사용 | `sam2_keys.py`에서 클래스 0의 사각형 박스 사용 | 마스크 사각형 4개 + 웨이퍼 키 1개를 검출 |
+| SAM2 사용 | 사각형 박스를 분할해 사각형 후보를 정제 | 두 키 종류의 박스를 분할 |
+| 웨이퍼 측정 | 기존 십자 탐색 + `PreciseKeys` 기하 측정 | 십자 중심선 또는 흰 창의 원본 경계 측정 |
+| 정렬 실행 | θ → X/Y, 새 영상으로 반복 보정 | 이동 전 한 계획 → X/Y 실행 → 별도 후평가 |
+| 이동 후 평가 | 정렬 루프의 새 영상 측정과 완료 판정 | YOLO + 원본 경계 측정, 추가 이동 없음 |
+
+별도 실험의 코드 전체가 이 저장소에 통합된 것은 아닙니다. 인식 결과 JSON과 학습 manifest를 문서 근거로 제공합니다. 이 저장소에서 실행 가능한 옵션은 [AI 실험 가이드](docs/model-pipeline.md)를 따릅니다.
+
+</details>
+
+## 실제 장비를 움직이는 흐름
+
+```mermaid
+stateDiagram-v2
+    [*] --> READY
+    READY --> THETA: START ALIGN
+    THETA --> THETA: 회전 명령 · 재측정
+    THETA --> XY: 각도 기준 확인
+    XY --> XY: X/Y 보정 · 새 영상 측정
+    XY --> DONE: 중심 정렬 확인
+    THETA --> STOP: 사용자 중단 · 관측 오류
+    XY --> STOP: 사용자 중단 · 통신 오류
 ```
 
-## 주요 구현
+**버튼은 한 번 누르지만, 현재 팀 앱 내부에서는 재측정과 보정을 반복합니다.** θ를 먼저 보정하고 X/Y 위치를 맞춥니다. 완료 시 모터 명령을 중단하고 결과 상태를 표시합니다.
 
-- **서브픽셀 측정** (`subpixel.py`): 기존 정수 픽셀 측정(윤곽선 꼭짓점, 템플릿 매칭 최고점)을
-  모서리 수직 방향 밝기 기울기의 포물선 보간 → 모서리별 직선 피팅 → 교점으로 바꿈.
-  웨이퍼 십자는 팔 양쪽 모서리 직선의 중심선 교점으로 측정하고, 마스크 사각형에 가려진 부분은 제외.
-- **안전한 스테이지 펌웨어** (`firmware/xy_tb6560`): 정해진 스텝만 이동, 소프트웨어 이동 한계,
-  위치를 EEPROM에 저장 (시리얼 연결 시 Arduino 리셋에도 한계 유지), 가감속.
-- **카메라 기반 자동 보정** (`calibrate_xy.py`): 축 매핑, 부호, 스텝/픽셀, 백래시, 기울어짐을 측정.
-- **하드웨어 없는 리허설** (`tools/sim_rig.py`): 가상 펌웨어(pty) + 합성 카메라로 보정과 폐루프 정렬 전체를 검증.
-- **검출기 비교** (`sam2_keys.py`, `tools/test_detectors.py`): OpenCV / SAM2.1-small / YOLO→SAM2 / OpenCV→SAM2.
-  결론: 정밀도는 검출기가 아니라 측정 단계에서 결정됨. 모델은 검출 강건성 용도.
-
-팀 기존 코드(v4 웹 UI, 정렬 상태 머신, 규칙 기반 키 검출)를 기반으로 위 내용을 추가했습니다.
-
----
-
-# 사용법 (팀원용)
-
-> θ(회전) 모터는 아직 지원하지 않습니다. 항상 `--skip-theta`로 실행하고, 마스크 방향은 손으로 웨이퍼 십자와 맞춥니다.
-
-## 파일
-
-| 파일 | 역할 |
+| 제어 항목 | 현재 구성 |
 |---|---|
-| `mask_aligner_optimized_v4.py` | 웹 앱 (브라우저 화면, START ALIGN 버튼) |
-| `subpixel.py` | 키 중심을 소수점 픽셀까지 재는 측정 코드 |
-| `calibrate_xy.py` | 카메라로 축 방향, 부호, 스텝/픽셀을 자동 측정 → `calibration.json` |
-| `preflight.py` | 시작 전 점검 (포트, 펌웨어, 카메라, 키 인식). 아무것도 움직이지 않음 |
-| `calibration.json` | 2026-10-02 측정값. **카메라 위치가 그대로일 때만** 유효 |
-| `firmware/xy_tb6560/xy_tb6560.ino` | Arduino Mega 펌웨어 |
-| `sam2_keys.py` | SAM2 / YOLO 검출기 (선택, `requirements-optional.txt` 필요) |
-| `tools/sim_rig.py` | 장비 없이 연습하는 가상 장비 |
-| `tools/bench_precision.py` | 측정 정밀도 벤치마크 (정수 vs 서브픽셀) |
-| `tools/test_detectors.py` | 사진/카메라로 검출기 비교 (torch 필요) |
-| `tools/flash.sh` | macOS: 펌웨어 백업 + 업로드 |
+| X | STEP **D10**, DIR **D11** |
+| Y | STEP **D8**, DIR **D9** |
+| θ | 연속회전 서보 신호 **D30** |
+| 통신 | USB Serial · **9600 baud** |
+| 영상 ↔ 명령 축 | 현재 교정은 image X → Arduino Y, image Y → Arduino X |
+| 정렬 기준 | 현재 설정상 XY 축별 0.5 px, θ 단계 4° |
 
-## 1. 설치 (처음 한 번)
+θ는 각도를 바로 지정하는 서보가 아니라 **방향·구동 시간에 따라 회전하는 방식**입니다. 응답을 영상으로 관측하며, 완료 메시지는 펄스 실행을 뜻합니다. 실제 이동과 정렬 결과는 새 영상에서 확인해야 합니다.
 
-Python 3.11 권장.
+## 실험 결과
 
-**macOS**
-```
+### 2026-10-12 · 실제 장비 X/Y/θ 재시험
+
+| 항목 | 이동 전 | 완료 시점 / 결과 |
+|---|---:|---:|
+| 영상 X 오차 | +108.80 px | −0.356 px |
+| 영상 Y 오차 | −61.51 px | −0.195 px |
+| 중심 간 거리 | **124.98 px** | **0.406 px** |
+| θ | +23.83° | **θ 단계 종료 시 +3.82°** |
+| 소요 시간 | — | 23.47초 |
+| 모터 명령 | — | θ 2회 + X/Y 7회 |
+| 앱 상태 | — | `DONE`, 자동 실행·이동 중단 |
+
+실행 경로는 **OpenCV + 서브픽셀 기하 측정**입니다. 최종 X/Y 완료 시 현재 θ는 측정되지 않아, 3.82°를 전체 실행의 최종 각도 정확도로 표시하지 않습니다. 물리 길이 교정이 없어 μm 오차도 미확정입니다. [원시 결과](docs/evidence/xy-theta-20261012.json) · [검증 범위](docs/validation.md)
+
+### 2026-10-02 · YOLO26n + SAM2 실제 영상 인식
+
+| 항목 | 확인 내용 |
+|---|---|
+| 이동 전 인식 경로 | `yolo-sam2+original-edge-fit` |
+| 출력 | 두 키의 중심·영상 각도, SAM 점수, YOLO 점수, 박스, 모델 버전 |
+| 새 프레임 평가 경로 | `yolo+original-edge-fit` — 후평가에서는 SAM2 생략 |
+| 상태 | `OBSERVED` / `UNCALIBRATED` |
+| 모터 명령 | **0회**, 영상 관찰 실험 |
+
+이 기록은 실제 카메라 입력으로 모델과 측정 과정을 연결한 사례입니다. 자동 정렬 정확도나 독립적인 성능 벤치마크 결과는 아닙니다. [인식 결과 JSON](docs/evidence/yolo-sam2-observation-20261002.json)
+
+## 엔지니어링 포인트
+
+- **인식과 계측의 역할 분리** — YOLO와 SAM2는 후보 영역을 찾고, 정렬 좌표는 원본 경계에서 측정합니다.
+- **카메라 좌표와 모터 좌표 연결** — 축 교환, 부호, steps/px를 교정 설정으로 관리합니다. px→펄스 교정과 px→μm 교정을 구분합니다.
+- **장치의 실제 명령 규약 반영** — TB6560 펄스 제어, 유한 이동, 응답 대기, 소프트웨어 이동 한계와 EEPROM 위치 기록을 연결했습니다.
+- **관측 가능한 제어 과정** — `THETA`, `XY`, `DONE`, `STOP` 상태와 좌표·응답을 웹 화면에서 확인합니다.
+- **재현 가능한 비교** — OpenCV / SAM2 / YOLO→SAM2 검출 옵션, 합성 데이터 생성, 가상 장비, 정밀 측정 벤치마크 도구를 제공합니다.
+
+## 기술 구성
+
+| 영역 | 사용 기술 |
+|---|---|
+| 언어 · 실행 | Python, Arduino C++ |
+| AI 검출 · 분할 | Ultralytics YOLO, PyTorch, SAM 2.1 Hiera Small |
+| 영상 · 수치 계산 | OpenCV, NumPy, 서브픽셀 경계 피팅 |
+| 제어 · 통신 | Arduino Mega 2560, TB6560, θ 서보, pySerial |
+| 인터페이스 | 로컬 웹 UI, 카메라 MJPEG, JSON 상태 API |
+| 검증 | 가상 시리얼 PTY, 합성 카메라, 실장비 로그 |
+
+## 시작하기
+
+```bash
 git clone https://github.com/dku-signal/mask-aligner-vision.git
 cd mask-aligner-vision
 python3.11 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 ```
-이후 명령의 `python`은 `.venv/bin/python`으로 실행합니다.
 
-**Windows**
-```
-git clone https://github.com/dku-signal/mask-aligner-vision.git
-cd mask-aligner-vision
-py -3.11 -m venv .venv
-.venv\Scripts\pip install -r requirements.txt
-```
-이후 명령의 `python`은 `.venv\Scripts\python`으로 실행합니다.
+**장비 없이 제어 흐름 확인**
 
-## 2. 펌웨어 (보드에 이미 있으면 생략)
-
-보드에는 `xy_tb6560` 펌웨어가 올라가 있어야 합니다. 확인 방법:
-아두이노 IDE 시리얼 모니터 → **9600 baud, 줄 끝 "새 줄(Newline)"** → `PING` 입력 → `PONG`이 오면 정상.
-
-`PONG`이 안 오면 아두이노 IDE로 `firmware/xy_tb6560/xy_tb6560.ino`를 업로드합니다 (보드: Arduino Mega 2560).
-macOS에서는 `tools/flash.sh`로 기존 펌웨어 백업과 업로드를 한 번에 할 수 있습니다.
-
-- 팀 원래 수동 제어 코드(F/B/f/b)를 다시 올리면 이 앱은 동작하지 않습니다.
-- 수동 제어는 이 펌웨어에서도 됩니다: 시리얼 모니터에서 `F`/`B`(X), `f`/`b`(Y), `S`(정지). 최대 3초, 이동 한계 적용.
-- **시리얼 모니터는 다 쓰고 반드시 닫으세요.** 열려 있으면 앱과 스크립트가 아두이노와 통신하지 못합니다.
-- 펌웨어 업로드는 **모터 전원(SMPS)을 끈 상태**에서 하는 것을 권장합니다.
-
-## 3. 매번 테스트 순서
-
-1. 모터 전원(SMPS) 켜기, 아두이노 USB와 카메라 연결 (카메라는 USB 허브 말고 노트북에 직접)
-2. 점검
-   ```
-   python preflight.py
-   ```
-   모두 PASS(또는 WARN)이면 진행. FAIL이면 아래 "문제 해결" 참고.
-3. **처음이거나 카메라를 옮겼을 때만** 보정
-   ```
-   python calibrate_xy.py --zero     # 스테이지를 레일 가운데에 두고 실행: 지금 위치를 0으로
-   python calibrate_xy.py            # 축 방향/스텝 측정 → calibration.json, 이동 한계 ±80px 자동 설정
-   ```
-4. 앱 실행
-   ```
-   python mask_aligner_optimized_v4.py --camera auto --skip-theta
-   ```
-   브라우저가 열리면 화면에 **MASK 4/4**와 **WAFER** 박스가 보이는지 확인 → **RESET → START ALIGN**
-5. 끝나면 터미널에서 `Ctrl + C`, USB 분리, **모터 전원(SMPS) 끄기** (멈춰 있어도 모터가 뜨거워짐)
-
-포트를 자동으로 못 찾으면 직접 지정합니다.
-- `calibrate_xy.py`, `preflight.py`: `--port COM3` (Windows) / `--port /dev/cu.usbmodemXXXX` (macOS)
-- 웹 앱: `--arduino-port COM3` (`--port`는 웹 화면 포트 8765라 다른 옵션)
-
-## 4. 안전 수칙 (레일 이탈 방지)
-
-- 펌웨어는 **정해진 스텝만** 움직이고, **이동 한계**를 넘는 명령은 거부합니다 (`ERR X limit`).
-- 위치와 한계는 보드 EEPROM에 저장되어 USB를 다시 꽂아도 유지됩니다.
-  `calibrate_xy.py`를 돌리면 한계가 화면 ±80px로 설정됩니다. 직접 바꾸려면 `python calibrate_xy.py --limit <스텝>`.
-- 레일 이동 거리는 200 mm (LM-2015R). 1스텝 ≈ 0.005px.
-- 처음 움직일 때는 장비 옆에서 전원을 바로 끌 수 있게 지켜보세요. 비상 시 웹 화면 **STOP** 또는 USB 분리.
-- 모터가 **움직이는 중**에 USB를 빼면 저장된 위치가 실제와 어긋납니다. 그때는 스테이지를 가운데에 두고 `calibrate_xy.py --zero`.
-- 정렬 거리가 길면(화면 80px 이상) 한계에 걸려 멈춥니다. 웨이퍼를 마스크 근처에 두고 시작하세요.
-
-## 5. 문제 해결
-
-| 증상 | 원인 / 조치 |
-|---|---|
-| `no PONG` / `did not answer PING` | ① 시리얼 모니터, 웹 앱 등 포트를 쓰는 프로그램 닫기 ② 포트 직접 지정 `--port` ③ 펌웨어 확인 (2번) |
-| `serial open` 실패 | 다른 프로그램이 포트를 잡고 있음 |
-| 모터가 안 움직임 (`DONE`은 옴) | **모터 전원(SMPS) 확인** |
-| `camera with keys` FAIL / 화면에 키 없음 | 마스크 사각형 4개가 다 화면 안에 있는지, 손이 가리지 않는지, 초점/조명 |
-| START 후 5초 뒤 `Camera/key unavailable` | 키가 안 보이는 상태에서 START를 누름. 키가 보일 때 다시 |
-| 정렬 중 `ERR X limit` / `ERR Y limit` | 이동 한계 도달. 웨이퍼를 마스크 가까이 두고 다시 |
-| 브라우저 화면이 멈춤 | 앱을 다시 켰으면 예전 탭은 끊김 → 새로고침 |
-| 마스크 키가 화면 가장자리 (MASK 3/4) | 마스크나 카메라를 옮겨 사각형 4개가 다 보이게. 카메라를 옮겼으면 보정 다시 |
-
-## 6. 현재 한계
-
-- θ 미지원: 마스크 방향은 손으로 맞춤 (화면의 theta 값이 0° 근처면 OK)
-- 키가 겹치면 측정이 ±0.5px 정도 흔들려 완료 직전에 몇 번 더 보정함 (개선 예정)
-- 결과는 px 단위. mm/µm 환산은 카메라 캘리브레이션 후 가능 (추정 1px ≈ 0.31~0.47 mm)
-
-## 장비 없이 연습
-
-```
+```bash
 python tools/sim_rig.py
 ```
-가상 아두이노 + 가상 카메라로 보정과 자동 정렬 전체 과정을 돌려봅니다. 실제 장비는 움직이지 않습니다.
 
-## 작업 규칙
+**연결 점검 후 기본 장비 앱 실행**
 
-- `main`에는 **실기기에서 검증된 코드만** 둡니다.
-- 새 기능은 브랜치(`feature/z-theta`, `feature/1080p` 등)에서 작업하고, Pull Request로 합칩니다.
-- PR에는 무엇을 바꿨는지와 **어떻게 확인했는지**(시뮬레이터, 실기기 결과)를 적어주세요.
-- `out/`(카메라 사진), 가상환경, 데이터셋, 가중치, `.hex`는 올리지 않습니다 (`.gitignore`에 등록됨).
+```bash
+python preflight.py
+python mask_aligner_optimized_v4.py --camera auto --detector opencv
+```
+
+**YOLO + SAM2 실험 경로**는 추가 의존성과 키 학습 가중치가 필요합니다. [설치·학습·실행 방법](docs/model-pipeline.md)을 먼저 확인하세요. 기존 가중치 경로는 `runs/keys/weights/best.pt`이며 가중치를 저장소에 포함하지 않습니다.
+
+실제 장비의 설치, 교정, θ 제외 실행, 포트 충돌과 종료 절차는 [팀 실행 가이드](docs/team-guide.md)에 정리했습니다.
+
+## 코드 둘러보기
+
+| 파일 | 책임 |
+|---|---|
+| [`mask_aligner_optimized_v4.py`](mask_aligner_optimized_v4.py) | 웹 UI, 카메라, 상태 머신, X/Y/θ 자동 정렬 |
+| [`sam2_keys.py`](sam2_keys.py) | SAM2 / YOLO→SAM2 / OpenCV→SAM2 후보 검출 |
+| [`subpixel.py`](subpixel.py) | 원본 경계 기반 중심·각도 측정 |
+| [`calibrate_xy.py`](calibrate_xy.py) | 축 매핑·방향·steps/px 교정 |
+| [`preflight.py`](preflight.py) | 실행 전 카메라·통신·키 인식 점검 |
+| [`firmware/xy_tb6560/xy_tb6560.ino`](firmware/xy_tb6560/xy_tb6560.ino) | Mega의 유한 펄스 이동과 θ 제어 |
+| [`tools/sim_rig.py`](tools/sim_rig.py) | 가상 장비로 제어 흐름 확인 |
+| [`tools/test_detectors.py`](tools/test_detectors.py) | 같은 영상에서 검출기 비교 |
+| [`tools/bench_precision.py`](tools/bench_precision.py) | 합성 정답을 이용한 측정 오차 비교 |
+
+## 다음 검증 과제
+
+- 촬영 세션을 분리한 실제 키 데이터셋으로 YOLO 검출률과 오검출 평가.
+- 같은 영상·교정 조건에서 OpenCV와 YOLO+SAM2의 중심 오차·실패율·지연 비교.
+- X/Y 이동까지 끝낸 뒤 **현재 θ를 다시 측정**하는 최종 평가.
+- 층별 카메라 교정, μm 환산 불확도, 백래시·반복성 측정.
+- 추가 카메라와 Z 간격 변화에 따른 촬영·좌표 교정 검증.
+
+---
+
+**Team Si-gnal** · 하드웨어의 스테이지·구동·광학 구성과 소프트웨어의 인식·측정·제어를 연결하는 캡스톤 프로젝트입니다. 개인별 기여는 저장소 커밋과 PR을 기준으로 확인할 수 있습니다.

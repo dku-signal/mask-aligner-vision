@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="440" viewBox="0 0 1200 440" role="img" aria-labelledby="title desc">
+<title id="title">Si-gnal · Vision-guided Mask Alignment</title><desc id="desc">YOLO and SAM2 key detection, geometric measurement and X/Y/theta stage control. Conceptual alignment illustration.</desc>
+<defs><pattern id="grid" width="30" height="30" patternUnits="userSpaceOnUse"><path d="M30 0H0V30" fill="none" stroke="#263946" stroke-width=".6"/></pattern></defs>
+<rect width="1200" height="440" fill="#101d28"/><rect x="760" width="440" height="440" fill="url(#grid)"/>
+<path d="M48 44h26" stroke="#6ce6ca" stroke-width="4"/><text x="88" y="51" font-family="Arial,sans-serif" font-size="16" letter-spacing="4" fill="#b3c8d2">TEAM SI-GNAL / CAPSTONE 2026</text>
+<text x="48" y="141" font-family="Arial,sans-serif" font-size="56" font-weight="700" letter-spacing="-2" fill="#f4f8fa">MASK ALIGNER</text>
+<text x="50" y="185" font-family="Arial,sans-serif" font-size="25" fill="#bfd0da">From visual perception to precise motion.</text>
+<path d="M50 215H698" stroke="#334853"/>
+<text x="50" y="253" font-family="Arial,sans-serif" font-size="15" letter-spacing="2" fill="#6ce6ca">YOLO + SAM2</text>
+<text x="264" y="253" font-family="Arial,sans-serif" font-size="15" letter-spacing="2" fill="#d9e3eb">X / Y / THETA</text>
+<text x="487" y="253" font-family="Arial,sans-serif" font-size="15" letter-spacing="2" fill="#d9e3eb">PYTHON + MEGA</text>
+<text x="50" y="329" font-family="Arial,sans-serif" font-size="16" fill="#a7bcc7">LOCATE</text><text x="143" y="329" fill="#6ce6ca" font-size="20">→</text>
+<text x="179" y="329" font-family="Arial,sans-serif" font-size="16" fill="#a7bcc7">SEGMENT</text><text x="286" y="329" fill="#6ce6ca" font-size="20">→</text>
+<text x="323" y="329" font-family="Arial,sans-serif" font-size="16" fill="#a7bcc7">MEASURE</text><text x="434" y="329" fill="#6ce6ca" font-size="20">→</text>
+<text x="470" y="329" font-family="Arial,sans-serif" font-size="16" fill="#a7bcc7">MOVE</text><text x="543" y="329" fill="#6ce6ca" font-size="20">→</text>
+<text x="579" y="329" font-family="Arial,sans-serif" font-size="16" fill="#a7bcc7">VERIFY</text>
+<text x="50" y="404" font-family="Arial,sans-serif" font-size="12" letter-spacing="1" fill="#829eac">COMPUTER VISION / SEGMENTATION / MOTION CONTROL</text>
+<circle cx="978" cy="222" r="146" fill="#172b37" stroke="#354c58"/><circle cx="978" cy="222" r="123" fill="none" stroke="#35545d" stroke-dasharray="4 8"/>
+<g fill="#10202b" stroke="#6ce6ca" stroke-width="2"><rect x="912" y="156" width="45" height="45"/><rect x="999" y="156" width="45" height="45"/><rect x="912" y="243" width="45" height="45"/><rect x="999" y="243" width="45" height="45"/></g>
+<g transform="rotate(-15 997 239)" fill="none" stroke="#efba6b" stroke-width="2" stroke-dasharray="6 4"><rect x="931" y="173" width="45" height="45"/><rect x="1018" y="173" width="45" height="45"/><rect x="931" y="260" width="45" height="45"/><rect x="1018" y="260" width="45" height="45"/></g>
+<path d="M958 222h40m-20-20v40" stroke="#6ce6ca" stroke-width="2"/><path d="M997 239l-19-17m0 0l3 12m-3-12l12 1" fill="none" stroke="#efba6b" stroke-width="2"/>
+<text x="907" y="400" font-family="Arial,sans-serif" font-size="12" letter-spacing="2" fill="#91a9b6">ALIGNMENT CONCEPT</text></svg>

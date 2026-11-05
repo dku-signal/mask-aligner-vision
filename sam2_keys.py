@@ -17,7 +17,7 @@ from mask_aligner_optimized_v4 import CornerKeys
 from subpixel import PreciseKeys
 
 MODEL_ID = 'facebook/sam2.1-hiera-small'
-YOLO_WEIGHTS = Path(__file__).resolve().parent/'runs'/'keys'/'weights'/'best.pt'
+YOLO_WEIGHTS = Path(__file__).resolve().parent/'runs'/'keys'/'weights'/'best.pt'  # classes 0 square, 1 cross
 
 
 def pick_device():
@@ -141,7 +141,15 @@ class BoxSam2Keys(Sam2Keys):
 
 
 class YoloSam2Keys(BoxSam2Keys):
-    """YOLO finds square boxes fast; SAM2 segments only inside those boxes."""
+    """YOLO finds both keys; SAM2 segments the mask squares only when the key is (re)acquired.
+
+    Acquire (no tracked mask yet): YOLO square boxes -> SAM2 box prompts -> quads.
+    Track: YOLO square boxes -> OpenCV squares inside those boxes (no SAM2: fast).
+    Wafer: the template search sees only the best YOLO cross box (class 1).
+    Every centre is still measured on the original image by PreciseKeys (edge fits).
+    """
+
+    BOX_PAD = .3  # search margin around a YOLO box, as a fraction of its size
 
     def __init__(self, weights=YOLO_WEIGHTS, conf=.25, device=None, **kwargs):
         super().__init__(mode='yolo-sam2', device=device, **kwargs)
@@ -149,17 +157,50 @@ class YoloSam2Keys(BoxSam2Keys):
         self.yolo = YOLO(str(weights))
         self.conf = conf
         self.yolo_ms = 0.0
+        self.cross_box = None
+        self.used_sam = False
+
+    def inside(self, point, boxes):
+        x, y = point
+        for x0, y0, x1, y1 in boxes:
+            pad = self.BOX_PAD*max(x1-x0, y1-y0)
+            if x0-pad <= x <= x1+pad and y0-pad <= y <= y1+pad:
+                return True
+        return False
 
     def segment(self, frame, gray):
         started = time.monotonic()
         result = self.yolo.predict(frame, imgsz=640, conf=self.conf, device=self.device, verbose=False)[0]
         cls = result.boxes.cls.cpu().numpy()
-        self.boxes = result.boxes.xyxy.cpu().numpy()[cls == 0]
+        boxes = result.boxes.xyxy.cpu().numpy()
+        conf = result.boxes.conf.cpu().numpy()
+        self.boxes = boxes[cls == 0]
+        crosses = np.flatnonzero(cls == 1)
+        self.cross_box = boxes[crosses[np.argmax(conf[crosses])]] if len(crosses) else None
         self.yolo_ms = (time.monotonic()-started)*1000
+        self.sam_ms, self.sam_mask_count, self.used_sam = 0.0, 0, False
         if not len(self.boxes):
-            self.sam_ms, self.sam_mask_count = 0.0, 0
             return []
-        return self.squares_from_masks(gray, self.refine(frame, gray, self.boxes))
+        if self.previous_mask is None:
+            found = self.squares_from_masks(gray, self.refine(frame, gray, self.boxes))
+            self.used_sam = True
+            if len(found) >= 3:
+                return found
+        # Tracking (or SAM2 found too few): rule-based squares, kept only inside YOLO boxes.
+        return [t for t in CornerKeys.squares(self, gray) if self.inside(t['center'], self.boxes)]
+
+    def wafer(self, gray, mask):
+        if self.cross_box is None:
+            return super().wafer(gray, mask)
+        x0, y0, x1, y1 = self.cross_box
+        pad = self.BOX_PAD*max(x1-x0, y1-y0)+8
+        h, w = gray.shape
+        xa, ya = max(0, int(x0-pad)), max(0, int(y0-pad))
+        xb, yb = min(w, int(x1+pad)+1), min(h, int(y1+pad)+1)
+        # Flat fill outside the box has no contrast, so the masked correlation rejects it there.
+        only = np.full_like(gray, int(np.median(gray)))
+        only[ya:yb, xa:xb] = gray[ya:yb, xa:xb]
+        return super().wafer(only, mask)
 
 
 class OpenCvSam2Keys(BoxSam2Keys):

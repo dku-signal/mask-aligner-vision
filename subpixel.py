@@ -158,14 +158,154 @@ def refine_cross(gray, valid, centre, size, angle):
 
 
 class PreciseKeys(CornerKeys):
+    # Mask key on the fixed (top) plate, wafer key on the moving disc - the 10/12 and
+    # 2026-11-05 rig layout. Set False if the stage ever carries the mask key again.
+    FIXED_MASK = True
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.search_scale = 100.0  # whole frame: the wafer key may be anywhere in view
 
+    def track_mask(self, gray):
+        """Mask key from 2+ squares when the rest merge with the wafer cross (keys overlapping).
+
+        The key is rigid: match visible squares to the last full detection shifted by one
+        common translation, and rebuild the hidden squares from it. Only while tracking
+        (previous_mask set), never for a first detection.
+        """
+        full = getattr(self, 'last_full_mask', None)
+        if full is None or self.previous_mask is None:
+            return None
+        prev_quads = [np.asarray(q, np.float64) for q in full['quads']]
+        prev_centres = np.array([q.mean(axis=0) for q in prev_quads])
+        side = float(np.mean([np.linalg.norm(q[1]-q[0]) for q in prev_quads]))
+        found = [t for t in CornerKeys.squares(self, gray) if .72 < t['side']/side < 1.39]
+        ink = float(full.get('ink', 60))
+        h, w = gray.shape
+
+        def hidden_darkness(matched, d):
+            # A hidden square is still there, merged with a dark cross arm: its spot must be dark.
+            # The mirrored hypothesis (2 visible squares in one column fit either column)
+            # puts it on bright background instead.
+            levels = []
+            for j, q in enumerate(prev_quads):
+                if j in matched:
+                    continue
+                c = q.mean(axis=0)+d
+                if not (0 <= c[0] < w and 0 <= c[1] < h):
+                    return None
+                m = np.zeros(gray.shape, np.uint8)
+                cv2.fillConvexPoly(m, np.round((q-q.mean(axis=0))*.6+c).astype(np.int32), 1)
+                levels.append(float(gray[m > 0].mean()))
+            return max(levels) if levels else ink
+
+        best, best_key = None, None
+        for t in found:
+            for k in range(len(prev_quads)):  # hypothesis: t is square k of the last full key
+                d = t['center']-prev_centres[k]
+                matched = {}
+                for u in found:
+                    e = np.linalg.norm(prev_centres+d-u['center'], axis=1)
+                    j = int(np.argmin(e))
+                    if e[j] < .25*side:
+                        matched[j] = u
+                if len(matched) < 2:
+                    continue
+                dark = hidden_darkness(matched, d)
+                if dark is None:
+                    continue
+                key = (len(matched), -dark)
+                if best_key is None or key > best_key:
+                    best, best_key = matched, key
+        # The brightest hidden spot must still look like ink, not background.
+        if best is None or -best_key[1] > ink+.5*(float(np.percentile(gray, 75))-ink):
+            return None
+        # Measured squares first (quads[:observed] means measured everywhere else).
+        ids = sorted(best)
+        measured = []
+        for j in ids:
+            r = refine_quad(gray, best[j]['quad'])
+            measured.append(r if r is not None else np.asarray(best[j]['quad'], np.float64))
+        d = np.mean([q.mean(axis=0)-prev_centres[j] for j, q in zip(ids, measured)], axis=0)
+        hidden = [prev_quads[j]+d for j in range(len(prev_quads)) if j not in best]
+        return dict(full, center=np.asarray(full['center'], np.float64)+d,
+                    quads=[q.astype(np.float32) for q in measured+hidden],
+                    observed=len(ids), score=full.get('score', 0)-.5, tracked=True)
+
+    def spot_level(self, gray, quad, centre):
+        """Mean grey inside a shrunken copy of quad placed at centre (None if off-frame)."""
+        h, w = gray.shape
+        if not (0 <= centre[0] < w and 0 <= centre[1] < h):
+            return None
+        q = np.asarray(quad, np.float64)
+        m = np.zeros(gray.shape, np.uint8)
+        cv2.fillConvexPoly(m, np.round((q-q.mean(axis=0))*.6+centre).astype(np.int32), 1)
+        return float(gray[m > 0].mean()) if m.any() else None
+
+    def cold_mask(self, gray):
+        """Mask key from 2 visible squares with no history (app started with the keys overlapping).
+
+        Two squares of the 2x2 key are either neighbours (the other two sit on one side or the
+        other) or diagonal (the other two are fixed). The hidden squares merge with the dark
+        cross, so the right hypothesis is the one whose hidden spots are dark.
+        """
+        sq = CornerKeys.squares(self, gray)
+        bright = float(np.percentile(gray, 75))
+        best = None
+        for i, a in enumerate(sq):
+            for b in sq[i+1:]:
+                if not .72 < a['side']/b['side'] < 1.39:
+                    continue
+                side = (a['side']+b['side'])/2
+                v = b['center']-a['center']
+                d = float(np.linalg.norm(v))
+                ratio = d/side
+                perp = np.array([-v[1], v[0]])
+                if 1.45 < ratio < 3.2:  # neighbours
+                    options = [[a['center']+perp, b['center']+perp], [a['center']-perp, b['center']-perp]]
+                elif 1.45*1.41 < ratio < 3.2*1.41:  # diagonal
+                    mid = (a['center']+b['center'])/2
+                    options = [[mid+perp/2, mid-perp/2]]
+                else:
+                    continue
+                ink = (a['ink']+b['ink'])/2
+                for hidden in options:
+                    levels = [self.spot_level(gray, a['quad'], c) for c in hidden]
+                    if any(l is None for l in levels):
+                        continue
+                    dark = max(levels)
+                    if dark > ink+.5*(bright-ink):
+                        continue  # a hidden spot on bright background: wrong side
+                    if best is None or dark < best[0]:
+                        best = (dark, a, b, hidden)
+        if best is None:
+            return None
+        _, a, b, hidden = best
+        measured = []
+        for t in (a, b):
+            r = refine_quad(gray, t['quad'])
+            measured.append(r if r is not None else np.asarray(t['quad'], np.float64))
+        rebuilt = [measured[0]-measured[0].mean(axis=0)+c for c in hidden]
+        centres = np.array([q.mean(axis=0) for q in measured+rebuilt])
+        edges = np.concatenate([np.roll(q, -1, axis=0)-q for q in measured])
+        z = np.exp(4j*np.arctan2(edges[:, 1], edges[:, 0])).mean()
+        side = float(np.mean([np.linalg.norm(q[1]-q[0]) for q in measured]))
+        spacing = float(np.median([np.linalg.norm(centres[0]-c) for c in centres[1:]]))
+        return dict(center=centres.mean(axis=0), angle=float(np.angle(z)/4*180/np.pi) % 90,
+                    size=min(spacing, float(np.linalg.norm(centres[0]-centres[1])))+side,
+                    quads=[q.astype(np.float32) for q in measured+rebuilt], observed=2,
+                    score=0.0, ink=(a['ink']+b['ink'])/2, tracked=True)
+
     def mask_geometry(self, gray):
         g = super().mask_geometry(gray)
         if g is None:
-            return None
+            g = self.track_mask(gray)
+            if g is None and self.FIXED_MASK and self.previous_mask is not None:
+                # The mask key sits on the fixed plate and the camera is fixed, so its last full
+                # measurement still holds while the wafer cross covers its squares.
+                g = getattr(self, 'last_full_mask', None)
+                g = dict(g, cached=True) if g is not None else None
+            return g if g is not None else self.cold_mask(gray)
         observed = g['observed']
         quads = g['quads'][:observed if observed == 4 else 3]
         refined = [refine_quad(gray, q) for q in quads]
@@ -186,6 +326,7 @@ class PreciseKeys(CornerKeys):
         z = np.exp(4j*np.arctan2(edges[:, 1], edges[:, 0])).mean()
         g = dict(g, center=centre, angle=float(np.angle(z)/4*180/np.pi) % 90,
                  quads=[r.astype(np.float32) for r in refined]+g['quads'][len(refined):])
+        self.last_full_mask = g
         return g
 
     def wafer(self, gray, mask):

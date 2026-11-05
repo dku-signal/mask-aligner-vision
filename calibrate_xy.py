@@ -116,25 +116,31 @@ class Rig:
 
 
 def probe(rig, axis):
-    """Move axis +n/-n with growing n; return (n, forward_px_vector, return_px_vector)."""
+    """Move axis +n/-n with growing n; return (n, forward_px_vector, return_px_vector).
+
+    The vectors are changes of (wafer - mask), the error the app drives to zero, so the
+    result is right whichever key the stage carries (2026-11: the mask squares are on the
+    moving disc and the wafer cross is fixed).
+    """
     n = START_STEPS
     while True:
         w0, m0 = rig.measure()
         rig.move(axis, n)
         w1, m1 = rig.measure()
         rig.move(axis, -n)
-        w2, _ = rig.measure()
-        fwd, back = w1-w0, w2-w1
+        w2, m2 = rig.measure()
+        fwd, back = (w1-m1)-(w0-m0), (w2-m2)-(w1-m1)
         moved = float(np.linalg.norm(fwd))
-        mask_shift = float(np.linalg.norm(m1-m0))
-        print(f'  {axis} {n:+5d} steps: wafer moved {fwd.round(2)} px, '
-              f'return {back.round(2)} px, mask {mask_shift:.2f} px')
-        if mask_shift > 2.0:
-            # One glitchy frame set (shadow, reflection, wrong square) must not abort; a real move persists.
-            _, m_again = rig.measure(12)
-            if float(np.linalg.norm(m_again-m0)) > 2.0:
-                raise SystemExit('the MASK key moved: the stage carries the mask, not the wafer; stop and check')
-            print('    (mask jump was a one-off detection glitch; continuing)')
+        wafer_shift, mask_shift = float(np.linalg.norm(w1-w0)), float(np.linalg.norm(m1-m0))
+        carried = 'wafer' if wafer_shift >= mask_shift else 'mask'
+        print(f'  {axis} {n:+5d} steps: offset changed {fwd.round(2)} px, return {back.round(2)} px '
+              f'(wafer {wafer_shift:.2f} px, mask {mask_shift:.2f} px -> stage carries the {carried})')
+        if min(wafer_shift, mask_shift) > 2.0:
+            # Both keys moving means a detection glitch (shadow, wrong square); a real fixed key stays put.
+            w_again, m_again = rig.measure(12)
+            if min(float(np.linalg.norm(w_again-w0)), float(np.linalg.norm(m_again-m0))) > 2.0:
+                raise SystemExit('both keys moved: the camera or the fixed key moved; stop and check')
+            print('    (one-off detection glitch; measuring again)')
             continue
         if moved > MAX_SAFE_PX:
             raise SystemExit(f'{axis}: {n} steps moved {moved:.0f} px, more than expected; stopping')
@@ -147,7 +153,7 @@ def probe(rig, axis):
 
 def solve(results):
     """App convention: steps = dx * STEPS_PER_PIXEL * MOTOR_SIGN, dx = wafer - mask,
-    and a correct move shifts the wafer by -dx."""
+    and a correct move changes (wafer - mask) by -dx (whichever key the stage carries)."""
     vec = {a: fwd/n for a, (n, fwd, back) in results.items()}  # px per +1 step
     # Arduino X drives mostly image Y -> commands are swapped.
     swap = abs(vec['X'][1]) > abs(vec['X'][0])

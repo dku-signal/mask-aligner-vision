@@ -97,7 +97,7 @@ class FakeCap:
 
 
 class FakeFirmware(threading.Thread):
-    """Same line protocol and soft limit as firmware/xy_tb6560."""
+    """Same line protocol and soft limit as firmware/xy_tb6560 (+ aligner_mega loader lines)."""
 
     def __init__(self, world, limit=4000):
         super().__init__(daemon=True)
@@ -138,6 +138,18 @@ class FakeFirmware(threading.Thread):
             time.sleep(abs(n)*200e-6+.05)
             self.world.step(axis, n)
             self.reply('DONE')
+        elif line[:3] in ('R1 ', 'R2 ', 'FY '):
+            self.reply(f'MOVE {line}')
+            time.sleep(.05)
+            self.reply('DONE')
+        elif line.startswith('Z '):
+            _, which, d, ms = line.split()
+            time.sleep(int(ms)/1000)
+            self.reply('DONE Z')
+        elif line.startswith('MAG '):
+            self.reply(f'DONE {line}')
+        elif line == 'DIST':
+            self.reply('DIST 1.58')
         elif line.startswith('T'):
             self.reply('ERR T disabled')
         else:
@@ -184,7 +196,30 @@ def main():
         time.sleep(.1)
     true = world.wafer()-world.mask
     moves = [l for l in fw.log if l[:2] in ('X ', 'Y ')]
-    print(f'\nresult: phase={app.phase}  moves={len(moves)}  time={time.time()-t0:.1f}s')
+    xy_result = (app.phase, len(moves), time.time()-t0, true.copy())
+
+    print('\n=== 3. Z mode, magnet, loader, distance, transfer (aligner_mega lines)')
+    app_mod.Z_MODES = {'contact': (200, 300, 200), 'proximity': (100, 300, 100)}
+    app_mod.TRANSFER_SEQUENCE = ['MAG 1 1', 'R1 -2000', 'Z 3 1 100', 'MAG 1 0']
+    start = len(fw.log)
+
+    def run(label, call):
+        assert call(), f'{label}: refused (app busy?)'
+        while True:
+            time.sleep(.05)
+            with app.lock:
+                if not app.auto_running:
+                    print(f'  {label:10s} -> {app.status}')
+                    return
+    run('contact', lambda: app.z_mode('contact'))
+    run('magnet', lambda: app.run_commands('MAG 1', [('MAG 1 1', 'DONE MAG 1 1', 2.0, 0.0)]))
+    run('loader', lambda: app.run_commands('R1 move', [('R1 500', 'DONE', 5.0, 0.0)]))
+    run('dist', lambda: app.run_commands('DIST', [('DIST', 'DIST *', 2.0, 0.0)]))
+    run('transfer', lambda: app.run_commands('transfer', [(l, 'DONE*', 5.0, 0.0) for l in app_mod.TRANSFER_SEQUENCE]))
+    print('  sent:', fw.log[start:])
+    print(f'  distance shown: {app.distance} mm, z mode: {app.z_last_mode}')
+    phase, nmoves, elapsed, true = xy_result
+    print(f'\nresult: phase={phase}  moves={nmoves}  time={elapsed:.1f}s')
     print(f'TRUE remaining offset: dx={true[0]:+.3f} px  dy={true[1]:+.3f} px  |e|={np.linalg.norm(true):.3f} px')
     print(f'stage position (steps): X={int(world.pos[0])} Y={int(world.pos[1])}  (limit +-{fw.limit})')
     app.shutdown()

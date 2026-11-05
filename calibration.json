@@ -1,28 +1,11 @@
 {
-  "SWAP_XY_COMMANDS": true,
+  "SWAP_XY_COMMANDS": false,
   "MOTOR_SIGN_X": 1,
-  "STEPS_PER_PIXEL_X": 202.5121,
-  "MOTOR_SIGN_Y": 1,
-  "STEPS_PER_PIXEL_Y": 225.5299,
-  "MAX_STEPS_PER_AXIS": 13531,
+  "MOTOR_SIGN_Y": -1,
+  "STEPS_PER_PIXEL_X": 216.83,
+  "STEPS_PER_PIXEL_Y": 285.21,
+  "MAX_STEPS_PER_AXIS": 17112,
   "DEAD_BAND_PX": 0.5,
-  "MANUAL_STEPS": 2255,
-  "_soft_limit_steps": 18042,
-  "_report": {
-    "X": {
-      "steps": 2560,
-      "px_per_step": 0.00443,
-      "image_axis": "Y",
-      "backlash_px": 0.197,
-      "skew_deg": 0.06
-    },
-    "Y": {
-      "steps": 2560,
-      "px_per_step": 0.00494,
-      "image_axis": "X",
-      "backlash_px": 0.029,
-      "skew_deg": -2.55
-    }
-  },
-  "_measured_at": "2026-10-12 12:08:26"
+  "MANUAL_STEPS": 2852,
+  "_measured_at": "2026-11-05 jog-derived, signs flipped after key swap (wafer cross on the moving disc)"
 }

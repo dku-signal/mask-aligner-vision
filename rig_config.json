@@ -1,0 +1,18 @@
+{
+  "_note": "Z mode times (ms) and the transfer sequence. Edit on the rig, then restart the app.",
+  "Z_WHICH": 3,
+  "Z_MODES": {
+    "contact": [
+      2000,
+      2000,
+      2000
+    ],
+    "proximity": [
+      1000,
+      2000,
+      1000
+    ]
+  },
+  "TRANSFER_SEQUENCE": [],
+  "THETA_TOL_DEG": 1.5
+}

@@ -306,6 +306,17 @@ THETA_PROBE_MS = (100, 150, 200, 250)
 THETA_MAX_PULSES = 100
 THETA_TIMEOUT_SEC = 180.0
 VISION_TIMEOUT_SEC = 5.0
+# Loader / Z / magnets (firmware/aligner_mega). rig_config.json overrides these.
+# Z moves both mask actuators (Z1+Z2 = 3): down ms, hold ms, up ms. HW team tunes the times.
+Z_WHICH = 3
+Z_MODES = {'contact': (2000, 2000, 2000), 'proximity': (1000, 2000, 1000)}
+# Transfer = list of firmware lines run in order, e.g. ["MAG 1 1", "R1 -20000", "Z ..."].
+# Empty until the loader positions are measured on the rig.
+TRANSFER_SEQUENCE = []
+LOADER_AXES = ('R1', 'R2', 'FY')
+# Dataset recording for YOLO/SAM2 training: raw camera frames (no overlay) every RECORD_INTERVAL_SEC.
+RECORD_INTERVAL_SEC = 0.5
+RECORD_ROOT = 'data/raw'
 
 def wrap90(a):
     return (a + 45.0) % 90.0 - 45.0
@@ -479,7 +490,7 @@ class ArduinoLink:
                 return False
             if line:
                 print(f'<- {line}', flush=True)
-            if line == expected:
+            if line == expected or (expected.endswith('*') and line.startswith(expected[:-1])):
                 return True
             if line == 'STOP' or line.startswith('ERR'):
                 self.last_error = f'Arduino replied: {line}'
@@ -617,6 +628,11 @@ class MaskAlignerApp:
         self.auto_running = False
         self.align_finished = False
         self.moving = False
+        self.distance = None
+        self.z_last_mode = None
+        self.record_dir = None
+        self.record_count = 0
+        self.record_last = 0.0
         self.stable = False
         self.centered_count = 0
         self.wafer_lost_count = 0
@@ -800,6 +816,9 @@ class MaskAlignerApp:
                         self.capture_fps = rate if not self.capture_fps else .8*self.capture_fps + .2*rate
                     previous_capture = captured
                     self.frame_ready.notify_all()
+                    record_dir = self.record_dir if captured - self.record_last >= RECORD_INTERVAL_SEC else None
+                if record_dir is not None:
+                    self.record_frame(record_dir, frame, captured)
         except Exception as exc:
             self.invalidate_camera_frame()
             self.fail(f'Camera error: {exc}')
@@ -1077,6 +1096,66 @@ class MaskAlignerApp:
             self.workers.append(manual_worker)
             manual_worker.start()
 
+    def set_recording(self, on):
+        from pathlib import Path
+        with self.lock:
+            if on and self.record_dir is None:
+                name = time.strftime('%Y%m%d_%H%M%S') + f'_cam{self.camera_index}'
+                self.record_dir = Path(__file__).resolve().parent/RECORD_ROOT/name
+                self.record_dir.mkdir(parents=True, exist_ok=True)
+                self.record_count = 0
+                self.status = f'RECORD start: {RECORD_ROOT}/{name}'
+            elif not on and self.record_dir is not None:
+                self.status = f'RECORD stop: {self.record_count} frames in {self.record_dir.name}'
+                self.record_dir = None
+
+    def record_frame(self, record_dir, frame, captured):
+        # Raw frame + what the app knew at that moment (phase, motion, OpenCV centres = pseudo labels).
+        name = f'{self.record_count:06d}.jpg'
+        if not cv2.imwrite(str(record_dir/name), frame, [cv2.IMWRITE_JPEG_QUALITY, 95]):
+            return
+        with self.lock:
+            meta = {'file': name, 't': round(time.time(), 3), 'camera': self.camera_index, 'phase': self.phase,
+                    'moving': self.moving, 'mask_center': self.mask_center, 'wafer_center': self.wafer_center}
+            self.record_count += 1
+            self.record_last = captured
+        with open(record_dir/'frames.jsonl', 'a') as f:
+            f.write(json.dumps(meta, default=float) + '\n')
+
+    def run_commands(self, label, commands):
+        """Run firmware lines (Z mode, magnets, loader, transfer) in a worker; STOP cancels."""
+        with self.lock:
+            if self.exit_event.is_set() or self.moving or self.auto_running:
+                return False
+            self.auto_running = True
+            self.phase = 'MANUAL'
+            self.stop_event.clear()
+            self.generation += 1
+            generation = self.generation
+            self.status = f'{label}: start'
+
+        def worker():
+            ok = self.execute(commands, generation)
+            with self.lock:
+                if generation == self.generation:
+                    self.auto_running = False
+                    self.status = f'{label}: done' if ok else f'{label}: stopped'
+                    if ok and self.arduino.last_rx.startswith('DIST '):
+                        self.distance = self.arduino.last_rx[5:]
+        thread = threading.Thread(target=worker, name=f'run_{label}', daemon=True)
+        with self.lock:
+            self.workers = [t for t in self.workers if t.is_alive()]
+            self.workers.append(thread)
+            thread.start()
+        return True
+
+    def z_mode(self, mode):
+        down, hold, up = Z_MODES[mode]
+        self.z_last_mode = mode
+        return self.run_commands(f'Z {mode}', [
+            (f'Z {Z_WHICH} -1 {down}', 'DONE Z', down/1000+3, hold/1000),
+            (f'Z {Z_WHICH} 1 {up}', 'DONE Z', up/1000+3, 0.0)])
+
     def begin_theta_recheck(self, before, direction, duration, err, reason):
         with self.lock:
             self.theta_recheck = (before, direction, duration, err)
@@ -1277,6 +1356,8 @@ class MaskAlignerApp:
     def get_status(self):
         with self.lock:
             return {'version': APP_VERSION, 'axis_mapping': f"image X -> Arduino {arduino_axis('X')}; image Y -> Arduino {arduino_axis('Y')}", 'status': self.status, 'camera_index': self.camera_index, 'arduino_connected': self.arduino.connected(), 'arduino_port': self.arduino.port or '-', 'auto_running': self.auto_running, 'align_finished': self.align_finished, 'moving': self.moving, 'stable': self.stable, 'history_len': len(self.history), 'stable_history': STABLE_HISTORY, 'mask_detected': self.mask_detected, 'wafer_detected': self.wafer_detected, 'wafer_lost_count': self.wafer_lost_count, 'dx': self.dx, 'dy': self.dy, 'steps_x': self.steps_x, 'steps_y': self.steps_y, 'quadrant': self.quadrant, 'quadrant_fix': self.quadrant_fix, 'phase': self.phase, 'theta_aligned': self.phase in ('XY', 'DONE'), 'theta_error': self.theta_error, 'theta_done_error': self.theta_done_error, 'mask_center': self.mask_center, 'wafer_center': self.wafer_center, 'motion_stage': self.motion_stage, 'last_rx': self.arduino.last_rx, 'serial_error': self.arduino.last_error,
+                    'distance': self.distance, 'z_mode': self.z_last_mode, 'transfer_steps': len(TRANSFER_SEQUENCE),
+                    'recording': self.record_dir is not None, 'record_count': self.record_count,
                     'capture_fps': self.capture_fps if time.monotonic()-self.capture_time < 1.5 else 0,
                     'preview_fps': self.preview_fps if time.monotonic()-self.capture_time < 1.5 else 0,
                     'vision_fps': self.vision_fps if not self.moving and time.monotonic()-self.frame_time < VISION_TIMEOUT_SEC else 0,
@@ -1415,6 +1496,47 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.app.manual_move(axis, steps)
             self.send_json({'ok': True})
             return
+        if parsed.path == '/api/record':
+            self.app.set_recording(query.get('on', ['0'])[0] == '1')
+            self.send_json({'ok': True})
+            return
+        if parsed.path == '/api/zmode':
+            mode = query.get('mode', [''])[0]
+            if mode not in Z_MODES:
+                self.send_json({'ok': False, 'error': 'mode contact/proximity'}, 400)
+                return
+            self.send_json({'ok': self.app.z_mode(mode)})
+            return
+        if parsed.path == '/api/magnet':
+            n, on = query.get('n', [''])[0], query.get('on', [''])[0]
+            if n not in ('1', '2') or on not in ('0', '1'):
+                self.send_json({'ok': False, 'error': 'n 1/2, on 0/1'}, 400)
+                return
+            self.send_json({'ok': self.app.run_commands(f'MAG {n}', [(f'MAG {n} {on}', f'DONE MAG {n} {on}', 2.0, 0.0)])})
+            return
+        if parsed.path == '/api/loader':
+            axis = query.get('axis', [''])[0]
+            try:
+                steps = int(query.get('steps', ['0'])[0])
+            except ValueError:
+                steps = 0
+            if axis not in LOADER_AXES or steps == 0 or abs(steps) > 400000:
+                self.send_json({'ok': False, 'error': 'axis R1/R2/FY, 0 < |steps| <= 400000'}, 400)
+                return
+            # Rails run ~5000 steps/s, the Foyu axis 125 steps/s.
+            timeout = abs(steps)/(125 if axis == 'FY' else 4000)+5
+            self.send_json({'ok': self.app.run_commands(f'{axis} move', [(f'{axis} {steps}', 'DONE', timeout, 0.2)])})
+            return
+        if parsed.path == '/api/dist':
+            self.send_json({'ok': self.app.run_commands('DIST', [('DIST', 'DIST *', 2.0, 0.0)])})
+            return
+        if parsed.path == '/api/transfer':
+            if not TRANSFER_SEQUENCE:
+                self.send_json({'ok': False, 'error': 'TRANSFER_SEQUENCE is empty (rig_config.json)'}, 400)
+                return
+            commands = [(line, 'DONE*', 120.0, 0.3) for line in TRANSFER_SEQUENCE]
+            self.send_json({'ok': self.app.run_commands('transfer', commands)})
+            return
         self.send_error(404)
 
 CALIBRATED_KEYS = ('SWAP_XY_COMMANDS', 'MOTOR_SIGN_X', 'MOTOR_SIGN_Y', 'STEPS_PER_PIXEL_X',
@@ -1434,6 +1556,23 @@ def load_calibration(path):
             globals()[key] = data[key]
     print(f'Loaded {path.name} ({data.get("_measured_at", "?")}): ' +
           ', '.join(f'{k}={data[k]}' for k in CALIBRATED_KEYS if k in data))
+
+
+RIG_CONFIG_KEYS = ('Z_WHICH', 'Z_MODES', 'TRANSFER_SEQUENCE', 'THETA_TOL_DEG')
+
+
+def load_rig_config(path):
+    """Z mode times and the transfer sequence, tuned on the rig without editing code."""
+    from pathlib import Path
+    path = Path(path)
+    if not path.is_file():
+        return
+    data = json.loads(path.read_text())
+    for key in RIG_CONFIG_KEYS:
+        if key in data:
+            globals()[key] = data[key]
+    globals()['Z_MODES'] = {k: tuple(v) for k, v in Z_MODES.items()}
+    print(f'Loaded {path.name}: Z_MODES={Z_MODES}, transfer {len(TRANSFER_SEQUENCE)} steps, THETA_TOL_DEG={THETA_TOL_DEG}')
 
 
 def find_key_camera(max_index=4):
@@ -1471,6 +1610,8 @@ def main():
                         help='serial port, e.g. COM3 or /dev/cu.usbmodemXXXX (default: auto). --port is the web page port')
     parser.add_argument('--skip-theta', action='store_true',
                         help='start alignment at XY (no theta motor connected)')
+    parser.add_argument('--rig-config', default=str(Path(__file__).resolve().parent/'rig_config.json'),
+                        help='Z mode times and transfer sequence (optional)')
     parser.add_argument('--calibration', default=str(Path(__file__).resolve().parent/'calibration.json'),
                         help='calibrate_xy.py output to load (default: calibration.json next to this file)')
     parser.add_argument('--detector', choices=('opencv', 'opencv-v4', 'sam2', 'hybrid', 'yolo-sam2', 'opencv-sam2'), default='opencv',
@@ -1491,6 +1632,7 @@ def main():
     if args.opencv_threads:
         cv2.setNumThreads(args.opencv_threads)
     load_calibration(args.calibration)
+    load_rig_config(args.rig_config)
     if args.arduino_port:
         global ARDUINO_PORT
         ARDUINO_PORT = args.arduino_port
@@ -1554,11 +1696,30 @@ pre{white-space:pre-wrap;line-height:1.7}small{display:block;margin-top:16px;lin
 <span></span><button onclick="jog('Y',1)">↓</button><span></span>
 </div>
 <small>키가 화면 밖에 있어도 동작합니다 (보정값 기준 이동, 실제 이동량은 약간 다를 수 있음). 이동 한계는 그대로 적용됩니다.</small>
-<small>START 한 번으로 세타 구동·검증을 반복하고, ±4° 이내 확인 후 X → Y 중심 정렬로 자동 전환합니다.<br>X·Y에서는 각도 검출을 요구하지 않습니다.<br>MASK의 검은 사각형 4개 배치와 WAFER의 남은 십자 팔로 중심을 구합니다. 각 축의 중심 오차가 6px 미만인 상태로 8프레임 연속 확인되면 ALIGN FINISH입니다. MASK 3/4는 3개 실측과 1개 위치 복원을 뜻합니다.</small>
+<div id="rig">
+<p><b>학습 데이터 녹화</b> (0.5초마다 원본 프레임 저장)</p>
+<button onclick="post('/api/record?on=1')">녹화 시작</button><button onclick="post('/api/record?on=0')">녹화 정지</button>
+<p><b>Z 노광 모드</b> (마스크 Z1+Z2: 내림 → 유지 → 올림)</p>
+<button onclick="post('/api/zmode?mode=contact')">CONTACT</button>
+<button onclick="post('/api/zmode?mode=proximity')">PROXIMITY</button>
+<p><b>전자석</b></p>
+<button onclick="post('/api/magnet?n=1&on=1')">자석1 ON</button><button onclick="post('/api/magnet?n=1&on=0')">자석1 OFF</button><br>
+<button onclick="post('/api/magnet?n=2&on=1')">자석2 ON</button><button onclick="post('/api/magnet?n=2&on=0')">자석2 OFF</button>
+<p><b>이송부 수동</b></p>
+<select id="laxis"><option value="R1">레일1 (R1)</option><option value="R2">레일2 (R2)</option><option value="FY">포유테크 X (FY)</option></select>
+<input id="lsteps" type="number" value="1000" min="1" style="width:90px"> steps<br>
+<button onclick="loader(-1)">− 방향</button><button onclick="loader(1)">+ 방향</button>
+<p><b>센서 · 이송</b></p>
+<button onclick="post('/api/dist')">거리 측정</button>
+<button onclick="post('/api/transfer')">이송 실행</button>
+<small>모든 동작은 STOP으로 멈춥니다. 이송 순서는 rig_config.json의 TRANSFER_SEQUENCE에 적습니다.</small>
+</div>
+<small>START 한 번으로 세타 구동·검증을 반복하고, 허용 각도(rig_config.json의 THETA_TOL_DEG) 이내 확인 후 X → Y 중심 정렬로 자동 전환합니다.<br>X·Y에서는 각도 검출을 요구하지 않습니다.<br>MASK의 검은 사각형 4개 배치와 WAFER의 남은 십자 팔로 중심을 구합니다. 각 축의 중심 오차가 6px 미만인 상태로 8프레임 연속 확인되면 ALIGN FINISH입니다. MASK 3/4는 3개 실측과 1개 위치 복원을 뜻합니다.</small>
 </aside></main>
 <script>
 async function post(path){await fetch(path,{method:'POST'});await refresh()}
 function manual(axis,steps){return post(`/api/manual?axis=${axis}&steps=${steps}`)}
+function loader(dir){const a=document.getElementById('laxis').value,n=parseInt(document.getElementById('lsteps').value||'0');if(n>0)return post(`/api/loader?axis=${a}&steps=${dir*n}`)}
 function jog(axis,dir){const px=document.querySelector('input[name=px]:checked').value;return post(`/api/manual?axis=${axis}&dir=${dir}&px=${px}`)}
 let refreshing=false;
 async function refresh(){if(refreshing)return;refreshing=true;try{
@@ -1567,7 +1728,7 @@ const n=x=>x==null?'-':x.toFixed(2);
 const banner=document.getElementById('thetaDone');
 banner.hidden=!d.theta_aligned;
 banner.textContent=d.phase==='DONE'?'세타 정렬 완료 · X·Y 정렬 완료':'세타 정렬 완료 — X·Y 정렬 시작 / 진행 중';
-document.getElementById('status').textContent=`${d.phase}: ${d.status}\nCamera: ${d.camera_index}\nArduino: ${d.arduino_connected?d.arduino_port:'OFF'}\nStage: ${d.motion_stage}\nRX: ${d.last_rx||'-'}\nSerial: ${d.serial_error||'OK'}\nTheta: ${d.theta_aligned?'완료 시 '+n(d.theta_done_error):n(d.theta_error)} deg\nMASK 중심: ${d.mask_center?d.mask_center.map(n).join(', '):'-'}\nWAFER 중심: ${d.wafer_center?d.wafer_center.map(n).join(', '):'-'}\n중심 정렬 확인: ${d.wafer_lost_count}/8\ndx: ${n(d.dx)} px / dy: ${n(d.dy)} px\n축 매핑: ${d.axis_mapping}\n화면 X 보정: ${d.steps_x} / 화면 Y 보정: ${d.steps_y}\nMASK: ${d.mask_detected?'OK':'NO'}\nWAFER: ${d.wafer_detected?'OK':'NO'}\nStable: ${d.stable} (${d.history_len}/${d.stable_history})`;
+document.getElementById('status').textContent=`${d.phase}: ${d.status}\nCamera: ${d.camera_index}\nArduino: ${d.arduino_connected?d.arduino_port:'OFF'}\nStage: ${d.motion_stage}\nRX: ${d.last_rx||'-'}\n녹화: ${d.recording?'● '+d.record_count+'장':'꺼짐'}\n거리: ${d.distance??'-'} mm · Z 모드: ${d.z_mode||'-'} · 이송 단계: ${d.transfer_steps}\nSerial: ${d.serial_error||'OK'}\nTheta: ${d.theta_aligned?'완료 시 '+n(d.theta_done_error):n(d.theta_error)} deg\nMASK 중심: ${d.mask_center?d.mask_center.map(n).join(', '):'-'}\nWAFER 중심: ${d.wafer_center?d.wafer_center.map(n).join(', '):'-'}\n중심 정렬 확인: ${d.wafer_lost_count}/8\ndx: ${n(d.dx)} px / dy: ${n(d.dy)} px\n축 매핑: ${d.axis_mapping}\n화면 X 보정: ${d.steps_x} / 화면 Y 보정: ${d.steps_y}\nMASK: ${d.mask_detected?'OK':'NO'}\nWAFER: ${d.wafer_detected?'OK':'NO'}\nStable: ${d.stable} (${d.history_len}/${d.stable_history})`;
 document.getElementById('finish').style.display=d.align_finished?'flex':'none';
 document.getElementById('performance').textContent=`촬영 ${n(d.capture_fps)} / 화면 ${n(d.preview_fps)} / 인식 ${n(d.vision_fps)} FPS · 인식 ${n(d.vision_ms)} ms · 패턴 캐시 ${n(d.cache_mb)} / ${d.cache_limit_mb} MiB · 해상도 ${d.camera_shape?d.camera_shape.join('×'):'-'} · 촬영 후 ${n(d.measurement_age_ms)} ms / 결과 갱신 후 ${n(d.result_age_ms)} ms · 표시 완화 ${d.overlay_smoothing_ms} ms`;
 }catch(e){document.getElementById('status').textContent='UI disconnected'}finally{refreshing=false}}

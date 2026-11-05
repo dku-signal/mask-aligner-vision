@@ -21,3 +21,7 @@ dataset.yaml
 .DS_Store
 .idea/
 .vscode/
+
+# Recorded training frames (camera images, may contain people)
+data/
+dataset_real/

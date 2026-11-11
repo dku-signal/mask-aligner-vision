@@ -10,6 +10,7 @@ from collections import OrderedDict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 import cv2
+import prealign
 """Four-square mask geometry and occlusion-masked wafer contrast matching."""
 from pathlib import Path
 from itertools import combinations
@@ -317,6 +318,20 @@ LOADER_AXES = ('R1', 'R2', 'FY')
 # Dataset recording for YOLO/SAM2 training: raw camera frames (no overlay) every RECORD_INTERVAL_SEC.
 RECORD_INTERVAL_SEC = 0.5
 RECORD_ROOT = 'data/raw'
+# Pre-align (prealign.py, OpenCV only): notch angle on the loader camera -> PT pulses on the
+# continuous pre-align servo, re-measured after every pulse. PREALIGN_TARGET_DEG is the notch angle
+# saved with "기준 저장" after one good fine align, so a pre-aligned wafer arrives with its key
+# within a few degrees of the mask key. rig_config.json overrides these.
+PREALIGN_CAMERA = 1
+PREALIGN_TARGET_DEG = None
+PREALIGN_TOL_DEG = 1.0
+PREALIGN_MIN_MS = 60
+PREALIGN_MAX_MS = 2000  # must not exceed firmware PREALIGN_MAX_MS
+PREALIGN_PROBE_MS = 150
+PREALIGN_GAIN = 0.7
+PREALIGN_MAX_PULSES = 30
+PREALIGN_SETTLE_SEC = 0.4
+RIG_CONFIG_PATH = None
 
 def wrap90(a):
     return (a + 45.0) % 90.0 - 45.0
@@ -633,6 +648,11 @@ class MaskAlignerApp:
         self.record_dir = None
         self.record_count = 0
         self.record_last = 0.0
+        self.prealign_cap = None
+        self.prealign_lock = threading.Lock()
+        self.prealign_angle = None
+        self.prealign_jpeg = None
+        self.prealign_seq = 0
         self.stable = False
         self.centered_count = 0
         self.wafer_lost_count = 0
@@ -1156,6 +1176,117 @@ class MaskAlignerApp:
             (f'Z {Z_WHICH} -1 {down}', 'DONE Z', down/1000+3, hold/1000),
             (f'Z {Z_WHICH} 1 {up}', 'DONE Z', up/1000+3, 0.0)])
 
+    def prealign_grab(self):
+        """One fresh loader-camera frame, or None (the main camera keeps its own thread)."""
+        if PREALIGN_CAMERA == self.camera_index:
+            return None
+        if self.prealign_cap is None:
+            self.prealign_cap = self.open_camera(PREALIGN_CAMERA)
+            if self.prealign_cap is None:
+                return None
+        for _ in range(4):  # drop frames buffered while the servo turned
+            self.prealign_cap.grab()
+        ok, frame = self.prealign_cap.read()
+        return frame if ok else None
+
+    def prealign_measure(self, frames=3):
+        """Median notch angle over a few loader-camera frames (prealign.find_notch), or None."""
+        with self.prealign_lock:
+            angles, frame, result = [], None, None
+            for _ in range(frames):
+                frame = self.prealign_grab()
+                if frame is None:
+                    break
+                result = prealign.find_notch(frame)
+                if result is not None:
+                    angles.append(result['angle'])
+            angle = None
+            if angles:
+                ref = angles[0]
+                angle = (ref+float(np.median([prealign.wrap180(a-ref) for a in angles]))) % 360
+            if frame is not None:
+                ok, jpg = cv2.imencode('.jpg', prealign.draw(frame, result, PREALIGN_TARGET_DEG))
+                if ok:
+                    self.prealign_jpeg = jpg.tobytes()
+        with self.lock:
+            self.prealign_angle = angle
+        return angle
+
+    def prealign_set_target(self):
+        """Save the current notch angle as the pre-align target (do this right after a good fine align)."""
+        global PREALIGN_TARGET_DEG
+        angle = self.prealign_measure()
+        if angle is None:
+            return False
+        PREALIGN_TARGET_DEG = round(angle, 2)
+        if RIG_CONFIG_PATH is not None:
+            data = json.loads(RIG_CONFIG_PATH.read_text()) if RIG_CONFIG_PATH.is_file() else {}
+            data['PREALIGN_TARGET_DEG'] = PREALIGN_TARGET_DEG
+            RIG_CONFIG_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False)+'\n')
+        with self.lock:
+            self.status = f'PREALIGN target saved: {PREALIGN_TARGET_DEG:.2f} deg'
+        return True
+
+    def prealign_run(self, generation):
+        """Turn the wafer until its notch sits at PREALIGN_TARGET_DEG. Returns the final status text."""
+        response = None  # notch degrees per ms for direction +1, learnt from the pulses
+        last = None      # (angle, direction, ms) before the previous pulse
+        for pulse in range(PREALIGN_MAX_PULSES+1):
+            if self.stop_event.is_set() or generation != self.generation:
+                return 'PREALIGN: stopped'
+            angle = self.prealign_measure()
+            if angle is None:
+                return 'PREALIGN FAIL: no wafer / notch on the loader camera'
+            err = prealign.wrap180(PREALIGN_TARGET_DEG-angle)
+            with self.lock:
+                self.status = f'PREALIGN notch {angle:.1f} deg, err {err:+.1f} deg (pulse {pulse})'
+            if abs(err) <= PREALIGN_TOL_DEG:
+                return f'PREALIGN DONE: notch {angle:.1f} deg, err {err:+.2f} deg, {pulse} pulses'
+            if last is not None:
+                moved = prealign.wrap180(angle-last[0])
+                if abs(moved) > 0.3:
+                    response = moved/(last[1]*last[2])
+                elif last[2] >= PREALIGN_MAX_MS:
+                    return f'PREALIGN FAIL: no measured rotation at {PREALIGN_MAX_MS} ms (servo power / coupling?)'
+            if response is None:
+                direction, ms = 1, PREALIGN_PROBE_MS if last is None else min(PREALIGN_MAX_MS, last[2]*2)
+            else:
+                direction = 1 if err/response > 0 else -1
+                ms = int(np.clip(PREALIGN_GAIN*abs(err/response), PREALIGN_MIN_MS, PREALIGN_MAX_MS))
+            self.prealign_seq += 1
+            seq = self.prealign_seq
+            if not self.execute([(f'PT {seq} {direction} {ms}', f'DONE PT {seq}', ms/1000+3, PREALIGN_SETTLE_SEC)], generation):
+                return 'PREALIGN: stopped'
+            last = (angle, direction, ms)
+        return f'PREALIGN FAIL: not within {PREALIGN_TOL_DEG} deg after {PREALIGN_MAX_PULSES} pulses'
+
+    def start_prealign(self):
+        if PREALIGN_TARGET_DEG is None:
+            with self.lock:
+                self.status = 'PREALIGN: no target yet (fine-align once, then press 기준 저장)'
+            return False
+        with self.lock:
+            if self.exit_event.is_set() or self.moving or self.auto_running:
+                return False
+            self.auto_running = True
+            self.phase = 'MANUAL'
+            self.stop_event.clear()
+            self.generation += 1
+            generation = self.generation
+
+        def worker():
+            message = self.prealign_run(generation)
+            with self.lock:
+                if generation == self.generation:
+                    self.auto_running = False
+                    self.status = message
+        thread = threading.Thread(target=worker, name='prealign', daemon=True)
+        with self.lock:
+            self.workers = [t for t in self.workers if t.is_alive()]
+            self.workers.append(thread)
+            thread.start()
+        return True
+
     def begin_theta_recheck(self, before, direction, duration, err, reason):
         with self.lock:
             self.theta_recheck = (before, direction, duration, err)
@@ -1358,6 +1489,8 @@ class MaskAlignerApp:
             return {'version': APP_VERSION, 'axis_mapping': f"image X -> Arduino {arduino_axis('X')}; image Y -> Arduino {arduino_axis('Y')}", 'status': self.status, 'camera_index': self.camera_index, 'arduino_connected': self.arduino.connected(), 'arduino_port': self.arduino.port or '-', 'auto_running': self.auto_running, 'align_finished': self.align_finished, 'moving': self.moving, 'stable': self.stable, 'history_len': len(self.history), 'stable_history': STABLE_HISTORY, 'mask_detected': self.mask_detected, 'wafer_detected': self.wafer_detected, 'wafer_lost_count': self.wafer_lost_count, 'dx': self.dx, 'dy': self.dy, 'steps_x': self.steps_x, 'steps_y': self.steps_y, 'quadrant': self.quadrant, 'quadrant_fix': self.quadrant_fix, 'phase': self.phase, 'theta_aligned': self.phase in ('XY', 'DONE'), 'theta_error': self.theta_error, 'theta_done_error': self.theta_done_error, 'mask_center': self.mask_center, 'wafer_center': self.wafer_center, 'motion_stage': self.motion_stage, 'last_rx': self.arduino.last_rx, 'serial_error': self.arduino.last_error,
                     'distance': self.distance, 'z_mode': self.z_last_mode, 'transfer_steps': len(TRANSFER_SEQUENCE),
                     'recording': self.record_dir is not None, 'record_count': self.record_count,
+                    'prealign_angle': self.prealign_angle, 'prealign_target': PREALIGN_TARGET_DEG,
+                    'prealign_camera': PREALIGN_CAMERA,
                     'capture_fps': self.capture_fps if time.monotonic()-self.capture_time < 1.5 else 0,
                     'preview_fps': self.preview_fps if time.monotonic()-self.capture_time < 1.5 else 0,
                     'vision_fps': self.vision_fps if not self.moving and time.monotonic()-self.frame_time < VISION_TIMEOUT_SEC else 0,
@@ -1381,6 +1514,9 @@ class MaskAlignerApp:
             if worker is not threading.current_thread():
                 worker.join(timeout=.75)
         self.arduino.close()
+        with self.prealign_lock:
+            if self.prealign_cap is not None:
+                self.prealign_cap.release()
 
 class RequestHandler(BaseHTTPRequestHandler):
     server_version = 'MaskAlignerHTTP/1.0'
@@ -1413,6 +1549,18 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == '/api/status':
             self.send_json(self.app.get_status())
+            return
+        if parsed.path == '/prealign.jpg':
+            jpg = self.app.prealign_jpeg
+            if jpg is None:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header('Content-Type', 'image/jpeg')
+            self.send_header('Content-Length', str(len(jpg)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(jpg)
             return
         if parsed.path == '/video.mjpg':
             self.send_response(200)
@@ -1530,6 +1678,21 @@ class RequestHandler(BaseHTTPRequestHandler):
         if parsed.path == '/api/dist':
             self.send_json({'ok': self.app.run_commands('DIST', [('DIST', 'DIST *', 2.0, 0.0)])})
             return
+        if parsed.path == '/api/prealign':
+            action = query.get('action', [''])[0]
+            if action == 'measure':
+                with self.app.lock:
+                    busy = self.app.auto_running
+                self.send_json({'ok': not busy and self.app.prealign_measure() is not None})
+            elif action == 'target':
+                with self.app.lock:
+                    busy = self.app.auto_running
+                self.send_json({'ok': not busy and self.app.prealign_set_target()})
+            elif action == 'start':
+                self.send_json({'ok': self.app.start_prealign()})
+            else:
+                self.send_json({'ok': False, 'error': 'action measure/target/start'}, 400)
+            return
         if parsed.path == '/api/transfer':
             if not TRANSFER_SEQUENCE:
                 self.send_json({'ok': False, 'error': 'TRANSFER_SEQUENCE is empty (rig_config.json)'}, 400)
@@ -1558,13 +1721,15 @@ def load_calibration(path):
           ', '.join(f'{k}={data[k]}' for k in CALIBRATED_KEYS if k in data))
 
 
-RIG_CONFIG_KEYS = ('Z_WHICH', 'Z_MODES', 'TRANSFER_SEQUENCE', 'THETA_TOL_DEG')
+RIG_CONFIG_KEYS = ('Z_WHICH', 'Z_MODES', 'TRANSFER_SEQUENCE', 'THETA_TOL_DEG',
+                   'PREALIGN_CAMERA', 'PREALIGN_TARGET_DEG', 'PREALIGN_TOL_DEG')
 
 
 def load_rig_config(path):
     """Z mode times and the transfer sequence, tuned on the rig without editing code."""
     from pathlib import Path
     path = Path(path)
+    globals()['RIG_CONFIG_PATH'] = path
     if not path.is_file():
         return
     data = json.loads(path.read_text())
@@ -1572,7 +1737,8 @@ def load_rig_config(path):
         if key in data:
             globals()[key] = data[key]
     globals()['Z_MODES'] = {k: tuple(v) for k, v in Z_MODES.items()}
-    print(f'Loaded {path.name}: Z_MODES={Z_MODES}, transfer {len(TRANSFER_SEQUENCE)} steps, THETA_TOL_DEG={THETA_TOL_DEG}')
+    print(f'Loaded {path.name}: Z_MODES={Z_MODES}, transfer {len(TRANSFER_SEQUENCE)} steps, THETA_TOL_DEG={THETA_TOL_DEG}, '
+          f'pre-align camera {PREALIGN_CAMERA} target {PREALIGN_TARGET_DEG}')
 
 
 def find_key_camera(max_index=4):
@@ -1709,6 +1875,11 @@ pre{white-space:pre-wrap;line-height:1.7}small{display:block;margin-top:16px;lin
 <select id="laxis"><option value="R1">레일1 (R1)</option><option value="R2">레일2 (R2)</option><option value="FY">포유테크 X (FY)</option></select>
 <input id="lsteps" type="number" value="1000" min="1" style="width:90px"> steps<br>
 <button onclick="loader(-1)">− 방향</button><button onclick="loader(1)">+ 방향</button>
+<p><b>프리얼라인</b> (로더 카메라 · 노치)</p>
+<img id="pimg" alt="로더 카메라: 측정을 누르세요" style="max-width:100%;background:#111;border-radius:6px">
+<button onclick="pre('measure')">노치 측정</button><button onclick="pre('target')">기준 저장</button>
+<button class="start" onclick="pre('start')">PREALIGN</button>
+<small>기준 저장: 정밀 정렬이 끝난 웨이퍼의 노치 각도를 목표로 저장합니다 (rig_config.json). PREALIGN은 노치가 목표 각도에 올 때까지 프리얼라인 서보를 돌리고 다시 재기를 반복합니다.</small>
 <p><b>센서 · 이송</b></p>
 <button onclick="post('/api/dist')">거리 측정</button>
 <button onclick="post('/api/transfer')">이송 실행</button>
@@ -1719,6 +1890,7 @@ pre{white-space:pre-wrap;line-height:1.7}small{display:block;margin-top:16px;lin
 <script>
 async function post(path){await fetch(path,{method:'POST'});await refresh()}
 function manual(axis,steps){return post(`/api/manual?axis=${axis}&steps=${steps}`)}
+async function pre(a){await post(`/api/prealign?action=${a}`);document.getElementById('pimg').src='/prealign.jpg?t='+Date.now()}
 function loader(dir){const a=document.getElementById('laxis').value,n=parseInt(document.getElementById('lsteps').value||'0');if(n>0)return post(`/api/loader?axis=${a}&steps=${dir*n}`)}
 function jog(axis,dir){const px=document.querySelector('input[name=px]:checked').value;return post(`/api/manual?axis=${axis}&dir=${dir}&px=${px}`)}
 let refreshing=false;
@@ -1728,8 +1900,9 @@ const n=x=>x==null?'-':x.toFixed(2);
 const banner=document.getElementById('thetaDone');
 banner.hidden=!d.theta_aligned;
 banner.textContent=d.phase==='DONE'?'세타 정렬 완료 · X·Y 정렬 완료':'세타 정렬 완료 — X·Y 정렬 시작 / 진행 중';
-document.getElementById('status').textContent=`${d.phase}: ${d.status}\nCamera: ${d.camera_index}\nArduino: ${d.arduino_connected?d.arduino_port:'OFF'}\nStage: ${d.motion_stage}\nRX: ${d.last_rx||'-'}\n녹화: ${d.recording?'● '+d.record_count+'장':'꺼짐'}\n거리: ${d.distance??'-'} mm · Z 모드: ${d.z_mode||'-'} · 이송 단계: ${d.transfer_steps}\nSerial: ${d.serial_error||'OK'}\nTheta: ${d.theta_aligned?'완료 시 '+n(d.theta_done_error):n(d.theta_error)} deg\nMASK 중심: ${d.mask_center?d.mask_center.map(n).join(', '):'-'}\nWAFER 중심: ${d.wafer_center?d.wafer_center.map(n).join(', '):'-'}\n중심 정렬 확인: ${d.wafer_lost_count}/8\ndx: ${n(d.dx)} px / dy: ${n(d.dy)} px\n축 매핑: ${d.axis_mapping}\n화면 X 보정: ${d.steps_x} / 화면 Y 보정: ${d.steps_y}\nMASK: ${d.mask_detected?'OK':'NO'}\nWAFER: ${d.wafer_detected?'OK':'NO'}\nStable: ${d.stable} (${d.history_len}/${d.stable_history})`;
+document.getElementById('status').textContent=`${d.phase}: ${d.status}\nCamera: ${d.camera_index}\nArduino: ${d.arduino_connected?d.arduino_port:'OFF'}\nStage: ${d.motion_stage}\nRX: ${d.last_rx||'-'}\n녹화: ${d.recording?'● '+d.record_count+'장':'꺼짐'}\n노치: ${d.prealign_angle==null?'-':n(d.prealign_angle)} deg · 목표: ${d.prealign_target==null?'미설정':n(d.prealign_target)} deg (카메라 ${d.prealign_camera})\n거리: ${d.distance??'-'} mm · Z 모드: ${d.z_mode||'-'} · 이송 단계: ${d.transfer_steps}\nSerial: ${d.serial_error||'OK'}\nTheta: ${d.theta_aligned?'완료 시 '+n(d.theta_done_error):n(d.theta_error)} deg\nMASK 중심: ${d.mask_center?d.mask_center.map(n).join(', '):'-'}\nWAFER 중심: ${d.wafer_center?d.wafer_center.map(n).join(', '):'-'}\n중심 정렬 확인: ${d.wafer_lost_count}/8\ndx: ${n(d.dx)} px / dy: ${n(d.dy)} px\n축 매핑: ${d.axis_mapping}\n화면 X 보정: ${d.steps_x} / 화면 Y 보정: ${d.steps_y}\nMASK: ${d.mask_detected?'OK':'NO'}\nWAFER: ${d.wafer_detected?'OK':'NO'}\nStable: ${d.stable} (${d.history_len}/${d.stable_history})`;
 document.getElementById('finish').style.display=d.align_finished?'flex':'none';
+if(d.auto_running&&d.status.startsWith('PREALIGN'))document.getElementById('pimg').src='/prealign.jpg?t='+Date.now();
 document.getElementById('performance').textContent=`촬영 ${n(d.capture_fps)} / 화면 ${n(d.preview_fps)} / 인식 ${n(d.vision_fps)} FPS · 인식 ${n(d.vision_ms)} ms · 패턴 캐시 ${n(d.cache_mb)} / ${d.cache_limit_mb} MiB · 해상도 ${d.camera_shape?d.camera_shape.join('×'):'-'} · 촬영 후 ${n(d.measurement_age_ms)} ms / 결과 갱신 후 ${n(d.result_age_ms)} ms · 표시 완화 ${d.overlay_smoothing_ms} ms`;
 }catch(e){document.getElementById('status').textContent='UI disconnected'}finally{refreshing=false}}
 setInterval(refresh,300);refresh();

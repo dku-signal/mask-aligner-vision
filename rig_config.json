@@ -14,5 +14,8 @@
     ]
   },
   "TRANSFER_SEQUENCE": [],
-  "THETA_TOL_DEG": 1.5
+  "THETA_TOL_DEG": 1.5,
+  "PREALIGN_CAMERA": 1,
+  "PREALIGN_TARGET_DEG": null,
+  "PREALIGN_TOL_DEG": 1.0
 }

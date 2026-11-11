@@ -138,7 +138,7 @@ class FakeFirmware(threading.Thread):
             time.sleep(abs(n)*200e-6+.05)
             self.world.step(axis, n)
             self.reply('DONE')
-        elif line[:3] in ('R1 ', 'R2 ', 'FY '):
+        elif line[:3] in ('R1 ', 'R2 '):
             self.reply(f'MOVE {line}')
             time.sleep(.05)
             self.reply('DONE')

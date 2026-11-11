@@ -307,13 +307,14 @@ THETA_MAX_PULSES = 100
 THETA_TIMEOUT_SEC = 180.0
 VISION_TIMEOUT_SEC = 5.0
 # Loader / Z / magnets (firmware/aligner_mega). rig_config.json overrides these.
-# Z moves both mask actuators (Z1+Z2 = 3): down ms, hold ms, up ms. HW team tunes the times.
+# Z_WHICH = sum of Z1 (1), Z2 (2), Z3 (4) driven together for the exposure gap; default Z1+Z2.
+# Z_MODES: down ms, hold ms, up ms. HW team tunes the times.
 Z_WHICH = 3
 Z_MODES = {'contact': (2000, 2000, 2000), 'proximity': (1000, 2000, 1000)}
 # Transfer = list of firmware lines run in order, e.g. ["MAG 1 1", "R1 -20000", "Z ..."].
 # Empty until the loader positions are measured on the rig.
 TRANSFER_SEQUENCE = []
-LOADER_AXES = ('R1', 'R2', 'FY')
+LOADER_AXES = ('R1', 'R2')
 # Dataset recording for YOLO/SAM2 training: raw camera frames (no overlay) every RECORD_INTERVAL_SEC.
 RECORD_INTERVAL_SEC = 0.5
 RECORD_ROOT = 'data/raw'
@@ -1509,8 +1510,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == '/api/magnet':
             n, on = query.get('n', [''])[0], query.get('on', [''])[0]
-            if n not in ('1', '2') or on not in ('0', '1'):
-                self.send_json({'ok': False, 'error': 'n 1/2, on 0/1'}, 400)
+            if n != '1' or on not in ('0', '1'):
+                self.send_json({'ok': False, 'error': 'n 1, on 0/1'}, 400)
                 return
             self.send_json({'ok': self.app.run_commands(f'MAG {n}', [(f'MAG {n} {on}', f'DONE MAG {n} {on}', 2.0, 0.0)])})
             return
@@ -1521,10 +1522,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             except ValueError:
                 steps = 0
             if axis not in LOADER_AXES or steps == 0 or abs(steps) > 400000:
-                self.send_json({'ok': False, 'error': 'axis R1/R2/FY, 0 < |steps| <= 400000'}, 400)
+                self.send_json({'ok': False, 'error': 'axis R1/R2, 0 < |steps| <= 400000'}, 400)
                 return
-            # Rails run ~5000 steps/s, the Foyu axis 125 steps/s.
-            timeout = abs(steps)/(125 if axis == 'FY' else 4000)+5
+            timeout = abs(steps)/4000+5  # rails run ~5000 steps/s
             self.send_json({'ok': self.app.run_commands(f'{axis} move', [(f'{axis} {steps}', 'DONE', timeout, 0.2)])})
             return
         if parsed.path == '/api/dist':
@@ -1703,10 +1703,9 @@ pre{white-space:pre-wrap;line-height:1.7}small{display:block;margin-top:16px;lin
 <button onclick="post('/api/zmode?mode=contact')">CONTACT</button>
 <button onclick="post('/api/zmode?mode=proximity')">PROXIMITY</button>
 <p><b>전자석</b></p>
-<button onclick="post('/api/magnet?n=1&on=1')">자석1 ON</button><button onclick="post('/api/magnet?n=1&on=0')">자석1 OFF</button><br>
-<button onclick="post('/api/magnet?n=2&on=1')">자석2 ON</button><button onclick="post('/api/magnet?n=2&on=0')">자석2 OFF</button>
+<button onclick="post('/api/magnet?n=1&on=1')">자석 ON</button><button onclick="post('/api/magnet?n=1&on=0')">자석 OFF</button>
 <p><b>이송부 수동</b></p>
-<select id="laxis"><option value="R1">레일1 (R1)</option><option value="R2">레일2 (R2)</option><option value="FY">포유테크 X (FY)</option></select>
+<select id="laxis"><option value="R1">레일1 (R1)</option><option value="R2">레일2 (R2)</option></select>
 <input id="lsteps" type="number" value="1000" min="1" style="width:90px"> steps<br>
 <button onclick="loader(-1)">− 방향</button><button onclick="loader(1)">+ 방향</button>
 <p><b>센서 · 이송</b></p>

@@ -207,6 +207,7 @@ python mask_aligner_optimized_v4.py --camera auto --detector opencv
 | [`preflight.py`](preflight.py) | 실행 전 카메라·통신·키 인식 점검 |
 | [`firmware/xy_tb6560/xy_tb6560.ino`](firmware/xy_tb6560/xy_tb6560.ino) | Mega의 유한 펄스 이동과 θ 제어 |
 | [`tools/sim_rig.py`](tools/sim_rig.py) | 가상 장비로 제어 흐름 확인 |
+| [`tools/motor_panel.py`](tools/motor_panel.py) | Mega_All_Control 펌웨어용 모터 수동 조작 패널 ([사용법](docs/motor-panel.md)) |
 | [`tools/test_detectors.py`](tools/test_detectors.py) | 같은 영상에서 검출기 비교 |
 | [`tools/bench_precision.py`](tools/bench_precision.py) | 합성 정답을 이용한 측정 오차 비교 |
 

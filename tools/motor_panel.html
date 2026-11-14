@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>모터 조작 패널</title>
+<style>
+  :root { --bg:#f4f5f7; --card:#fff; --ink:#1d2330; --mute:#6b7280; --line:#dde1e7;
+          --btn:#eef1f5; --btnon:#2563eb; --stop:#dc2626; --ok:#16a34a; --warn:#d97706; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14171c; --card:#1d2128; --ink:#e7eaf0; --mute:#9aa3b2; --line:#2e343e;
+            --btn:#2a3039; --btnon:#3b82f6; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.4 -apple-system, "Apple SD Gothic Neo", sans-serif; background:var(--bg); color:var(--ink); }
+  header { display:flex; flex-wrap:wrap; gap:10px; align-items:center; padding:12px 16px; border-bottom:1px solid var(--line); background:var(--card); position:sticky; top:0; z-index:2; }
+  header h1 { font-size:17px; margin:0 12px 0 0; }
+  select, header button { font:inherit; padding:6px 10px; border-radius:8px; border:1px solid var(--line); background:var(--btn); color:var(--ink); }
+  .pill { padding:4px 10px; border-radius:99px; font-size:13px; background:var(--btn); }
+  .pill.ok { background:var(--ok); color:#fff; } .pill.bad { background:var(--stop); color:#fff; }
+  main { max-width:1100px; margin:0 auto; padding:16px; display:grid; gap:14px; grid-template-columns:repeat(auto-fit, minmax(250px, 1fr)); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; }
+  .card h2 { font-size:15px; margin:0 0 4px; } .card p { margin:0 0 10px; color:var(--mute); font-size:12.5px; }
+  .row { display:flex; gap:8px; align-items:center; margin:6px 0; }
+  .row .lbl { width:62px; font-weight:600; font-size:13.5px; }
+  .hold, .tog { flex:1; padding:14px 6px; font:inherit; font-weight:600; border:1px solid var(--line); border-radius:10px; background:var(--btn); color:var(--ink); cursor:pointer; user-select:none; touch-action:none; }
+  .hold.on, .tog.on { background:var(--btnon); color:#fff; border-color:var(--btnon); }
+  .hold small { display:block; font-weight:400; opacity:.7; font-size:11px; }
+  #stop { grid-column:1/-1; padding:18px; font-size:20px; font-weight:800; color:#fff; background:var(--stop); border:0; border-radius:14px; cursor:pointer; }
+  .sensor { font-size:34px; font-weight:700; font-variant-numeric:tabular-nums; }
+  .warn { color:var(--warn); font-size:13px; }
+  .cams { display:grid; gap:10px; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); }
+  .cam { border:1px solid var(--line); border-radius:10px; overflow:hidden; background:#000; }
+  .cam img { display:block; width:100%; aspect-ratio:4/3; object-fit:contain; }
+  .cam div { padding:6px 8px; font-size:12.5px; background:var(--card); color:var(--mute); }
+  pre { margin:0; font-size:12px; color:var(--mute); white-space:pre-wrap; max-height:150px; overflow:auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>모터 조작 패널 · Mega_All_Control</h1>
+  <select id="port"></select>
+  <button id="connect">연결</button>
+  <button id="disc">해제</button>
+  <span id="conn" class="pill bad">연결 안 됨</span>
+  <span id="mv" class="pill">정지</span>
+</header>
+<main>
+  <section class="card" style="grid-column:1/-1">
+    <h2>카메라</h2>
+    <p>관찰용 화면(0.3초 갱신). 번호는 연결 순서에 따라 바뀔 수 있으니 화면을 보고 역할을 확인하세요.</p>
+    <div id="cams" class="cams"></div>
+  </section>
+
+  <button id="stop">■ 전체 정지 (Space / Esc)</button>
+
+  <section class="card">
+    <h2>정렬 스테이지 X · Y</h2>
+    <p>누르고 있는 동안만 움직입니다. 스텝 수 지정 없음, 리밋 스위치 없음.</p>
+    <div class="row"><span class="lbl">X</span><button class="hold" data-c="F">F<small>DIR LOW</small></button><button class="hold" data-c="B">B<small>DIR HIGH</small></button></div>
+    <div class="row"><span class="lbl">Y</span><button class="hold" data-c="f">f<small>DIR LOW</small></button><button class="hold" data-c="b">b<small>DIR HIGH</small></button></div>
+  </section>
+
+  <section class="card">
+    <h2>이송 레일</h2>
+    <p>이송부는 양쪽 모터를 같이 움직이는 <b>1+2 동시</b>를 쓰세요. 한쪽만 움직이는 개별 버튼은 아래에 있습니다.</p>
+    <div class="row"><span class="lbl">1+2 동시</span><button class="hold" data-c="J">J<small>DIR LOW</small></button><button class="hold" data-c="H">H<small>DIR HIGH</small></button></div>
+    <div class="row"><span class="lbl">레일 1</span><button class="hold" data-c="Q">Q<small>DIR LOW</small></button><button class="hold" data-c="W">W<small>DIR HIGH</small></button></div>
+    <div class="row"><span class="lbl">레일 2</span><button class="hold" data-c="E">E<small>DIR LOW</small></button><button class="hold" data-c="R">R<small>DIR HIGH</small></button></div>
+  </section>
+
+  <section class="card">
+    <h2>Z 축 (DC 모터)</h2>
+    <p>↑ = IN1 HIGH, ↓ = IN2 HIGH. 실제 위/아래 방향은 배선에 따라 다를 수 있음.</p>
+    <div class="row"><span class="lbl">Z1</span><button class="hold" data-c="u">↑ u</button><button class="hold" data-c="d">↓ d</button></div>
+    <div class="row"><span class="lbl">Z2</span><button class="hold" data-c="O">↑ O</button><button class="hold" data-c="P">↓ P</button></div>
+    <div class="row"><span class="lbl">Z3</span><button class="hold" data-c="K">↑ K</button><button class="hold" data-c="L">↓ L</button></div>
+  </section>
+
+  <section class="card">
+    <h2>레이저 변위 (Z 간격)</h2>
+    <p>보드가 0.2초마다 보내는 값 (mm)</p>
+    <div class="sensor" id="sensor">–</div>
+    <div class="warn" id="sensorNote"></div>
+  </section>
+
+  <section class="card">
+    <h2>θ 서보 · 전자석</h2>
+    <p>연속회전 서보: 90 = 정지, 0 = 한 방향 최고속 회전. 부팅 시 둘 다 정지(90). 전체 정지 버튼은 서보를 멈추지 않으니 T 또는 t로 멈추세요.</p>
+    <div class="row"><span class="lbl">θ (D5)</span><button class="tog" data-c="G" id="th0">회전 (G · 0)</button><button class="tog" data-c="T" id="th90">정지 (T · 90)</button></div>
+    <div class="row"><span class="lbl">프리얼라인 (D6)</span><button class="tog" data-c="t" id="pre">정지 ↔ 회전 (t)</button></div>
+    <div class="row"><span class="lbl">전자석 (D7)</span><button class="tog" data-c="M" id="mag">OFF (M)</button></div>
+  </section>
+
+  <section class="card">
+    <h2>기록</h2>
+    <pre id="log"></pre>
+    <p style="margin-top:8px">보드 원문</p>
+    <pre id="raw"></pre>
+  </section>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+let holding = null, beatTimer = null, lastErr = '';
+
+async function post(path, body) {
+  const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body||{})});
+  const j = await r.json();
+  if (!j.ok) { lastErr = j.error; alert(j.error); }
+  return j;
+}
+function stopAll() {
+  release();
+  post('/cmd', {c:'X'});
+}
+function press(btn) {
+  if (holding) release();
+  holding = btn; btn.classList.add('on');
+  post('/cmd', {c:btn.dataset.c});
+  beatTimer = setInterval(() => post('/beat'), 150);
+}
+function release() {
+  if (!holding) return;
+  holding.classList.remove('on'); holding = null;
+  clearInterval(beatTimer); beatTimer = null;
+  post('/cmd', {c:'X'});
+}
+document.querySelectorAll('.hold').forEach(b => {
+  b.addEventListener('pointerdown', e => { e.preventDefault(); b.setPointerCapture(e.pointerId); press(b); });
+  ['pointerup','pointercancel','lostpointercapture'].forEach(ev => b.addEventListener(ev, release));
+});
+document.querySelectorAll('.tog').forEach(b => b.addEventListener('click', () => post('/cmd', {c:b.dataset.c})));
+$('#stop').addEventListener('click', stopAll);
+window.addEventListener('blur', release);
+document.addEventListener('visibilitychange', () => document.hidden && release());
+window.addEventListener('keydown', e => { if (e.code === 'Space' || e.code === 'Escape') { e.preventDefault(); stopAll(); } });
+
+async function loadPorts() {
+  const ps = await (await fetch('/ports')).json();
+  $('#port').innerHTML = ps.map(p => `<option value="${p.device}">${p.arduino ? '★ ' : ''}${p.device} — ${p.desc}</option>`).join('');
+}
+$('#connect').onclick = async () => { $('#conn').textContent = '연결 중… (보드 리셋 2초)'; await post('/connect', {port:$('#port').value}); };
+$('#disc').onclick = () => post('/disconnect');
+
+async function poll() {
+  try {
+    const s = await (await fetch('/status')).json();
+    $('#conn').textContent = s.port ? `연결됨 ${s.port}` : '연결 안 됨';
+    $('#conn').className = 'pill ' + (s.port ? 'ok' : 'bad');
+    $('#mv').textContent = s.moving ? `움직이는 중: ${s.moving}` : '정지';
+    $('#mv').className = 'pill ' + (s.moving ? 'bad' : '');
+    $('#sensor').textContent = s.sensor === null ? '–' : (typeof s.sensor === 'number' ? s.sensor.toFixed(2) + ' mm' : s.sensor);
+    $('#sensorNote').textContent = s.sensor === 'ADS_ERROR' ? 'ADS1115 응답 없음 (센서 배선/전원 확인)' : s.sensor === 'ERR' ? '측정 범위 밖' : (s.sensor_age > 2 ? `${s.sensor_age}초 전 값` : '');
+    $('#th0').classList.toggle('on', s.theta === '0°'); $('#th90').classList.toggle('on', s.theta === '90°');
+    $('#pre').textContent = s.prealign === '90°' ? '정지 중 · 누르면 회전 (t)' : '회전 중 · 누르면 정지 (t)'; $('#pre').classList.toggle('on', s.prealign === '90°');
+    $('#mag').textContent = s.magnet ? 'ON (M)' : 'OFF (M)'; $('#mag').classList.toggle('on', s.magnet);
+    $('#log').textContent = s.log.join('\n'); $('#raw').textContent = s.raw.join('\n');
+  } catch (e) { $('#conn').textContent = '패널 서버 꺼짐'; $('#conn').className = 'pill bad'; }
+}
+async function cams() {
+  const cs = await (await fetch('/cameras')).json();
+  const box = $('#cams');
+  if (!cs.length) { box.textContent = '카메라를 여는 중이거나 사용하지 않도록 실행했습니다.'; return; }
+  cs.forEach(c => {
+    let el = document.getElementById('cam' + c.index);
+    if (!el) {
+      el = document.createElement('div'); el.className = 'cam'; el.id = 'cam' + c.index;
+      el.innerHTML = `<img alt="카메라 ${c.index}"><div></div>`; box.appendChild(el);
+    }
+    if (!c.error && c.age !== null) el.querySelector('img').src = `/cam/${c.index}.jpg?t=${Date.now()}`;
+    el.querySelector('div').textContent = `카메라 ${c.index} · ` +
+      (c.error ? `오류: ${c.error}` : c.age === null ? '대기 중' : `${c.size[0]}×${c.size[1]} · ${c.age > 2 ? c.age + '초 멈춤' : '실시간'}`);
+  });
+}
+loadPorts(); poll(); cams(); setInterval(poll, 300); setInterval(cams, 300);
+</script>
+</body>
+</html>

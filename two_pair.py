@@ -30,6 +30,7 @@ from sam2_keys import YOLO_WEIGHTS, pick_device
 IMGSZ = 1280
 CONF = 0.15
 MASK_SQUARES = 8
+MASK_MIN_SEEN = 6  # one full 2x2 key plus at least a row of the other
 FINISH_SCORE = 0.5
 # KEEP_MASK = False: the mask must be found in every frame (all 8 squares), nothing is reused.
 # True: the last full mask is kept while squares are hidden (fixed plate) and saved to MASK_FILE.
@@ -122,14 +123,52 @@ class TwoPairKeys:
         """True if 4 points form a square (4 equal sides, 2 diagonals = side * sqrt 2)."""
         d = np.sort([np.linalg.norm(a-b) for i, a in enumerate(pts) for b in pts[i+1:]])
         side = np.median(d[:4])
-        return bool(side > 0 and np.all(abs(d[:4]-side) < tol*side) and np.all(abs(d[4:]-side*np.sqrt(2)) < tol*side))
+        # Sides within 20% of each other: two rows of different keys (closer together) are no square.
+        return bool(side > 0 and d[3] < 1.2*d[0] and np.all(abs(d[4:]-side*np.sqrt(2)) < tol*side))
+
+    @classmethod
+    def complete_groups(cls, pts):
+        """Two 2x2 groups from 6-8 square centres: (group1, group2, measured flags) or None.
+
+        One group must be fully seen; the other may miss a corner (parallelogram rule) or a whole
+        row of two (shifted by the seen group's edge that points towards it). Every frame is
+        measured afresh: nothing comes from an earlier frame.
+        """
+        from itertools import combinations
+        n = len(pts)
+        for idx in combinations(range(n), 4):
+            a = pts[list(idx)]
+            if not cls.is_grid(a):
+                continue
+            rest = pts[[i for i in range(n) if i not in idx]]
+            if len(rest) == 4 and cls.is_grid(rest):
+                return a, rest, np.ones(8, bool)
+            d = np.sort([np.linalg.norm(p-q) for i, p in enumerate(a) for q in a[i+1:]])
+            side = np.median(d[:4])
+            if len(rest) == 3:
+                # The corner whose two neighbours are one side away is the right angle.
+                for k in range(3):
+                    i, j = [m for m in range(3) if m != k]
+                    if all(abs(np.linalg.norm(rest[m]-rest[k])-side) < .25*side for m in (i, j)):
+                        b = np.vstack([rest, rest[i]+rest[j]-rest[k]])
+                        if cls.is_grid(b):
+                            return a, b, np.r_[np.ones(7, bool), False]
+            if len(rest) == 2 and abs(np.linalg.norm(rest[1]-rest[0])-side) < .25*side:
+                edge = rest[1]-rest[0]
+                away = rest.mean(0)-a.mean(0)
+                v = np.array([-edge[1], edge[0]])
+                v *= side/np.linalg.norm(v)*np.sign(v@away)
+                b = np.vstack([rest, rest+v])
+                if cls.is_grid(b) and np.linalg.norm(b.mean(0)-a.mean(0)) > 1.5*side:
+                    return a, b, np.r_[np.ones(6, bool), False, False]
+        return None
 
     def measure_mask(self, gray, square_boxes):
-        """Two square groups from MASK_SQUARES squares (YOLO + nearby blobs), or None."""
+        """Two square groups from 6-8 squares (YOLO + nearby blobs) in this frame, or None."""
         if len(square_boxes) < 2:
             return None
         boxes = self.more_squares(gray, square_boxes)
-        if len(boxes) < MASK_SQUARES:
+        if len(boxes) < MASK_MIN_SEEN:
             return None
         centers = [blob_center(gray, b) for b in boxes]
         if any(c is None for c in centers):
@@ -139,21 +178,24 @@ class TwoPairKeys:
             # Keep the MASK_SQUARES closest to their median: stray dark blobs lie further out.
             keep = np.argsort(np.linalg.norm(pts-np.median(pts, 0), axis=1))[:MASK_SQUARES]
             pts, boxes = pts[keep], boxes[keep]
-        mean = pts.mean(0)
-        _, _, vt = np.linalg.svd(pts-mean)
-        axis = vt[0]
-        if axis[0] < 0 or (abs(axis[0]) < 1e-9 and axis[1] < 0):
-            axis = -axis
-        order = np.argsort((pts-mean)@axis)
-        half = MASK_SQUARES//2
-        groups = pts[order[:half]], pts[order[half:]]
-        if not all(self.is_grid(g) for g in groups):
+        found = self.complete_groups(pts)
+        if found is None:
             return None  # stray dark blobs, not the 2 x (2x2) mask pattern
-        g1, g2 = groups[0].mean(0), groups[1].mean(0)
-        keys = [np.r_[g.min(0), g.max(0)] for g in groups]  # one box per 2x2 key (square centres)
+        ga, gb, measured = found
+        mean = np.vstack([ga, gb]).mean(0)
+        axis = gb.mean(0)-ga.mean(0)
+        axis /= np.linalg.norm(axis)
+        if axis[0] < 0 or (abs(axis[0]) < 1e-9 and axis[1] < 0):
+            axis, ga, gb = -axis, gb, ga
+            measured = np.r_[measured[4:], measured[:4]] if not measured.all() else measured
+        groups = ga, gb
+        g1, g2 = ga.mean(0), gb.mean(0)
         size = float(np.median(np.r_[boxes[:, 2]-boxes[:, 0], boxes[:, 3]-boxes[:, 1]]))
-        keys = [k+[-size*0.7, -size*0.7, size*0.7, size*0.7] for k in keys]
-        return dict(groups=(g1, g2), squares=pts, boxes=boxes, axis=axis, size=size, keys=keys)
+        keys = [np.r_[g.min(0), g.max(0)]+[-size*0.7, -size*0.7, size*0.7, size*0.7] for g in groups]
+        squares = np.vstack(groups)
+        order = np.argsort(~measured, kind='stable')  # measured first: the app draws the rest dimmer
+        return dict(groups=(g1, g2), squares=squares[order], boxes=boxes, axis=axis, size=size, keys=keys,
+                    observed=int(measured.sum()))
 
     def confirm_saved(self, gray, square_boxes):
         """Adopt the mask saved by an earlier run if the squares seen now sit on it."""
@@ -223,7 +265,7 @@ class TwoPairKeys:
         g1, g2 = mask['groups']
         s = mask['size']
         quads = [np.array([[x-s/2, y-s/2], [x+s/2, y-s/2], [x+s/2, y+s/2], [x-s/2, y+s/2]]) for x, y in mask['squares']]
-        md = self.detection((g1+g2)/2, float(np.linalg.norm(g2-g1))+2*s, 1.0, quads, len(quads))
+        md = self.detection((g1+g2)/2, float(np.linalg.norm(g2-g1))+2*s, 1.0, quads, mask.get('observed', len(quads)))
         md['keys'] = [tuple(int(round(v)) for v in k) for k in mask['keys']]
         ma = (math.degrees(math.atan2(*(g2-g1)[::-1])), 1.0)
         c = self.crosses(gray, cross_boxes)

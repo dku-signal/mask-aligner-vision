@@ -25,6 +25,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+import prealign
 from sam2_keys import YOLO_WEIGHTS, pick_device
 
 IMGSZ = 1280
@@ -40,6 +41,7 @@ KEEP_MASK = False
 MASK_FILE = Path(__file__).resolve().parent/'out'/'two_pair_mask.json'
 MASK_CONFIRM = 3
 DARK_MARGIN = 60  # grey levels a held square must stay below the gap between the keys
+FIT_RADIUS = 6     # px the model fit may move a cross away from its disc-based place
 NEAR_SIDES = 2.5  # a cross this close to its key (in square widths) may be found without YOLO
 
 
@@ -113,6 +115,10 @@ class TwoPairKeys:
         self.last_offset = None  # cross - key per pair from the last good frame
         self.last_crosses = None # both crosses from the last good frame
         self.baseline = None     # cross 2 - cross 1 when both were seen by YOLO (rigid wafer)
+        self.disc = None         # wafer disc centre in this frame (prealign.find_disc)
+        self.disc_arm = None     # cross - disc centre per cross, from the last frame they were clear
+        self.disc_last = None    # (cx, cy, r) of the last disc found
+        self.gray = None
         self.tracked = 0
         try:
             if not KEEP_MASK:
@@ -333,14 +339,28 @@ class TwoPairKeys:
             c = self.last_crosses.copy()
         else:
             return None
-        for i in (0, 1):
-            if self.square_distance(c[i]) < 2*side and self.plate is not None and self.cross_tpl[i] is not None:
-                fit = self.fit_cross(gray, i, c[i])
-                if fit is None:
-                    return None
-                c[i] = fit
+        on_squares = [self.square_distance(c[i]) < 2*side for i in (0, 1)]
+        if any(on_squares):
+            # The square grid repeats every square pitch, so a fit on it alone can lock one pitch off
+            # (seen on the rig 2026-11-18: ALIGN FINISH ~50 px off). The disc edge moves rigidly with
+            # the wafer and is never covered: disc centre + the cross's arm from the disc, measured
+            # while the cross was clear, places it; the model fit only refines within a few px.
+            if self.disc_arm is None or self.disc_center() is None:
+                return None
+            for i in (0, 1):
+                if not on_squares[i]:
+                    continue
+                c[i] = self.disc+self.disc_arm[i]
+                if self.plate is not None and self.cross_tpl[i] is not None:
+                    fit = self.fit_cross(gray, i, c[i], radius=FIT_RADIUS)
+                    if fit is not None and np.linalg.norm(fit-c[i]) < FIT_RADIUS-0.5:
+                        c[i] = fit
                 self.tracked += 1
-            elif self.square_distance(c[i]) >= (NEAR_SIDES+2)*side:
+        elif min(self.square_distance(ci) for ci in c) < 6*side and self.disc_center() is not None:
+            # Clear of the squares but on the way to them: keep the arms (rigid while theta holds).
+            self.disc_arm = [c[i]-self.disc for i in (0, 1)]
+        for i in (0, 1):
+            if self.square_distance(c[i]) >= (NEAR_SIDES+2)*side:
                 box = next((b for cc, b in seen if np.linalg.norm(cc-c[i]) < side), None)
                 if box is not None:
                     self.keep_cross(gray, i, c[i], box)  # well clear of the squares: keep its look
@@ -351,6 +371,21 @@ class TwoPairKeys:
             self.baseline = c[1]-c[0]
         self.last_offset = [c[i]-self.mask['groups'][i] for i in (0, 1)]
         return c
+
+    def disc_center(self):
+        """Wafer disc centre, refined from the last one (fast) or found from scratch (Hough)."""
+        if self.disc is None:
+            d = None
+            if self.disc_last is not None:
+                d = prealign._refine(self.gray, *self.disc_last)
+                if d is not None and (d[3] < prealign.DISC_MIN_EDGE or d[4] < prealign.DISC_MIN_STEP
+                                      or abs(d[2]-self.disc_last[2]) > 5):
+                    d = None
+            if d is None:
+                d = prealign.find_disc(self.gray)
+            self.disc_last = None if d is None else d[:3]
+            self.disc = None if d is None else np.array(d[:2])
+        return self.disc
 
     def square_distance(self, point):
         return float(np.min(np.linalg.norm(self.mask['squares']-point, axis=1)))
@@ -383,7 +418,7 @@ class TwoPairKeys:
             plate[int(max(0, by0-q-y0)):int(max(0, by1+q-y0)), int(max(0, bx0-q-x0)):int(max(0, bx1+q-x0))] = 1.0
         self.plate = (x0, y0, plate, white)
 
-    def fit_cross(self, gray, i, guess):
+    def fit_cross(self, gray, i, guess, radius=None):
         x0, y0, plate, white = self.plate
         tpl, (cx, cy) = self.cross_tpl[i]
         h, w = plate.shape
@@ -391,7 +426,7 @@ class TwoPairKeys:
         if obs.shape != plate.shape:
             return None
         top_left = (guess[0]-x0-cx, guess[1]-y0-cy)
-        t = fit_overlap(obs, plate, tpl, top_left, int(1.5*self.mask['size']))
+        t = fit_overlap(obs, plate, tpl, top_left, int(radius or 1.5*self.mask['size']))
         if t is None:
             return None
         return np.array([t[0]+x0+cx, t[1]+y0+cy])
@@ -409,7 +444,7 @@ class TwoPairKeys:
         if camera != self.token or frame.shape != self.shape or run != self.run:
             # New camera or a new START: nothing measured before carries over.
             self.mask = self.mask_pixels = None
-            self.last_offset = self.last_crosses = self.baseline = None
+            self.last_offset = self.last_crosses = self.baseline = self.disc_arm = None
             self.plate = None
             self.cross_tpl = [None, None]
             self.token, self.shape, self.run = camera, frame.shape, run
@@ -441,6 +476,8 @@ class TwoPairKeys:
         md = self.detection((g1+g2)/2, float(np.linalg.norm(g2-g1))+2*s, 1.0, quads, mask.get('observed', len(quads)))
         md['keys'] = [tuple(int(round(v)) for v in k) for k in mask['keys']]
         ma = (math.degrees(math.atan2(*(g2-g1)[::-1])), 1.0)
+        self.disc = None  # found on demand by disc_center(): only needed near the squares
+        self.gray = gray
         c = self.crosses(gray, cross_boxes)
         if c is not None and mask.get('observed') == MASK_SQUARES and \
                 min(self.square_distance(ci) for ci in c) > (NEAR_SIDES+2)*s:

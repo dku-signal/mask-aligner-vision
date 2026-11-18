@@ -31,6 +31,9 @@ IMGSZ = 1280
 CONF = 0.15
 MASK_SQUARES = 8
 FINISH_SCORE = 0.5
+# KEEP_MASK = False: the mask must be found in every frame (all 8 squares), nothing is reused.
+# True: the last full mask is kept while squares are hidden (fixed plate) and saved to MASK_FILE.
+KEEP_MASK = False
 # The kept mask survives an app restart; it is trusted again only once enough of the squares
 # seen now sit on it (the camera may have been bumped in between).
 MASK_FILE = Path(__file__).resolve().parent/'out'/'two_pair_mask.json'
@@ -72,6 +75,8 @@ class TwoPairKeys:
         self.previous_mask = self.previous_wafer = None
         self.saved = None
         try:
+            if not KEEP_MASK:
+                raise OSError
             d = json.loads(MASK_FILE.read_text())
             self.saved = dict(groups=tuple(np.array(g) for g in d['groups']), squares=np.array(d['squares']),
                               boxes=np.array(d['boxes']), axis=np.array(d['axis']), size=d['size'],
@@ -203,11 +208,16 @@ class TwoPairKeys:
         gray = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (3, 3), 0)
         square_boxes, cross_boxes, cross_conf = self.detect(frame)
         fresh = self.measure_mask(gray, square_boxes)
-        if fresh is not None and stationary:
-            self.keep_mask(gray, fresh)
-        elif self.mask is None:
-            self.confirm_saved(gray, square_boxes)
-        mask = self.mask or fresh
+        if not KEEP_MASK:
+            if fresh is not None:
+                self.keep_mask(gray, fresh, save=False)  # this frame's squares only (cross centroid mask)
+            mask = fresh
+        else:
+            if fresh is not None and stationary:
+                self.keep_mask(gray, fresh)
+            elif self.mask is None:
+                self.confirm_saved(gray, square_boxes)
+            mask = self.mask or fresh
         if mask is None:
             return None, None, None, None, False
         g1, g2 = mask['groups']

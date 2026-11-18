@@ -358,8 +358,13 @@ Y_PROBE_STEPS = 2000
 Y_FEEDBACK = []            # [[rail steps sent, fine Y steps the align then needed], ...] newest last
 RIG_CONFIG_PATH = None
 
+# Key angles repeat every 90 deg for one square key; the two-pair baseline (yolo-2pair) only every 180.
+ANGLE_PERIOD = 90.0
+
+
 def wrap90(a):
-    return (a + 45.0) % 90.0 - 45.0
+    """Wrap an angle difference to +-ANGLE_PERIOD/2 (name kept from the one-key build)."""
+    return (a + ANGLE_PERIOD/2) % ANGLE_PERIOD - ANGLE_PERIOD/2
 
 def clamp_steps(value):
     value = int(round(value))
@@ -635,7 +640,7 @@ class PreviewSmoother:
             state['extent']+=alpha*(target['extent']-state['extent'])
             for q,destination in zip(state['quads'],target['quads']):q+=alpha*(destination-q)
             if target['angle'] is None or state['angle'] is None:state['angle']=target['angle']
-            else:state['angle']=(state['angle']+alpha*wrap90(target['angle']-state['angle']))%90
+            else:state['angle']=(state['angle']+alpha*wrap90(target['angle']-state['angle']))%ANGLE_PERIOD
             shown=dict(det)
             shown['center']=tuple(float(x) for x in state['center'])
             width,height=state['extent'];cx,cy=state['center']
@@ -714,6 +719,8 @@ class MaskAlignerApp:
             from subpixel import PreciseKeys
             self.key_detector = PreciseKeys(center_tolerance=DEAD_BAND_PX, cache_mb=cache_mb)
         elif detector == 'yolo-2pair':
+            global ANGLE_PERIOD
+            ANGLE_PERIOD = 180.0
             from two_pair import TwoPairKeys
             self.key_detector = TwoPairKeys(center_tolerance=DEAD_BAND_PX)
         else:
@@ -804,7 +811,7 @@ class MaskAlignerApp:
             self.stable = bool(is_stable(self.history))
             if len(self.samples) == STABLE_HISTORY:
                 arr = np.asarray(self.samples)
-                unwrapped = arr[-1] + (arr - arr[-1] + 45) % 90 - 45
+                unwrapped = arr[-1] + (arr - arr[-1] + ANGLE_PERIOD/2) % ANGLE_PERIOD - ANGLE_PERIOD/2
                 med = np.median(unwrapped, axis=0)
                 self.stable &= bool(np.max(abs(unwrapped - med)) <= THETA_JITTER_DEG)
                 self.theta_error = wrap90(float(med[1] - med[0]))

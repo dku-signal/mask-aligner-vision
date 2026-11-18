@@ -39,6 +39,38 @@ KEEP_MASK = False
 # seen now sit on it (the camera may have been bumped in between).
 MASK_FILE = Path(__file__).resolve().parent/'out'/'two_pair_mask.json'
 MASK_CONFIRM = 3
+DARK_MARGIN = 60  # grey levels a held square must stay below the gap between the keys
+NEAR_SIDES = 2.5  # a cross this close to its key (in square widths) may be found without YOLO
+
+
+def fit_overlap(obs, plate, cross, guess, radius):
+    """Sub-pixel top-left of the cross template on an overlapped key, by analysis by synthesis.
+
+    Model (transmission, 1 = white): obs = plate * cross(t). plate is this key area seen with no
+    cross on it, cross the cross seen clear of the squares. SSD(t) = sum((obs - plate - plate*c)^2)
+    with c = cross - 1 (zero outside the template), expanded into two correlations, so every
+    shift is scored at once. Unlike a centroid this keeps the gaps between the cross arms and the
+    squares, which is where the position is when they touch. Returns (x, y) in obs or None.
+    """
+    e = (obs-plate)*plate
+    c = cross-1.0
+    score = -2*cv2.matchTemplate(e, c, cv2.TM_CCORR)+cv2.matchTemplate(plate*plate, c*c, cv2.TM_CCORR)
+    h, w = score.shape
+    gx, gy = int(round(guess[0])), int(round(guess[1]))
+    x0, y0 = max(0, gx-radius), max(0, gy-radius)
+    x1, y1 = min(w, gx+radius+1), min(h, gy+radius+1)
+    if x1-x0 < 3 or y1-y0 < 3:
+        return None
+    win = score[y0:y1, x0:x1]
+    j, i = np.unravel_index(int(np.argmin(win)), win.shape)
+    y, x = y0+j, x0+i
+    if not (0 < x < w-1 and 0 < y < h-1):
+        return float(x), float(y)
+
+    def vertex(a, b, c_):
+        d = a-2*b+c_
+        return 0.0 if d <= 0 else float(np.clip(0.5*(a-c_)/d, -0.5, 0.5))
+    return x+vertex(score[y, x-1], score[y, x], score[y, x+1]), y+vertex(score[y-1, x], score[y, x], score[y+1, x])
 
 
 def blob_center(gray, box, exclude=None, pad=0.15):
@@ -75,6 +107,11 @@ class TwoPairKeys:
         self.bank_bytes = 0
         self.previous_mask = self.previous_wafer = None
         self.saved = None
+        self.run = None          # this align run (app generation): the mask is held only within it
+        self.plate = None        # (x0, y0, transmission image) of both keys with no cross on them
+        self.cross_tpl = [None, None]  # (transmission patch, centre in patch) per cross, seen clear
+        self.last_offset = None  # cross - key per pair from the last good frame
+        self.tracked = 0
         try:
             if not KEEP_MASK:
                 raise OSError
@@ -215,6 +252,30 @@ class TwoPairKeys:
         return dict(groups=(g1, g2), squares=squares[order], boxes=boxes, axis=axis, size=size, keys=keys,
                     observed=int(measured.sum()))
 
+    def confirm_held(self, gray, square_boxes):
+        if self.mask is None:
+            return None
+        seen = [c for c in (blob_center(gray, b, None) for b in square_boxes) if c is not None]
+        hits = sum(min(np.linalg.norm(self.mask['squares']-c, axis=1)) < self.mask['size']/3 for c in seen)
+        if hits >= MASK_CONFIRM:
+            return dict(self.mask, observed=int(hits))
+        # Aligned: the cross arms touch every square, so no square stands alone. Then each held
+        # square must still be dark in this frame, against the bright gaps between the keys.
+        s = self.mask['size']
+        inner = [gray[int(y-s/4):int(y+s/4)+1, int(x-s/4):int(x+s/4)+1].mean() for x, y in self.mask['squares']]
+        # Reference: the strip just outside both keys (plate or wafer, beyond the cross arms).
+        k = np.array(self.mask['keys'])
+        x0, y0 = (k[:, :2].min(0)-1.6*s).astype(int).clip(0)
+        x1, y1 = (k[:, 2:].max(0)+1.6*s).astype(int)
+        roi = gray[y0:y1, x0:x1]
+        w = int(0.5*s)
+        strip = np.r_[roi[:w].ravel(), roi[-w:].ravel(), roi[:, :w].ravel(), roi[:, -w:].ravel()]
+        bright = np.percentile(strip, 75)
+        dark = sum(v < bright-DARK_MARGIN for v in inner)
+        if dark < MASK_SQUARES:
+            return None
+        return dict(self.mask, observed=0)
+
     def confirm_saved(self, gray, square_boxes):
         """Adopt the mask saved by an earlier run if the squares seen now sit on it."""
         if self.saved is None or not len(square_boxes):
@@ -233,25 +294,100 @@ class TwoPairKeys:
                                                  for k, v in mask.items()}))
             except OSError:
                 pass
+        # All 8 squares (also the ones filled in), slightly enlarged: they are no part of a cross.
         m = np.zeros(gray.shape, bool)
-        for x0, y0, x1, y1 in mask['boxes']:
-            p = 0.15*(x1-x0)
-            m[int(max(0, y0-p)):int(y1+p)+1, int(max(0, x0-p)):int(x1+p)+1] = True
+        h = 0.65*mask['size']
+        for x, y in mask['squares']:
+            m[int(max(0, y-h)):int(y+h)+1, int(max(0, x-h)):int(x+h)+1] = True
         self.mask_pixels = m
 
     def crosses(self, gray, cross_boxes):
-        """The two cross centres ordered like the mask groups, or None."""
-        if len(cross_boxes) < 2 or self.mask is None:
+        """The two cross centres ordered like the mask groups, or None.
+
+        Each YOLO cross goes to its nearest mask key. Near the aligned state a cross sits on its
+        key's squares and YOLO may miss it; then, if the last measured cross was within
+        NEAR_SIDES square widths of that key, the cross is the dark pixels in the key's box with
+        the key's own squares masked out.
+        """
+        if self.mask is None:
             return None
-        c = [blob_center(gray, b, self.mask_pixels) for b in cross_boxes[:2]]
-        if any(v is None for v in c):
+        groups = self.mask['groups']
+        side = self.mask['size']
+        found = [None, None]
+        boxes = [None, None]
+        seen = [(blob_center(gray, b, self.mask_pixels), b) for b in cross_boxes[:2]]
+        seen = [(c, b) for c, b in seen if c is not None]
+        if len(seen) == 2:
+            # Both crosses: order them along the mask axis like the keys (works at any distance).
+            if (seen[1][0]-seen[0][0])@self.mask['axis'] < 0:
+                seen = seen[::-1]
+            if np.linalg.norm(seen[0][0]-seen[1][0]) < 2*side:
+                return None  # both boxes on the same cross
+            found, boxes = [seen[0][0], seen[1][0]], [seen[0][1], seen[1][1]]
+        elif len(seen) == 1:
+            c, b = seen[0]
+            i = int(np.argmin([np.linalg.norm(c-g) for g in groups]))
+            found[i], boxes[i] = c, b
+        for i in (0, 1):
+            near = self.last_offset is not None and np.linalg.norm(self.last_offset[i]) < NEAR_SIDES*side
+            if found[i] is not None and np.linalg.norm(found[i]-groups[i]) > (NEAR_SIDES+2)*side:
+                self.keep_cross(gray, i, found[i], boxes[i])  # well clear of the squares: keep its look
+            if near and self.plate is not None and self.cross_tpl[i] is not None:
+                # On the squares a centroid is pulled by the hidden arm parts: fit the model instead.
+                guess = groups[i]+self.last_offset[i] if found[i] is None else found[i]
+                fit = self.fit_cross(gray, i, guess)
+                if fit is not None:
+                    found[i] = fit
+                    self.tracked += 1
+                    half = 1.2*side
+                    boxes[i] = np.r_[fit-half, fit+half]
+        if found[0] is None or found[1] is None:
             return None
-        c = np.array(c)
-        boxes = cross_boxes[:2]
-        if (c[1]-c[0])@self.mask['axis'] < 0:
-            c, boxes = c[::-1], boxes[::-1]
+        c = np.array(found)
+        self.last_offset = [c[i]-groups[i] for i in (0, 1)]
         self.cross_keys = [tuple(int(round(v)) for v in b) for b in boxes]
         return c
+
+    def keep_cross(self, gray, i, center, box):
+        x0, y0, x1, y1 = box
+        p = 0.25*max(x1-x0, y1-y0)
+        x0, y0 = int(max(0, x0-p)), int(max(0, y0-p))
+        x1, y1 = int(min(gray.shape[1], x1+p)), int(min(gray.shape[0], y1+p))
+        patch = gray[y0:y1, x0:x1].astype(np.float32)
+        white = np.percentile(patch, 90)
+        if white < 120 or patch.size < 100:
+            return
+        self.cross_tpl[i] = (np.clip(patch/white, 0, 1.2), (center[0]-x0, center[1]-y0))
+
+    def keep_plate(self, gray, cross_boxes):
+        """Both keys with no cross on them (the wafer under them, so the plate looks as it will)."""
+        k = np.array(self.mask['keys'])
+        s = self.mask['size']
+        x0, y0 = (k[:, :2].min(0)-3*s).astype(int).clip(0)
+        x1, y1 = (k[:, 2:].max(0)+3*s).astype(int)
+        patch = gray[y0:y1, x0:x1].astype(np.float32)
+        white = np.percentile(patch, 90)
+        if white < 120:
+            return
+        plate = np.clip(patch/white, 0, 1.2)
+        for bx0, by0, bx1, by1 in cross_boxes:
+            # A cross inside the patch would be counted twice by the model: paint it white.
+            q = 0.25*max(bx1-bx0, by1-by0)
+            plate[int(max(0, by0-q-y0)):int(max(0, by1+q-y0)), int(max(0, bx0-q-x0)):int(max(0, bx1+q-x0))] = 1.0
+        self.plate = (x0, y0, plate, white)
+
+    def fit_cross(self, gray, i, guess):
+        x0, y0, plate, white = self.plate
+        tpl, (cx, cy) = self.cross_tpl[i]
+        h, w = plate.shape
+        obs = np.clip(gray[y0:y0+h, x0:x0+w].astype(np.float32)/white, 0, 1.2)
+        if obs.shape != plate.shape:
+            return None
+        top_left = (guess[0]-x0-cx, guess[1]-y0-cy)
+        t = fit_overlap(obs, plate, tpl, top_left, int(1.5*self.mask['size']))
+        if t is None:
+            return None
+        return np.array([t[0]+x0+cx, t[1]+y0+cy])
 
     def detection(self, center, size, score, quads=(), observed=0):
         n = int(math.ceil(size))
@@ -262,16 +398,28 @@ class TwoPairKeys:
         # The app's token changes on every motor move; only a camera change (its last two fields)
         # invalidates the kept mask, which stays put while the stage moves the wafer.
         camera = token[-2:] if isinstance(token, tuple) else token
-        if camera != self.token or frame.shape != self.shape:
+        run = token[0] if isinstance(token, tuple) else token
+        if camera != self.token or frame.shape != self.shape or run != self.run:
+            # New camera or a new START: nothing measured before carries over.
             self.mask = self.mask_pixels = None
-            self.token, self.shape = camera, frame.shape
+            self.last_offset = None
+            self.plate = None
+            self.cross_tpl = [None, None]
+            self.token, self.shape, self.run = camera, frame.shape, run
         gray = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (3, 3), 0)
         square_boxes, cross_boxes, cross_conf = self.detect(frame)
         fresh = self.measure_mask(gray, square_boxes)
         if not KEEP_MASK:
-            if fresh is not None:
-                self.keep_mask(gray, fresh, save=False)  # this frame's squares only (cross centroid mask)
-            mask = fresh
+            if fresh is not None and (self.mask is None or fresh['observed'] == MASK_SQUARES):
+                self.keep_mask(gray, fresh, save=False)
+                mask = fresh
+            else:
+                # A partial fresh mask while one is held: cross arms may pass for squares, so
+                # the held mask (checked against this frame below) is the safer one.
+                # Crosses on the squares hide some of them. The plate does not move, so the mask
+                # found earlier in this run holds, but only while MASK_CONFIRM squares seen in this
+                # frame still sit on it: a moved plate or camera drops it at once.
+                mask = self.confirm_held(gray, square_boxes)
         else:
             if fresh is not None and stationary:
                 self.keep_mask(gray, fresh)
@@ -287,9 +435,12 @@ class TwoPairKeys:
         md['keys'] = [tuple(int(round(v)) for v in k) for k in mask['keys']]
         ma = (math.degrees(math.atan2(*(g2-g1)[::-1])), 1.0)
         c = self.crosses(gray, cross_boxes)
+        if c is not None and mask.get('observed') == MASK_SQUARES and \
+                min(np.linalg.norm(c[i]-mask['groups'][i]) for i in (0, 1)) > NEAR_SIDES*s+s:
+            self.keep_plate(gray, cross_boxes[:2])
         if c is None:
             return md, None, ma, None, False
-        score = float(cross_conf[:2].min())
+        score = float(cross_conf[:2].min()) if len(cross_conf) >= 2 else FINISH_SCORE
         wd = self.detection(c.mean(0), float(np.linalg.norm(c[1]-c[0]))+2*s, score)
         wd['pairs'] = [(g1, c[0]), (g2, c[1])]
         wd['keys'] = self.cross_keys

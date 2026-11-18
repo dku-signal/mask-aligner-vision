@@ -111,6 +111,8 @@ class TwoPairKeys:
         self.plate = None        # (x0, y0, transmission image) of both keys with no cross on them
         self.cross_tpl = [None, None]  # (transmission patch, centre in patch) per cross, seen clear
         self.last_offset = None  # cross - key per pair from the last good frame
+        self.last_crosses = None # both crosses from the last good frame
+        self.baseline = None     # cross 2 - cross 1 when both were seen by YOLO (rigid wafer)
         self.tracked = 0
         try:
             if not KEEP_MASK:
@@ -304,49 +306,54 @@ class TwoPairKeys:
     def crosses(self, gray, cross_boxes):
         """The two cross centres ordered like the mask groups, or None.
 
-        Each YOLO cross goes to its nearest mask key. Near the aligned state a cross sits on its
-        key's squares and YOLO may miss it; then, if the last measured cross was within
-        NEAR_SIDES square widths of that key, the cross is the dark pixels in the key's box with
-        the key's own squares masked out.
+        A cross that sits on squares (its own key near the end, or the other key on the way
+        there) merges with them: YOLO may miss it and a centroid is pulled by the hidden parts.
+        The wafer is rigid and theta is set first, so a missed cross is the seen one plus the
+        cross-to-cross vector of the last frame with both; every cross on squares is then placed
+        by the plate x cross model fit.
         """
         if self.mask is None:
             return None
-        groups = self.mask['groups']
         side = self.mask['size']
-        found = [None, None]
-        boxes = [None, None]
         seen = [(blob_center(gray, b, self.mask_pixels), b) for b in cross_boxes[:2]]
         seen = [(c, b) for c, b in seen if c is not None]
+        if len(seen) == 2 and np.linalg.norm(seen[0][0]-seen[1][0]) < 2*side:
+            seen = seen[:1]  # both boxes on the same cross
         if len(seen) == 2:
-            # Both crosses: order them along the mask axis like the keys (works at any distance).
             if (seen[1][0]-seen[0][0])@self.mask['axis'] < 0:
                 seen = seen[::-1]
-            if np.linalg.norm(seen[0][0]-seen[1][0]) < 2*side:
-                return None  # both boxes on the same cross
-            found, boxes = [seen[0][0], seen[1][0]], [seen[0][1], seen[1][1]]
-        elif len(seen) == 1:
-            c, b = seen[0]
-            i = int(np.argmin([np.linalg.norm(c-g) for g in groups]))
-            found[i], boxes[i] = c, b
-        for i in (0, 1):
-            near = self.last_offset is not None and np.linalg.norm(self.last_offset[i]) < NEAR_SIDES*side
-            if found[i] is not None and np.linalg.norm(found[i]-groups[i]) > (NEAR_SIDES+2)*side:
-                self.keep_cross(gray, i, found[i], boxes[i])  # well clear of the squares: keep its look
-            if near and self.plate is not None and self.cross_tpl[i] is not None:
-                # On the squares a centroid is pulled by the hidden arm parts: fit the model instead.
-                guess = groups[i]+self.last_offset[i] if found[i] is None else found[i]
-                fit = self.fit_cross(gray, i, guess)
-                if fit is not None:
-                    found[i] = fit
-                    self.tracked += 1
-                    half = 1.2*side
-                    boxes[i] = np.r_[fit-half, fit+half]
-        if found[0] is None or found[1] is None:
+            c = np.array([seen[0][0], seen[1][0]])
+        elif len(seen) == 1 and self.baseline is not None:
+            # The missed cross is on squares: of the two places it can be, take the one on squares.
+            one = seen[0][0]
+            options = [np.array([one, one+self.baseline]), np.array([one-self.baseline, one])]
+            hidden = [options[0][1], options[1][0]]
+            c = options[int(np.argmin([self.square_distance(h) for h in hidden]))]
+        elif not seen and self.last_crosses is not None:
+            c = self.last_crosses.copy()
+        else:
             return None
-        c = np.array(found)
-        self.last_offset = [c[i]-groups[i] for i in (0, 1)]
-        self.cross_keys = [tuple(int(round(v)) for v in b) for b in boxes]
+        for i in (0, 1):
+            if self.square_distance(c[i]) < 2*side and self.plate is not None and self.cross_tpl[i] is not None:
+                fit = self.fit_cross(gray, i, c[i])
+                if fit is None:
+                    return None
+                c[i] = fit
+                self.tracked += 1
+            elif self.square_distance(c[i]) >= (NEAR_SIDES+2)*side:
+                box = next((b for cc, b in seen if np.linalg.norm(cc-c[i]) < side), None)
+                if box is not None:
+                    self.keep_cross(gray, i, c[i], box)  # well clear of the squares: keep its look
+        half = 1.4*side
+        self.cross_keys = [tuple(int(round(v)) for v in np.r_[ci-half, ci+half]) for ci in c]
+        self.last_crosses = c.copy()
+        if len(seen) == 2:
+            self.baseline = c[1]-c[0]
+        self.last_offset = [c[i]-self.mask['groups'][i] for i in (0, 1)]
         return c
+
+    def square_distance(self, point):
+        return float(np.min(np.linalg.norm(self.mask['squares']-point, axis=1)))
 
     def keep_cross(self, gray, i, center, box):
         x0, y0, x1, y1 = box
@@ -402,7 +409,7 @@ class TwoPairKeys:
         if camera != self.token or frame.shape != self.shape or run != self.run:
             # New camera or a new START: nothing measured before carries over.
             self.mask = self.mask_pixels = None
-            self.last_offset = None
+            self.last_offset = self.last_crosses = self.baseline = None
             self.plate = None
             self.cross_tpl = [None, None]
             self.token, self.shape, self.run = camera, frame.shape, run
@@ -436,7 +443,7 @@ class TwoPairKeys:
         ma = (math.degrees(math.atan2(*(g2-g1)[::-1])), 1.0)
         c = self.crosses(gray, cross_boxes)
         if c is not None and mask.get('observed') == MASK_SQUARES and \
-                min(np.linalg.norm(c[i]-mask['groups'][i]) for i in (0, 1)) > NEAR_SIDES*s+s:
+                min(self.square_distance(ci) for ci in c) > (NEAR_SIDES+2)*s:
             self.keep_plate(gray, cross_boxes[:2])
         if c is None:
             return md, None, ma, None, False

@@ -367,14 +367,23 @@ def draw_detection(frame, det, label, color):
     if det is None:
         return
     cx, cy = det['center']
-    x, y, w, h = det['rect']
-    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+    if det.get('keys'):
+        # Two-pair detector: one box per key, numbered so each mask key pairs with its wafer key.
+        for n, (x0, y0, x1, y1) in enumerate(det['keys'], 1):
+            cv2.rectangle(frame, (x0, y0), (x1, y1), color, 3)
+            put_text(frame, f'{label} {n}', (x1 + 8, (y0 + y1) // 2 + 10), color, 0.9, 2)  # beside: the keys touch
+    else:
+        x, y, w, h = det['rect']
+        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
     cv2.circle(frame, (int(cx), int(cy)), 3, color, -1)
     for i,quad in enumerate(det.get('quads', [])):
         measured = i < det.get('observed', 4)
         cv2.polylines(frame, [quad.astype(np.int32)], True, color if measured else (0,165,255), 2 if measured else 1)
-    detail = f"{det['observed']}/4" if label == 'MASK' else f"score={det['score']:.2f}"
-    put_text(frame, f"{label} {detail}", (int(cx) + 12, int(cy) - 12), color, 0.65, 2)
+    detail = f"{det['observed']}/{max(4, len(det.get('quads', [])))}" if label == 'MASK' else f"score={det['score']:.2f}"
+    if det.get('keys'):  # summary goes left of the pair, the key numbers are on the right
+        put_text(frame, f"{label} {detail}", (min(k[0] for k in det['keys']) - 230, int(cy)), color, 0.9, 2)
+    else:
+        put_text(frame, f"{label} {detail}", (int(cx) + 12, int(cy) - 12), color, 0.65, 2)
 
 def is_stable(history):
     if len(history) < STABLE_HISTORY:

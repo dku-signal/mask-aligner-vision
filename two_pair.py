@@ -17,6 +17,7 @@ process() returns the same tuple as the other detectors, so the app needs no oth
 md/wd centre = midpoint of the two mask groups / two crosses, ma/wa = baseline angles.
 """
 
+import json
 import math
 import sys
 from pathlib import Path
@@ -30,6 +31,10 @@ IMGSZ = 1280
 CONF = 0.15
 MASK_SQUARES = 8
 FINISH_SCORE = 0.5
+# The kept mask survives an app restart; it is trusted again only once enough of the squares
+# seen now sit on it (the camera may have been bumped in between).
+MASK_FILE = Path(__file__).resolve().parent/'out'/'two_pair_mask.json'
+MASK_CONFIRM = 3
 
 
 def blob_center(gray, box, exclude=None, pad=0.15):
@@ -65,6 +70,14 @@ class TwoPairKeys:
         # Attributes the app reads from every detector (pattern cache size, tracking reset).
         self.bank_bytes = 0
         self.previous_mask = self.previous_wafer = None
+        self.saved = None
+        try:
+            d = json.loads(MASK_FILE.read_text())
+            self.saved = dict(groups=tuple(np.array(g) for g in d['groups']), squares=np.array(d['squares']),
+                              boxes=np.array(d['boxes']), axis=np.array(d['axis']), size=d['size'],
+                              keys=[np.array(k) for k in d['keys']])
+        except (OSError, ValueError, KeyError):
+            pass
 
     def detect(self, frame):
         r = self.yolo.predict(frame, imgsz=IMGSZ, conf=CONF, device=self.device, verbose=False)[0]
@@ -75,7 +88,7 @@ class TwoPairKeys:
         return box[order][cls[order] == 0], box[order][cls[order] == 1], conf[order][cls[order] == 1]
 
     @staticmethod
-    def more_squares(gray, boxes, reach=4.0):
+    def more_squares(gray, boxes, reach=2.5):
         """Square boxes YOLO missed: dark square blobs of the same size near the YOLO squares."""
         size = float(np.median(np.r_[boxes[:, 2]-boxes[:, 0], boxes[:, 3]-boxes[:, 1]]))
         x0, y0 = (boxes[:, :2].min(0)-reach*size).astype(int).clip(0)
@@ -99,6 +112,13 @@ class TwoPairKeys:
                 merged.append(b)
         return np.array(merged)
 
+    @staticmethod
+    def is_grid(pts, tol=0.25):
+        """True if 4 points form a square (4 equal sides, 2 diagonals = side * sqrt 2)."""
+        d = np.sort([np.linalg.norm(a-b) for i, a in enumerate(pts) for b in pts[i+1:]])
+        side = np.median(d[:4])
+        return bool(side > 0 and np.all(abs(d[:4]-side) < tol*side) and np.all(abs(d[4:]-side*np.sqrt(2)) < tol*side))
+
     def measure_mask(self, gray, square_boxes):
         """Two square groups from MASK_SQUARES squares (YOLO + nearby blobs), or None."""
         if len(square_boxes) < 2:
@@ -121,12 +141,33 @@ class TwoPairKeys:
             axis = -axis
         order = np.argsort((pts-mean)@axis)
         half = MASK_SQUARES//2
-        g1, g2 = pts[order[:half]].mean(0), pts[order[half:]].mean(0)
+        groups = pts[order[:half]], pts[order[half:]]
+        if not all(self.is_grid(g) for g in groups):
+            return None  # stray dark blobs, not the 2 x (2x2) mask pattern
+        g1, g2 = groups[0].mean(0), groups[1].mean(0)
+        keys = [np.r_[g.min(0), g.max(0)] for g in groups]  # one box per 2x2 key (square centres)
         size = float(np.median(np.r_[boxes[:, 2]-boxes[:, 0], boxes[:, 3]-boxes[:, 1]]))
-        return dict(groups=(g1, g2), squares=pts, boxes=boxes, axis=axis, size=size)
+        keys = [k+[-size*0.7, -size*0.7, size*0.7, size*0.7] for k in keys]
+        return dict(groups=(g1, g2), squares=pts, boxes=boxes, axis=axis, size=size, keys=keys)
 
-    def keep_mask(self, gray, mask):
+    def confirm_saved(self, gray, square_boxes):
+        """Adopt the mask saved by an earlier run if the squares seen now sit on it."""
+        if self.saved is None or not len(square_boxes):
+            return
+        seen = [c for c in (blob_center(gray, b) for b in square_boxes) if c is not None]
+        hits = sum(min(np.linalg.norm(self.saved['squares']-c, axis=1)) < self.saved['size']/2 for c in seen)
+        if hits >= MASK_CONFIRM:
+            self.keep_mask(gray, self.saved, save=False)
+
+    def keep_mask(self, gray, mask, save=True):
         self.mask = mask
+        if save:
+            try:
+                MASK_FILE.parent.mkdir(exist_ok=True)
+                MASK_FILE.write_text(json.dumps({k: (np.asarray(v).tolist() if k != 'groups' else [g.tolist() for g in v])
+                                                 for k, v in mask.items()}))
+            except OSError:
+                pass
         m = np.zeros(gray.shape, bool)
         for x0, y0, x1, y1 in mask['boxes']:
             p = 0.15*(x1-x0)
@@ -141,8 +182,10 @@ class TwoPairKeys:
         if any(v is None for v in c):
             return None
         c = np.array(c)
+        boxes = cross_boxes[:2]
         if (c[1]-c[0])@self.mask['axis'] < 0:
-            c = c[::-1]
+            c, boxes = c[::-1], boxes[::-1]
+        self.cross_keys = [tuple(int(round(v)) for v in b) for b in boxes]
         return c
 
     def detection(self, center, size, score, quads=(), observed=0):
@@ -151,14 +194,19 @@ class TwoPairKeys:
                     area=float(size*size), score=float(score), quads=list(quads), observed=observed)
 
     def process(self, frame, phase, token=None, stationary=True):
-        if token != self.token or frame.shape != self.shape:
+        # The app's token changes on every motor move; only a camera change (its last two fields)
+        # invalidates the kept mask, which stays put while the stage moves the wafer.
+        camera = token[-2:] if isinstance(token, tuple) else token
+        if camera != self.token or frame.shape != self.shape:
             self.mask = self.mask_pixels = None
-            self.token, self.shape = token, frame.shape
+            self.token, self.shape = camera, frame.shape
         gray = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (3, 3), 0)
         square_boxes, cross_boxes, cross_conf = self.detect(frame)
         fresh = self.measure_mask(gray, square_boxes)
         if fresh is not None and stationary:
             self.keep_mask(gray, fresh)
+        elif self.mask is None:
+            self.confirm_saved(gray, square_boxes)
         mask = self.mask or fresh
         if mask is None:
             return None, None, None, None, False
@@ -166,6 +214,7 @@ class TwoPairKeys:
         s = mask['size']
         quads = [np.array([[x-s/2, y-s/2], [x+s/2, y-s/2], [x+s/2, y+s/2], [x-s/2, y+s/2]]) for x, y in mask['squares']]
         md = self.detection((g1+g2)/2, float(np.linalg.norm(g2-g1))+2*s, 1.0, quads, len(quads))
+        md['keys'] = [tuple(int(round(v)) for v in k) for k in mask['keys']]
         ma = (math.degrees(math.atan2(*(g2-g1)[::-1])), 1.0)
         c = self.crosses(gray, cross_boxes)
         if c is None:
@@ -173,6 +222,7 @@ class TwoPairKeys:
         score = float(cross_conf[:2].min())
         wd = self.detection(c.mean(0), float(np.linalg.norm(c[1]-c[0]))+2*s, score)
         wd['pairs'] = [(g1, c[0]), (g2, c[1])]
+        wd['keys'] = self.cross_keys
         wa = (math.degrees(math.atan2(*(c[1]-c[0])[::-1])), score)
         offset = c.mean(0)-(g1+g2)/2
         finish = bool(phase in ('XY', 'DONE') and max(abs(offset)) < self.center_tolerance and score >= FINISH_SCORE)

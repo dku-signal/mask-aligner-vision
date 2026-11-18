@@ -264,6 +264,7 @@ HTTP_PORT = 8765
 CAMERA_INDEX = 0
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
+PREVIEW_MAX_WIDTH = 960
 JPEG_QUALITY = 72
 PREVIEW_FPS = 20
 PATTERN_CACHE_MB = 64
@@ -693,6 +694,9 @@ class MaskAlignerApp:
             # Default path needs only opencv/numpy; sam2_keys pulls in torch.
             from subpixel import PreciseKeys
             self.key_detector = PreciseKeys(center_tolerance=DEAD_BAND_PX, cache_mb=cache_mb)
+        elif detector == 'yolo-2pair':
+            from two_pair import TwoPairKeys
+            self.key_detector = TwoPairKeys(center_tolerance=DEAD_BAND_PX)
         else:
             from sam2_keys import make_detector
             self.key_detector = make_detector(detector, center_tolerance=DEAD_BAND_PX, cache_mb=cache_mb)
@@ -974,6 +978,8 @@ class MaskAlignerApp:
                         cv2.line(display, (int(cx-vx),int(cy-vy)), (int(cx+vx),int(cy+vy)),color,2)
             if md is not None and wd is not None:
                 cv2.line(display, tuple(int(v) for v in md['center']), tuple(int(v) for v in wd['center']), (255,255,255),1)
+            if display.shape[1] > PREVIEW_MAX_WIDTH:  # 1080p capture: keep the stream light and the text readable
+                display = cv2.resize(display, None, fx=PREVIEW_MAX_WIDTH/display.shape[1], fy=PREVIEW_MAX_WIDTH/display.shape[1], interpolation=cv2.INTER_AREA)
             put_text(display, ('ALIGNING / ' if phase in ('THETA','XY') else '')+phase+' / '+status, (12,28),scale=0.48)
             if phase in ('XY','DONE'):
                 text = 'THETA ALIGN DONE / ' + ('XY CENTER ALIGN' if phase=='XY' else 'ALIGN FINISH')
@@ -1911,8 +1917,10 @@ def main():
                         help='Z mode times and transfer sequence (optional)')
     parser.add_argument('--calibration', default=str(Path(__file__).resolve().parent/'calibration.json'),
                         help='calibrate_xy.py output to load (default: calibration.json next to this file)')
-    parser.add_argument('--detector', choices=('opencv', 'opencv-v4', 'sam2', 'hybrid', 'yolo-sam2', 'opencv-sam2'), default='opencv',
-                        help='opencv: rule-based squares + subpixel edge fit; opencv-v4: original integer-pixel; sam2/hybrid: SAM2.1 hiera-small segmentation; yolo-sam2/opencv-sam2: YOLO or OpenCV boxes -> SAM2')
+    parser.add_argument('--detector', choices=('opencv', 'opencv-v4', 'sam2', 'hybrid', 'yolo-sam2', 'opencv-sam2', 'yolo-2pair'), default='opencv',
+                        help='opencv: rule-based squares + subpixel edge fit; opencv-v4: original integer-pixel; sam2/hybrid: SAM2.1 hiera-small segmentation; yolo-sam2/opencv-sam2: YOLO or OpenCV boxes -> SAM2; yolo-2pair: two mask/wafer key pairs in one view (two_pair.py)')
+    parser.add_argument('--frame', default=None,
+                        help='capture size WxH, e.g. 1920x1080 for small keys (default 640x480)')
     parser.add_argument('--cache-mb', type=int, default=PATTERN_CACHE_MB,
                         help='Template array cache limit in MiB (default: 64)')
     parser.add_argument('--preview-fps', type=int, default=PREVIEW_FPS,
@@ -1929,6 +1937,9 @@ def main():
     if args.opencv_threads:
         cv2.setNumThreads(args.opencv_threads)
     load_calibration(args.calibration)
+    if args.frame:
+        global FRAME_WIDTH, FRAME_HEIGHT
+        FRAME_WIDTH, FRAME_HEIGHT = (int(v) for v in args.frame.lower().split('x'))
     load_rig_config(args.rig_config)
     if args.arduino_port:
         global ARDUINO_PORT

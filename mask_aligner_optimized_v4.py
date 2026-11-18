@@ -338,17 +338,24 @@ PREALIGN_SETTLE_SEC = 0.4
 #   @TURN     start a background PT turn sized from the last @MEASURE; the next rail line runs
 #             while the wafer turns (needs PREALIGN_DEG_PER_MS, learnt by any closed-loop PREALIGN)
 #   @THETA    wait for that turn, then closed-loop PREALIGN to PREALIGN_TOL_DEG
-#   @Y        move PREALIGN_Y_AXIS until the disc centre is at PREALIGN_TARGET_XY (image axis
-#             PREALIGN_Y_IMAGE_AXIS: 0 = x, 1 = y), within PREALIGN_Y_TOL_PX
+#   @Y        method 2 (wafer transfer doc, 2026-11-18): move Y_RAIL_AXIS by
+#             Y_RAIL_MAX_STEPS - Y_RAIL_CORRECTION. After every ALIGN FINISH the fine-stage Y steps that
+#             align needed are fed back: Y_RAIL_CORRECTION -= fine_steps * Y_RAIL_PER_FINE, so the next
+#             wafer arrives where the last one ended. Y_RAIL_PER_FINE (rail steps per fine Y step, signed)
+#             is learnt from two wafers sent with different rail moves; the second one is sent
+#             Y_PROBE_STEPS shorter for that. The first wafer goes uncorrected.
+#   @STAGE_HOME  move the fine stage X/Y back by everything aligns and jogs moved since the last home
+#   @UNWIND   turn the pre-align servo back by this cycle's net PT time (magnet cable untwist)
 PREALIGN_DEG_PER_MS = None
 PREALIGN_TURN_GAIN = 0.9
-PREALIGN_TARGET_XY = None
-PREALIGN_Y_AXIS = 'R2'
-PREALIGN_Y_IMAGE_AXIS = 1
-PREALIGN_Y_STEPS_PER_PX = None
-PREALIGN_Y_PROBE_STEPS = 2000
-PREALIGN_Y_TOL_PX = 2.0
-PREALIGN_Y_MAX_MOVES = 6
+PREALIGN_NET_MS = 0        # net PT time since the last @UNWIND (+ = direction 1)
+Y_RAIL_AXIS = 'R2'
+Y_FINE_AXIS = 'Y'          # Arduino axis of the fine stage that matches the transfer Y rail
+Y_RAIL_MAX_STEPS = None    # rail travel to the right end, signed (measure on the rig)
+Y_RAIL_CORRECTION = 0
+Y_RAIL_PER_FINE = None
+Y_PROBE_STEPS = 2000
+Y_FEEDBACK = []            # [[rail steps sent, fine Y steps the align then needed], ...] newest last
 RIG_CONFIG_PATH = None
 
 def wrap90(a):
@@ -682,6 +689,9 @@ class MaskAlignerApp:
         self.prealign_lock = threading.Lock()
         self.prealign_angle = None
         self.prealign_center = None
+        self.stage_offset = {'X': 0, 'Y': 0}  # fine-stage steps since the last @STAGE_HOME
+        self.align_moved = {'X': 0, 'Y': 0}   # fine-stage steps of the current / last align
+        self.y_rail_sent = None               # rail steps @Y sent for the wafer now on the stage
         self.prealign_jpeg = None
         self.prealign_seq = 0
         self.stable = False
@@ -1038,6 +1048,7 @@ class MaskAlignerApp:
                 self.history.clear()
                 self.next_info = None
                 self.status = 'ALIGN START'
+                self.align_moved = {'X': 0, 'Y': 0}
             self.generation += 1
             self.clear_samples()
             # No theta motor on the current build: go straight to XY centring.
@@ -1100,6 +1111,12 @@ class MaskAlignerApp:
                     success = False
                     error = self.arduino.last_error or 'Serial command failed'
                     break
+                head, _, value = command.partition(' ')
+                if head in ('X', 'Y') and value.lstrip('-').isdigit():
+                    with self.lock:
+                        self.stage_offset[head] += int(value)
+                        if self.auto_running and self.phase in ('THETA', 'XY'):
+                            self.align_moved[head] += int(value)
                 with self.lock:
                     self.motion_stage = 'SETTLING'
                     self.status = f'ACK OK; settling {settle:.2f}s'
@@ -1265,10 +1282,9 @@ class MaskAlignerApp:
         angle = self.prealign_measure()
         if angle is None:
             return False
-        self.save_rig_config(PREALIGN_TARGET_DEG=round(angle, 2),
-                             PREALIGN_TARGET_XY=[round(v, 1) for v in self.prealign_center])
+        self.save_rig_config(PREALIGN_TARGET_DEG=round(angle, 2))
         with self.lock:
-            self.status = f'PREALIGN target saved: {PREALIGN_TARGET_DEG:.2f} deg, centre {PREALIGN_TARGET_XY}'
+            self.status = f'PREALIGN target saved: {PREALIGN_TARGET_DEG:.2f} deg'
         return True
 
     def prealign_run(self, generation):
@@ -1304,8 +1320,27 @@ class MaskAlignerApp:
             seq = self.prealign_seq
             if not self.execute([(f'PT {seq} {direction} {ms}', f'DONE PT {seq}', ms/1000+3, PREALIGN_SETTLE_SEC)], generation):
                 return 'PREALIGN: stopped'
+            self.add_turn(direction*ms)
             last = (angle, direction, ms)
         return f'PREALIGN FAIL: not within {PREALIGN_TOL_DEG} deg after {PREALIGN_MAX_PULSES} pulses'
+
+    def add_turn(self, signed_ms):
+        """Net pre-align servo time since the last unwind (+ = direction 1), kept across restarts."""
+        self.save_rig_config(PREALIGN_NET_MS=int(PREALIGN_NET_MS+signed_ms))
+
+    def unwind(self, generation):
+        """Turn the pre-align servo back by the net time turned since the last unwind."""
+        left = PREALIGN_NET_MS
+        while left:
+            ms = int(min(abs(left), PREALIGN_MAX_MS))
+            direction = -1 if left > 0 else 1
+            self.prealign_seq += 1
+            seq = self.prealign_seq
+            if not self.execute([(f'PT {seq} {direction} {ms}', f'DONE PT {seq}', ms/1000+3, 0.1)], generation):
+                return False
+            left += direction*ms
+            self.save_rig_config(PREALIGN_NET_MS=int(left))
+        return True
 
     def wait_pt(self, seq, timeout, generation):
         """Wait for "DONE PT seq" of a background turn (it may have arrived during a rail move)."""
@@ -1314,38 +1349,6 @@ class MaskAlignerApp:
             self.arduino.pt_done.discard(line)
             return True
         return self.execute([('', line, timeout, PREALIGN_SETTLE_SEC)], generation)
-
-    def prealign_y(self, generation):
-        """Move PREALIGN_Y_AXIS until the disc centre sits at PREALIGN_TARGET_XY. Returns an error or None."""
-        if PREALIGN_TARGET_XY is None:
-            return 'no PREALIGN_TARGET_XY (press 기준 저장 once)'
-        k = PREALIGN_Y_IMAGE_AXIS
-        for move in range(PREALIGN_Y_MAX_MOVES+1):
-            if self.prealign_measure() is None:
-                return 'no wafer on the loader camera'
-            err = PREALIGN_TARGET_XY[k]-self.prealign_center[k]
-            with self.lock:
-                self.status = f'PREALIGN Y err {err:+.1f} px (move {move})'
-            if abs(err) <= PREALIGN_Y_TOL_PX:
-                return None
-            if PREALIGN_Y_STEPS_PER_PX is None:
-                # First use: probe once to learn steps per px (sign included) and keep it.
-                before = self.prealign_center[k]
-                if not self.execute([(f'{PREALIGN_Y_AXIS} {PREALIGN_Y_PROBE_STEPS}', 'DONE', 30.0, PREALIGN_SETTLE_SEC)], generation):
-                    return 'stopped'
-                if self.prealign_measure() is None:
-                    return 'wafer lost during the Y probe'
-                moved = self.prealign_center[k]-before
-                if abs(moved) < 1.0:
-                    return f'{PREALIGN_Y_AXIS} {PREALIGN_Y_PROBE_STEPS} steps moved the disc {moved:.2f} px: wrong axis?'
-                self.save_rig_config(PREALIGN_Y_STEPS_PER_PX=round(PREALIGN_Y_PROBE_STEPS/moved, 3))
-                continue
-            steps = int(round(err*PREALIGN_Y_STEPS_PER_PX))
-            if steps == 0:
-                return None
-            if not self.execute([(f'{PREALIGN_Y_AXIS} {steps}', 'DONE', abs(steps)/4000+5, PREALIGN_SETTLE_SEC)], generation):
-                return 'stopped'
-        return f'not within {PREALIGN_Y_TOL_PX} px after {PREALIGN_Y_MAX_MOVES} moves'
 
     @staticmethod
     def reply_for(line):
@@ -1382,6 +1385,7 @@ class MaskAlignerApp:
                 pending = (self.prealign_seq, min(ms, PREALIGN_MAX_MS))
                 if not self.execute([(f'PT {pending[0]} {direction} {pending[1]}', f'START PT {pending[0]}', 2.0, 0.0)], generation):
                     return 'transfer: stopped'
+                self.add_turn(direction*pending[1])
             elif step == '@THETA':
                 if pending is not None:
                     if not self.wait_pt(pending[0], pending[1]/1000+3, generation):
@@ -1393,9 +1397,21 @@ class MaskAlignerApp:
                 if not message.startswith('PREALIGN DONE'):
                     return f'transfer FAIL at {i+1}: {message}'
             elif step == '@Y':
-                error = self.prealign_y(generation)
-                if error:
-                    return f'transfer FAIL at {i+1}: Y {error}'
+                if Y_RAIL_MAX_STEPS is None:
+                    return f'transfer FAIL at {i+1}: Y_RAIL_MAX_STEPS not measured (rig_config.json)'
+                rail = int(Y_RAIL_MAX_STEPS-Y_RAIL_CORRECTION)
+                if rail and not self.execute([(f'{Y_RAIL_AXIS} {rail}', 'DONE', abs(rail)/4000+5, 0.3)], generation):
+                    return 'transfer: stopped'
+                self.y_rail_sent = rail
+            elif step == '@STAGE_HOME':
+                with self.lock:
+                    back = {k: -v for k, v in self.stage_offset.items()}
+                moves = [(f'{k} {v}', 'DONE', abs(v)/4000+5, AXIS_SETTLE_SEC) for k, v in back.items() if v]
+                if moves and not self.execute(moves, generation):
+                    return 'transfer: stopped'
+            elif step == '@UNWIND':
+                if not self.unwind(generation):
+                    return 'transfer: stopped'
             elif not self.execute([(step, self.reply_for(step), 120.0, 0.3)], generation):
                 return 'transfer: stopped'
         if pending is not None and not self.wait_pt(pending[0], pending[1]/1000+3, generation):
@@ -1629,6 +1645,30 @@ class MaskAlignerApp:
             self.history.clear()
             self.next_info = None
             self.status = message
+            fine = self.align_moved[Y_FINE_AXIS]
+        note = self.y_feedback(fine)
+        if note:
+            with self.lock:
+                self.status = f'{message} / {note}'
+
+    def y_feedback(self, fine):
+        """Method 2: feed this align's fine-stage Y steps back into the next wafer's rail move."""
+        if self.y_rail_sent is None:
+            return None  # this wafer did not come through @Y (placed by hand)
+        rail, self.y_rail_sent = self.y_rail_sent, None
+        history = (Y_FEEDBACK+[[rail, fine]])[-5:]
+        ratio = Y_RAIL_PER_FINE
+        if len(history) >= 2:
+            (r0, f0), (r1, f1) = history[-2], history[-1]
+            if abs(r1-r0) >= 100 and abs(f1-f0) >= 20:
+                ratio = round(-(r1-r0)/(f1-f0), 4)  # rail steps that cancel one fine step
+        if ratio is None:
+            correction = Y_RAIL_CORRECTION+Y_PROBE_STEPS  # no ratio yet: probe with a shorter move
+        else:
+            correction = int(round(Y_RAIL_CORRECTION-fine*ratio))
+        self.save_rig_config(Y_FEEDBACK=history, Y_RAIL_PER_FINE=ratio, Y_RAIL_CORRECTION=correction)
+        nxt = '?' if Y_RAIL_MAX_STEPS is None else Y_RAIL_MAX_STEPS-correction
+        return f'Y feedback: fine {fine:+d} steps -> next rail {nxt}'
 
     def get_status(self):
         with self.lock:
@@ -1867,8 +1907,8 @@ def load_calibration(path):
 
 RIG_CONFIG_KEYS = ('Z_WHICH', 'Z_MODES', 'TRANSFER_SEQUENCE', 'THETA_TOL_DEG',
                    'PREALIGN_CAMERA', 'PREALIGN_TARGET_DEG', 'PREALIGN_TOL_DEG', 'PREALIGN_DEG_PER_MS',
-                   'PREALIGN_TARGET_XY', 'PREALIGN_Y_AXIS', 'PREALIGN_Y_IMAGE_AXIS', 'PREALIGN_Y_STEPS_PER_PX',
-                   'PREALIGN_Y_TOL_PX')
+                   'PREALIGN_NET_MS', 'Y_RAIL_AXIS', 'Y_FINE_AXIS', 'Y_RAIL_MAX_STEPS', 'Y_RAIL_CORRECTION',
+                   'Y_RAIL_PER_FINE', 'Y_PROBE_STEPS', 'Y_FEEDBACK')
 
 
 def load_rig_config(path):

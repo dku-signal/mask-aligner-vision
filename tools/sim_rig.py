@@ -254,16 +254,27 @@ def main():
     pts = [l for l in fw.log[start:] if l.startswith('PT ')]
     print(f'  pulses: {pts}')
     print(f'  TRUE notch {world.notch:.2f} deg, target 30.00 -> err {(world.notch-30+180)%360-180:+.2f} deg')
-    print('\n=== 5. transfer: measure, turn while R1 carries the wafer, fine theta, then Y on R2')
-    world.notch, world.loader_y = 140.0, 18.0
-    app_mod.PREALIGN_TARGET_XY = [330.0, 235.0]
-    app_mod.TRANSFER_SEQUENCE = ['MAG 1 1', '@MEASURE', '@TURN', 'R1 -6000', '@THETA', '@Y', 'R1 -3000', 'MAG 1 0']
-    print(f'  learnt deg/ms {app_mod.PREALIGN_DEG_PER_MS}  notch {world.notch} -> target 30, disc y offset {world.loader_y} px')
+    print('\n=== 5. transfer (method 2): unwind, measure, turn while R1 carries, fine theta, Y rail by feedback')
+    world.notch = 140.0
+    app_mod.Y_RAIL_MAX_STEPS = 20000
+    app_mod.TRANSFER_SEQUENCE = ['@UNWIND', '@STAGE_HOME', 'MAG 1 1', '@MEASURE', '@TURN', 'R1 -6000', '@THETA',
+                                 '@Y', 'R1 -3000', 'MAG 1 0']
     start = len(fw.log)
     t0 = time.time()
     run('transfer', lambda: app.start_worker('transfer', app.transfer_run))
     print(f'  sent: {fw.log[start:]}  ({time.time()-t0:.1f} s)')
-    print(f'  TRUE notch err {(world.notch-30+180)%360-180:+.2f} deg, disc y offset {world.loader_y:+.2f} px')
+    print(f'  TRUE notch err {(world.notch-30+180)%360-180:+.2f} deg, net PT ms {app_mod.PREALIGN_NET_MS}')
+    # Feedback loop: the fine stage needs 0.8 fine steps per rail step the rail is off the ideal 17500.
+    print('  method 2 feedback over 5 wafers (ideal rail 17500, fine = -0.8 * (rail - 17500)):')
+    for k in range(5):
+        rail = app_mod.Y_RAIL_MAX_STEPS-app_mod.Y_RAIL_CORRECTION
+        app.y_rail_sent = rail
+        fine = int(round(-0.8*(rail-17500)))
+        note = app.y_feedback(fine)
+        print(f'    wafer {k+1}: rail {rail:6d} -> fine Y needed {fine:+6d}   {note}  ratio {app_mod.Y_RAIL_PER_FINE}')
+    run('unwind', lambda: app.start_worker('unwind', lambda g: 'unwound' if app.unwind(g) else 'stopped'))
+    print(f'  after unwind: net PT ms {app_mod.PREALIGN_NET_MS}')
+
     phase, nmoves, elapsed, true = xy_result
     print(f'\nresult: phase={phase}  moves={nmoves}  time={elapsed:.1f}s')
     print(f'TRUE remaining offset: dx={true[0]:+.3f} px  dy={true[1]:+.3f} px  |e|={np.linalg.norm(true):.3f} px')

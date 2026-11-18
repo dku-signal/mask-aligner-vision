@@ -17,5 +17,26 @@
   "THETA_TOL_DEG": 1.5,
   "PREALIGN_CAMERA": 0,
   "PREALIGN_TARGET_DEG": null,
-  "PREALIGN_TOL_DEG": 1.0
+  "PREALIGN_TOL_DEG": 1.0,
+  "Y_RAIL_AXIS": "R2",
+  "Y_FINE_AXIS": "Y",
+  "Y_RAIL_MAX_STEPS": null,
+  "Y_RAIL_CORRECTION": 0,
+  "Y_RAIL_PER_FINE": null,
+  "Y_PROBE_STEPS": 2000,
+  "Y_FEEDBACK": [],
+  "PREALIGN_NET_MS": 0,
+  "_transfer_example": [
+    "@UNWIND",
+    "@STAGE_HOME",
+    "MAG 1 1",
+    "@MEASURE",
+    "@TURN",
+    "R1 <X rail to stage>",
+    "@THETA",
+    "@Y",
+    "Z 4 1 <ms Y linear in>",
+    "Z 2 -1 <ms Z down>",
+    "MAG 1 0"
+  ]
 }

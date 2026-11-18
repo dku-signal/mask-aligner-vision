@@ -150,6 +150,12 @@ class FakeFirmware(threading.Thread):
             self.reply(f'DONE {line}')
         elif line == 'DIST':
             self.reply('DIST 1.58')
+        elif line.startswith('PT '):
+            # Continuous servo: dead zone ~40 ms, then ~0.09 deg/ms, turning the notch backwards.
+            _, seq, d, ms = line.split()[:4]
+            time.sleep(int(ms)/1000)
+            self.world.notch = (self.world.notch-int(d)*0.09*max(0, int(ms)-40)) % 360
+            self.reply(f'DONE PT {seq}')
         elif line.startswith('T'):
             self.reply('ERR T disabled')
         else:
@@ -218,6 +224,26 @@ def main():
     run('transfer', lambda: app.run_commands('transfer', [(l, 'DONE*', 5.0, 0.0) for l in app_mod.TRANSFER_SEQUENCE]))
     print('  sent:', fw.log[start:])
     print(f'  distance shown: {app.distance} mm, z mode: {app.z_last_mode}')
+    print('\n=== 4. pre-align: notch on a synthetic loader frame, PT pulses')
+    world.notch = 250.0
+    rng = np.random.default_rng(1)
+
+    def loader_frame():
+        img = rng.normal(30, 6, (480, 640)).clip(0, 255).astype(np.uint8)
+        c, r, a = (330, 235), 170, np.radians(world.notch)
+        cv2.circle(img, c, r, 225, -1, cv2.LINE_AA)
+        tip = (c[0]+r*np.cos(a), c[1]+r*np.sin(a))
+        side = np.array([-np.sin(a), np.cos(a)])*14
+        notch = np.array([tip+side, tip-side, (c[0]+(r-22)*np.cos(a), c[1]+(r-22)*np.sin(a))])
+        cv2.fillPoly(img, [np.round(notch*16).astype(np.int32)], 30, cv2.LINE_AA, shift=4)
+        return cv2.cvtColor(cv2.GaussianBlur(img, (3, 3), 0), cv2.COLOR_GRAY2BGR)
+    app.prealign_grab = loader_frame
+    app_mod.PREALIGN_TARGET_DEG = 30.0
+    start = len(fw.log)
+    run('prealign', app.start_prealign)
+    pts = [l for l in fw.log[start:] if l.startswith('PT ')]
+    print(f'  pulses: {pts}')
+    print(f'  TRUE notch {world.notch:.2f} deg, target 30.00 -> err {(world.notch-30+180)%360-180:+.2f} deg')
     phase, nmoves, elapsed, true = xy_result
     print(f'\nresult: phase={phase}  moves={nmoves}  time={elapsed:.1f}s')
     print(f'TRUE remaining offset: dx={true[0]:+.3f} px  dy={true[1]:+.3f} px  |e|={np.linalg.norm(true):.3f} px')

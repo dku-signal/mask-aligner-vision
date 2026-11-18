@@ -17,7 +17,12 @@ from mask_aligner_optimized_v4 import CornerKeys
 from subpixel import PreciseKeys
 
 MODEL_ID = 'facebook/sam2.1-hiera-small'
-YOLO_WEIGHTS = Path(__file__).resolve().parent/'runs'/'keys'/'weights'/'best.pt'  # classes 0 square, 1 cross
+_RUNS = Path(__file__).resolve().parent/'runs'
+# Classes 0 square, 1 cross. Prefer the model fine-tuned on real rig frames (2026-11-05,
+# tools/autolabel.py); fall back to the synthetic one (tools/make_dataset.py, 2026-09-28).
+YOLO_WEIGHTS_REAL = _RUNS/'keys_real'/'weights'/'best.pt'
+YOLO_WEIGHTS_SYNTH = _RUNS/'keys'/'weights'/'best.pt'
+YOLO_WEIGHTS = YOLO_WEIGHTS_REAL if YOLO_WEIGHTS_REAL.is_file() else YOLO_WEIGHTS_SYNTH
 
 
 def pick_device():

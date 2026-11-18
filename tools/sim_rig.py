@@ -38,6 +38,7 @@ class World:
         self.A = np.array([[0.40, -14.34], [13.77, -0.98]])/30.0
         self.backlash = 2.0  # steps lost on each direction reversal
         self.pos = np.zeros(2)      # commanded steps
+        self.notch, self.loader_y = 0.0, 0.0  # loader camera: notch angle, disc offset (px)
         self.eff = np.zeros(2)      # effective (after backlash/noise) steps
         self.last_dir = np.zeros(2)
 
@@ -140,7 +141,10 @@ class FakeFirmware(threading.Thread):
             self.reply('DONE')
         elif line[:3] in ('R1 ', 'R2 '):
             self.reply(f'MOVE {line}')
-            time.sleep(.05)
+            n = int(line[3:])
+            time.sleep(abs(n)/5000+.05)  # rails ~5000 steps/s
+            if line[:2] == 'R2':
+                self.world.loader_y += n/250  # R2 moves the disc down the loader image, 250 steps/px
             self.reply('DONE')
         elif line.startswith('Z '):
             _, which, d, ms = line.split()
@@ -151,11 +155,17 @@ class FakeFirmware(threading.Thread):
         elif line == 'DIST':
             self.reply('DIST 1.58')
         elif line.startswith('PT '):
-            # Continuous servo: dead zone ~40 ms, then ~0.09 deg/ms, turning the notch backwards.
+            # Continuous servo, non-blocking like the firmware: dead zone ~40 ms, then ~0.09 deg/ms,
+            # turning the notch backwards. Rotation is applied gradually so frames see it turn.
             _, seq, d, ms = line.split()[:4]
-            time.sleep(int(ms)/1000)
-            self.world.notch = (self.world.notch-int(d)*0.09*max(0, int(ms)-40)) % 360
-            self.reply(f'DONE PT {seq}')
+            self.reply(f'START PT {seq}')
+
+            def turn():
+                for _ in range(10):
+                    time.sleep(int(ms)/10000)
+                    self.world.notch = (self.world.notch-int(d)*0.09*max(0, int(ms)-40)/10) % 360
+                self.reply(f'DONE PT {seq}')
+            threading.Thread(target=turn, daemon=True).start()
         elif line.startswith('T'):
             self.reply('ERR T disabled')
         else:
@@ -230,7 +240,7 @@ def main():
 
     def loader_frame():
         img = rng.normal(30, 6, (480, 640)).clip(0, 255).astype(np.uint8)
-        c, r, a = (330, 235), 170, np.radians(world.notch)
+        c, r, a = (330, int(round(235+world.loader_y))), 170, np.radians(world.notch)
         cv2.circle(img, c, r, 225, -1, cv2.LINE_AA)
         tip = (c[0]+r*np.cos(a), c[1]+r*np.sin(a))
         side = np.array([-np.sin(a), np.cos(a)])*14
@@ -244,6 +254,16 @@ def main():
     pts = [l for l in fw.log[start:] if l.startswith('PT ')]
     print(f'  pulses: {pts}')
     print(f'  TRUE notch {world.notch:.2f} deg, target 30.00 -> err {(world.notch-30+180)%360-180:+.2f} deg')
+    print('\n=== 5. transfer: measure, turn while R1 carries the wafer, fine theta, then Y on R2')
+    world.notch, world.loader_y = 140.0, 18.0
+    app_mod.PREALIGN_TARGET_XY = [330.0, 235.0]
+    app_mod.TRANSFER_SEQUENCE = ['MAG 1 1', '@MEASURE', '@TURN', 'R1 -6000', '@THETA', '@Y', 'R1 -3000', 'MAG 1 0']
+    print(f'  learnt deg/ms {app_mod.PREALIGN_DEG_PER_MS}  notch {world.notch} -> target 30, disc y offset {world.loader_y} px')
+    start = len(fw.log)
+    t0 = time.time()
+    run('transfer', lambda: app.start_worker('transfer', app.transfer_run))
+    print(f'  sent: {fw.log[start:]}  ({time.time()-t0:.1f} s)')
+    print(f'  TRUE notch err {(world.notch-30+180)%360-180:+.2f} deg, disc y offset {world.loader_y:+.2f} px')
     phase, nmoves, elapsed, true = xy_result
     print(f'\nresult: phase={phase}  moves={nmoves}  time={elapsed:.1f}s')
     print(f'TRUE remaining offset: dx={true[0]:+.3f} px  dy={true[1]:+.3f} px  |e|={np.linalg.norm(true):.3f} px')

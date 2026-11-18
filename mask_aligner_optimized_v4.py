@@ -332,6 +332,22 @@ PREALIGN_PROBE_MS = 150
 PREALIGN_GAIN = 0.7
 PREALIGN_MAX_PULSES = 30
 PREALIGN_SETTLE_SEC = 0.4
+# Transfer with pre-align (TRANSFER_SEQUENCE steps that start with @, see transfer_run):
+#   @MEASURE  notch + disc centre on the loader camera (fails if no wafer)
+#   @TURN     start a background PT turn sized from the last @MEASURE; the next rail line runs
+#             while the wafer turns (needs PREALIGN_DEG_PER_MS, learnt by any closed-loop PREALIGN)
+#   @THETA    wait for that turn, then closed-loop PREALIGN to PREALIGN_TOL_DEG
+#   @Y        move PREALIGN_Y_AXIS until the disc centre is at PREALIGN_TARGET_XY (image axis
+#             PREALIGN_Y_IMAGE_AXIS: 0 = x, 1 = y), within PREALIGN_Y_TOL_PX
+PREALIGN_DEG_PER_MS = None
+PREALIGN_TURN_GAIN = 0.9
+PREALIGN_TARGET_XY = None
+PREALIGN_Y_AXIS = 'R2'
+PREALIGN_Y_IMAGE_AXIS = 1
+PREALIGN_Y_STEPS_PER_PX = None
+PREALIGN_Y_PROBE_STEPS = 2000
+PREALIGN_Y_TOL_PX = 2.0
+PREALIGN_Y_MAX_MOVES = 6
 RIG_CONFIG_PATH = None
 
 def wrap90(a):
@@ -416,6 +432,7 @@ class ArduinoLink:
         self.lock = threading.Lock()
         self.rx_buffer = bytearray()
         self.last_rx = ''
+        self.pt_done = set()  # "DONE PT <id>" lines that arrived during another command
         self.last_error = '' 
         if serial is None:
             print('pyserial is not installed. Run: python -m pip install pyserial')
@@ -506,8 +523,10 @@ class ArduinoLink:
                 return False
             if line:
                 print(f'<- {line}', flush=True)
-            if line == expected or (expected.endswith('*') and line.startswith(expected[:-1])):
+            if line == expected or (expected.endswith('*') and line.startswith(expected[:-1]) and not line.startswith('DONE PT ')):
                 return True
+            if line.startswith('DONE PT '):
+                self.pt_done.add(line)
             if line == 'STOP' or line.startswith('ERR'):
                 self.last_error = f'Arduino replied: {line}'
                 return False
@@ -652,6 +671,7 @@ class MaskAlignerApp:
         self.prealign_cap = None
         self.prealign_lock = threading.Lock()
         self.prealign_angle = None
+        self.prealign_center = None
         self.prealign_jpeg = None
         self.prealign_seq = 0
         self.stable = False
@@ -1060,7 +1080,7 @@ class MaskAlignerApp:
                         break
                     self.motion_stage = 'WAIT_ACK'
                     self.status = f'WAIT ACK: {command}'
-                    sent = self.arduino.send(command)
+                    sent = self.arduino.send(command) if command else True  # '' = only wait
                 if not sent or not self.arduino.wait_done(self.stop_event, timeout, expected):
                     success = False
                     error = self.arduino.last_error or 'Serial command failed'
@@ -1193,7 +1213,7 @@ class MaskAlignerApp:
     def prealign_measure(self, frames=3):
         """Median notch angle over a few loader-camera frames (prealign.find_notch), or None."""
         with self.prealign_lock:
-            angles, frame, result = [], None, None
+            angles, centers, frame, result = [], [], None, None
             for _ in range(frames):
                 frame = self.prealign_grab()
                 if frame is None:
@@ -1201,31 +1221,39 @@ class MaskAlignerApp:
                 result = prealign.find_notch(frame)
                 if result is not None:
                     angles.append(result['angle'])
-            angle = None
+                    centers.append(result['center'])
+            angle = center = None
             if angles:
                 ref = angles[0]
                 angle = (ref+float(np.median([prealign.wrap180(a-ref) for a in angles]))) % 360
+                center = tuple(float(v) for v in np.median(centers, axis=0))
             if frame is not None:
                 ok, jpg = cv2.imencode('.jpg', prealign.draw(frame, result, PREALIGN_TARGET_DEG))
                 if ok:
                     self.prealign_jpeg = jpg.tobytes()
         with self.lock:
             self.prealign_angle = angle
+            self.prealign_center = center
         return angle
+
+    def save_rig_config(self, **values):
+        """Set module constants and write them into rig_config.json (values learnt on the rig)."""
+        globals().update(values)
+        if RIG_CONFIG_PATH is None:
+            return
+        data = json.loads(RIG_CONFIG_PATH.read_text()) if RIG_CONFIG_PATH.is_file() else {}
+        data.update(values)
+        RIG_CONFIG_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False)+'\n')
 
     def prealign_set_target(self):
         """Save the current notch angle as the pre-align target (do this right after a good fine align)."""
-        global PREALIGN_TARGET_DEG
         angle = self.prealign_measure()
         if angle is None:
             return False
-        PREALIGN_TARGET_DEG = round(angle, 2)
-        if RIG_CONFIG_PATH is not None:
-            data = json.loads(RIG_CONFIG_PATH.read_text()) if RIG_CONFIG_PATH.is_file() else {}
-            data['PREALIGN_TARGET_DEG'] = PREALIGN_TARGET_DEG
-            RIG_CONFIG_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False)+'\n')
+        self.save_rig_config(PREALIGN_TARGET_DEG=round(angle, 2),
+                             PREALIGN_TARGET_XY=[round(v, 1) for v in self.prealign_center])
         with self.lock:
-            self.status = f'PREALIGN target saved: {PREALIGN_TARGET_DEG:.2f} deg'
+            self.status = f'PREALIGN target saved: {PREALIGN_TARGET_DEG:.2f} deg, centre {PREALIGN_TARGET_XY}'
         return True
 
     def prealign_run(self, generation):
@@ -1247,8 +1275,11 @@ class MaskAlignerApp:
                 moved = prealign.wrap180(angle-last[0])
                 if abs(moved) > 0.3:
                     response = moved/(last[1]*last[2])
+                    self.save_rig_config(PREALIGN_DEG_PER_MS=round(response, 5))
                 elif last[2] >= PREALIGN_MAX_MS:
                     return f'PREALIGN FAIL: no measured rotation at {PREALIGN_MAX_MS} ms (servo power / coupling?)'
+            if response is None and pulse == 0 and PREALIGN_DEG_PER_MS:
+                response = PREALIGN_DEG_PER_MS  # learnt on an earlier run; refined below
             if response is None:
                 direction, ms = 1, PREALIGN_PROBE_MS if last is None else min(PREALIGN_MAX_MS, last[2]*2)
             else:
@@ -1261,11 +1292,103 @@ class MaskAlignerApp:
             last = (angle, direction, ms)
         return f'PREALIGN FAIL: not within {PREALIGN_TOL_DEG} deg after {PREALIGN_MAX_PULSES} pulses'
 
-    def start_prealign(self):
-        if PREALIGN_TARGET_DEG is None:
+    def wait_pt(self, seq, timeout, generation):
+        """Wait for "DONE PT seq" of a background turn (it may have arrived during a rail move)."""
+        line = f'DONE PT {seq}'
+        if line in self.arduino.pt_done:
+            self.arduino.pt_done.discard(line)
+            return True
+        return self.execute([('', line, timeout, PREALIGN_SETTLE_SEC)], generation)
+
+    def prealign_y(self, generation):
+        """Move PREALIGN_Y_AXIS until the disc centre sits at PREALIGN_TARGET_XY. Returns an error or None."""
+        if PREALIGN_TARGET_XY is None:
+            return 'no PREALIGN_TARGET_XY (press 기준 저장 once)'
+        k = PREALIGN_Y_IMAGE_AXIS
+        for move in range(PREALIGN_Y_MAX_MOVES+1):
+            if self.prealign_measure() is None:
+                return 'no wafer on the loader camera'
+            err = PREALIGN_TARGET_XY[k]-self.prealign_center[k]
             with self.lock:
-                self.status = 'PREALIGN: no target yet (fine-align once, then press 기준 저장)'
-            return False
+                self.status = f'PREALIGN Y err {err:+.1f} px (move {move})'
+            if abs(err) <= PREALIGN_Y_TOL_PX:
+                return None
+            if PREALIGN_Y_STEPS_PER_PX is None:
+                # First use: probe once to learn steps per px (sign included) and keep it.
+                before = self.prealign_center[k]
+                if not self.execute([(f'{PREALIGN_Y_AXIS} {PREALIGN_Y_PROBE_STEPS}', 'DONE', 30.0, PREALIGN_SETTLE_SEC)], generation):
+                    return 'stopped'
+                if self.prealign_measure() is None:
+                    return 'wafer lost during the Y probe'
+                moved = self.prealign_center[k]-before
+                if abs(moved) < 1.0:
+                    return f'{PREALIGN_Y_AXIS} {PREALIGN_Y_PROBE_STEPS} steps moved the disc {moved:.2f} px: wrong axis?'
+                self.save_rig_config(PREALIGN_Y_STEPS_PER_PX=round(PREALIGN_Y_PROBE_STEPS/moved, 3))
+                continue
+            steps = int(round(err*PREALIGN_Y_STEPS_PER_PX))
+            if steps == 0:
+                return None
+            if not self.execute([(f'{PREALIGN_Y_AXIS} {steps}', 'DONE', abs(steps)/4000+5, PREALIGN_SETTLE_SEC)], generation):
+                return 'stopped'
+        return f'not within {PREALIGN_Y_TOL_PX} px after {PREALIGN_Y_MAX_MOVES} moves'
+
+    @staticmethod
+    def reply_for(line):
+        """Final firmware reply for a plain transfer line (a background "DONE PT" must not match)."""
+        head = line.split()[0]
+        if head in ('X', 'Y', 'R1', 'R2'):
+            return 'DONE'
+        if head == 'Z':
+            return 'DONE Z'
+        if head == 'MAG':
+            return 'DONE ' + ' '.join(line.split())
+        return 'DONE*'
+
+    def transfer_run(self, generation):
+        """TRANSFER_SEQUENCE: firmware lines plus the @ pre-align steps (see the constants)."""
+        pending = None
+        for i, step in enumerate(TRANSFER_SEQUENCE):
+            if self.stop_event.is_set() or generation != self.generation:
+                return 'transfer: stopped'
+            with self.lock:
+                self.status = f'transfer {i+1}/{len(TRANSFER_SEQUENCE)}: {step}'
+            if step == '@MEASURE':
+                if self.prealign_measure() is None:
+                    return f'transfer FAIL at {i+1}: no wafer / notch on the loader camera'
+            elif step == '@TURN':
+                if PREALIGN_TARGET_DEG is None or self.prealign_angle is None or not PREALIGN_DEG_PER_MS:
+                    continue  # nothing learnt yet: @THETA does all the turning after the move
+                err = prealign.wrap180(PREALIGN_TARGET_DEG-self.prealign_angle)
+                ms = int(abs(err/PREALIGN_DEG_PER_MS)*PREALIGN_TURN_GAIN)
+                if ms < PREALIGN_MIN_MS:
+                    continue
+                direction = 1 if err/PREALIGN_DEG_PER_MS > 0 else -1
+                self.prealign_seq += 1
+                pending = (self.prealign_seq, min(ms, PREALIGN_MAX_MS))
+                if not self.execute([(f'PT {pending[0]} {direction} {pending[1]}', f'START PT {pending[0]}', 2.0, 0.0)], generation):
+                    return 'transfer: stopped'
+            elif step == '@THETA':
+                if pending is not None:
+                    if not self.wait_pt(pending[0], pending[1]/1000+3, generation):
+                        return 'transfer: stopped'
+                    pending = None
+                if PREALIGN_TARGET_DEG is None:
+                    return 'transfer FAIL: no PREALIGN_TARGET_DEG (press 기준 저장 once)'
+                message = self.prealign_run(generation)
+                if not message.startswith('PREALIGN DONE'):
+                    return f'transfer FAIL at {i+1}: {message}'
+            elif step == '@Y':
+                error = self.prealign_y(generation)
+                if error:
+                    return f'transfer FAIL at {i+1}: Y {error}'
+            elif not self.execute([(step, self.reply_for(step), 120.0, 0.3)], generation):
+                return 'transfer: stopped'
+        if pending is not None and not self.wait_pt(pending[0], pending[1]/1000+3, generation):
+            return 'transfer: stopped'
+        return f'transfer DONE ({len(TRANSFER_SEQUENCE)} steps)'
+
+    def start_worker(self, name, job):
+        """Run job(generation) -> status text in a thread, as one STOP-able automatic action."""
         with self.lock:
             if self.exit_event.is_set() or self.moving or self.auto_running:
                 return False
@@ -1276,17 +1399,24 @@ class MaskAlignerApp:
             generation = self.generation
 
         def worker():
-            message = self.prealign_run(generation)
+            message = job(generation)
             with self.lock:
                 if generation == self.generation:
                     self.auto_running = False
                     self.status = message
-        thread = threading.Thread(target=worker, name='prealign', daemon=True)
+        thread = threading.Thread(target=worker, name=name, daemon=True)
         with self.lock:
             self.workers = [t for t in self.workers if t.is_alive()]
             self.workers.append(thread)
             thread.start()
         return True
+
+    def start_prealign(self):
+        if PREALIGN_TARGET_DEG is None:
+            with self.lock:
+                self.status = 'PREALIGN: no target yet (fine-align once, then press 기준 저장)'
+            return False
+        return self.start_worker('prealign', self.prealign_run)
 
     def begin_theta_recheck(self, before, direction, duration, err, reason):
         with self.lock:
@@ -1697,8 +1827,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             if not TRANSFER_SEQUENCE:
                 self.send_json({'ok': False, 'error': 'TRANSFER_SEQUENCE is empty (rig_config.json)'}, 400)
                 return
-            commands = [(line, 'DONE*', 120.0, 0.3) for line in TRANSFER_SEQUENCE]
-            self.send_json({'ok': self.app.run_commands('transfer', commands)})
+            self.send_json({'ok': self.app.start_worker('transfer', self.app.transfer_run)})
             return
         self.send_error(404)
 
@@ -1722,7 +1851,9 @@ def load_calibration(path):
 
 
 RIG_CONFIG_KEYS = ('Z_WHICH', 'Z_MODES', 'TRANSFER_SEQUENCE', 'THETA_TOL_DEG',
-                   'PREALIGN_CAMERA', 'PREALIGN_TARGET_DEG', 'PREALIGN_TOL_DEG')
+                   'PREALIGN_CAMERA', 'PREALIGN_TARGET_DEG', 'PREALIGN_TOL_DEG', 'PREALIGN_DEG_PER_MS',
+                   'PREALIGN_TARGET_XY', 'PREALIGN_Y_AXIS', 'PREALIGN_Y_IMAGE_AXIS', 'PREALIGN_Y_STEPS_PER_PX',
+                   'PREALIGN_Y_TOL_PX')
 
 
 def load_rig_config(path):

@@ -24,7 +24,9 @@
 //   Z <mask> <dir> <ms>        run Z1 (1), Z2 (2), Z3 (4) or a sum of them; dir +1 = up; reply "DONE Z"
 //   MAG 1 <0|1>                magnet off/on, reply "DONE MAG 1 <v>"
 //   TA <deg> / PA <deg>        theta / pre-align angle (positional servo only), reply "DONE TA <deg>"
-//   PT <id> <dir> <ms> [speed] pre-align continuous servo timed turn, reply "DONE PT <id>"
+//   PT <id> <dir> <ms> [speed] pre-align continuous servo timed turn, NON-BLOCKING: reply "START PT <id>"
+//                              at once, "DONE PT <id>" when the time is up. Other commands (a rail
+//                              move R1/R2) run meanwhile, so the wafer turns while it is carried.
 //   DIST                       one laser reading, reply "DIST <mm>" | "DIST ERR" | "DIST NOSENSOR"
 //   STREAM <0|1>               print "D <mm>" every 200 ms while idle (HW manual use; app keeps it 0)
 //
@@ -34,7 +36,8 @@
 //   X or x stops all motion (magnets and servo angles are kept).
 // Jogs run until a stop letter (s S x X) or a timeout: rails JOG_MAX_MS, Z ZJOG_MAX_MS.
 //
-// One thing moves at a time; every move checks for a stop letter between steps.
+// One blocking move at a time, except the pre-align servo turn (PT), which runs in the background
+// alongside it. Every move checks for a stop letter between steps.
 
 #include <EEPROM.h>
 #include <Servo.h>
@@ -146,6 +149,11 @@ void loadPosition() {
   }
 }
 
+// Background pre-align turn (PT): the servo is driven for ptMs, then released.
+bool ptActive = false;
+long ptId = 0;
+unsigned long ptStart = 0, ptMs = 0;
+
 // ---------------------------------------------------------------- stop helpers
 
 void idleRails() {
@@ -183,9 +191,19 @@ void continuousServosStop() {
 
 // Stops motion only: magnets stay as they are, positional servos keep their angle.
 void stopAll() {
+  ptActive = false;
   idleRails();
   zStop();
   continuousServosStop();
+}
+
+void ptService() {
+  if (ptActive && millis() - ptStart >= ptMs) {
+    ptActive = false;
+    servoRelease(prealignServo, PREALIGN_POSITIONAL);
+    Serial.print("DONE PT ");
+    Serial.println(ptId);
+  }
 }
 
 bool isStopChar(char c) {
@@ -194,6 +212,7 @@ bool isStopChar(char c) {
 
 // True if a stop letter arrived (consumed). Other input waits until the move ends.
 bool stopRequested() {
+  ptService();  // every blocking loop passes here, so a background PT ends on time
   while (Serial.available() > 0) {
     char c = Serial.peek();
     if (isStopChar(c)) {
@@ -379,8 +398,21 @@ void turnCommand(char *line, bool prealign) {
     Serial.println(" range");
     return;
   }
-  bool completed = timedTurn(prealign ? prealignServo : thetaServo, prealign ? PREALIGN_PIN : THETA_PIN,
-                             dir, (unsigned long)ms, (int)speed);
+  if (prealign) {
+    if (ptActive) {
+      Serial.println("ERR PT busy");
+      return;
+    }
+    servoDrive(prealignServo, PREALIGN_PIN, SERVO_NEUTRAL_US + dir * (int)speed);
+    ptActive = true;
+    ptId = id;
+    ptStart = millis();
+    ptMs = (unsigned long)ms;
+    Serial.print("START PT ");
+    Serial.println(id);
+    return;
+  }
+  bool completed = timedTurn(thetaServo, THETA_PIN, dir, (unsigned long)ms, (int)speed);
   if (!completed) {
     Serial.println("STOP");
     return;
@@ -633,6 +665,7 @@ void setup() {
 }
 
 void loop() {
+  ptService();
   while (Serial.available() > 0) {
     char c = Serial.read();
     if (c == '\n' || c == '\r') {

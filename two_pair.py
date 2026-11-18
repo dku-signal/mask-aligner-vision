@@ -136,31 +136,51 @@ class TwoPairKeys:
         """
         from itertools import combinations
         n = len(pts)
+        best = None
         for idx in combinations(range(n), 4):
             a = pts[list(idx)]
             if not cls.is_grid(a):
                 continue
-            rest = pts[[i for i in range(n) if i not in idx]]
-            if len(rest) == 4 and cls.is_grid(rest):
+            others = pts[[i for i in range(n) if i not in idx]]
+            # Stray dark blobs may be among the others: try the other key from its best subset down.
+            for k in (4, 3, 2):
+                for sub in combinations(range(len(others)), k):
+                    found = cls.second_group(a, others[list(sub)])
+                    if found is not None and (best is None or found[2].sum() > best[2].sum()):
+                        best = found
+                if best is not None and best[2].sum() == 4+k:
+                    break
+            if best is not None and best[2].all():
+                return best
+        return best
+
+    @classmethod
+    def second_group(cls, a, rest):
+        """The other 2x2 key from 2-4 of its squares next to the full key a: (a, b, measured) or None."""
+        d = np.sort([np.linalg.norm(p-q) for i, p in enumerate(a) for q in a[i+1:]])
+        side = np.median(d[:4])
+        if np.linalg.norm(rest.mean(0)-a.mean(0)) > 4*side:
+            return None  # a key further than two key widths away is a stray blob, not the pair
+        if len(rest) == 4:
+            if cls.is_grid(rest) and np.linalg.norm(rest.mean(0)-a.mean(0)) > 1.5*side:
                 return a, rest, np.ones(8, bool)
-            d = np.sort([np.linalg.norm(p-q) for i, p in enumerate(a) for q in a[i+1:]])
-            side = np.median(d[:4])
-            if len(rest) == 3:
-                # The corner whose two neighbours are one side away is the right angle.
-                for k in range(3):
-                    i, j = [m for m in range(3) if m != k]
-                    if all(abs(np.linalg.norm(rest[m]-rest[k])-side) < .25*side for m in (i, j)):
-                        b = np.vstack([rest, rest[i]+rest[j]-rest[k]])
-                        if cls.is_grid(b):
-                            return a, b, np.r_[np.ones(7, bool), False]
-            if len(rest) == 2 and abs(np.linalg.norm(rest[1]-rest[0])-side) < .25*side:
-                edge = rest[1]-rest[0]
-                away = rest.mean(0)-a.mean(0)
-                v = np.array([-edge[1], edge[0]])
-                v *= side/np.linalg.norm(v)*np.sign(v@away)
-                b = np.vstack([rest, rest+v])
-                if cls.is_grid(b) and np.linalg.norm(b.mean(0)-a.mean(0)) > 1.5*side:
-                    return a, b, np.r_[np.ones(6, bool), False, False]
+            return None
+        if len(rest) == 3:
+            # The corner whose two neighbours are one side away is the right angle.
+            for k in range(3):
+                i, j = [m for m in range(3) if m != k]
+                if all(abs(np.linalg.norm(rest[m]-rest[k])-side) < .25*side for m in (i, j)):
+                    b = np.vstack([rest, rest[i]+rest[j]-rest[k]])
+                    if cls.is_grid(b):
+                        return a, b, np.r_[np.ones(7, bool), False]
+        if len(rest) == 2 and abs(np.linalg.norm(rest[1]-rest[0])-side) < .25*side:
+            edge = rest[1]-rest[0]
+            away = rest.mean(0)-a.mean(0)
+            v = np.array([-edge[1], edge[0]])
+            v *= side/np.linalg.norm(v)*np.sign(v@away)
+            b = np.vstack([rest, rest+v])
+            if cls.is_grid(b) and np.linalg.norm(b.mean(0)-a.mean(0)) > 1.5*side:
+                return a, b, np.r_[np.ones(6, bool), False, False]
         return None
 
     def measure_mask(self, gray, square_boxes):
@@ -174,10 +194,8 @@ class TwoPairKeys:
         if any(c is None for c in centers):
             return None
         pts = np.array(centers)
-        if len(pts) > MASK_SQUARES:
-            # Keep the MASK_SQUARES closest to their median: stray dark blobs lie further out.
-            keep = np.argsort(np.linalg.norm(pts-np.median(pts, 0), axis=1))[:MASK_SQUARES]
-            pts, boxes = pts[keep], boxes[keep]
+        if len(pts) > 12:
+            return None  # clutter: the combination search below is meant for 6-10 blobs
         found = self.complete_groups(pts)
         if found is None:
             return None  # stray dark blobs, not the 2 x (2x2) mask pattern

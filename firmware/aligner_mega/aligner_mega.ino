@@ -26,6 +26,9 @@
 //   MAG <1|2> <0|1>            magnet off/on, reply "DONE MAG <n> <v>"
 //   TA <deg> / PA <deg>        theta / pre-align angle (positional servo only), reply "DONE TA <deg>"
 //   PT <id> <dir> <ms> [speed] pre-align continuous servo timed turn, reply "DONE PT <id>"
+//   PX <steps> <signed-ms>    R1 transfer with pre-align servo at halfway, reply "DONE PX"
+//   PZERO                    register the current R1/R2 transfer start as zero
+//   PY <target-steps>        move R2 to the absolute delivery position relative to PZERO
 //   DIST                       one laser reading, reply "DIST <mm>" | "DIST ERR" | "DIST NOSENSOR"
 //   STREAM <0|1>               print "D <mm>" every 200 ms while idle (HW manual use; app keeps it 0)
 //
@@ -35,7 +38,7 @@
 //   X or x stops all motion (magnets and servo angles are kept).
 // Jogs run until a stop letter (s S x X) or a timeout: rails JOG_MAX_MS, Z ZJOG_MAX_MS.
 //
-// One thing moves at a time; every move checks for a stop letter between steps.
+// Only PX drives a rail and the pre-align servo together. Moves check for STOP.
 
 #include <EEPROM.h>
 #include <Servo.h>
@@ -109,6 +112,7 @@ const unsigned long JOG_MAX_MS = 3000;
 const unsigned long ZJOG_MAX_MS = 10000;
 
 long posX = 0, posY = 0, posR1 = 0, posR2 = 0, posFY = 0;
+bool transferReferenced = false;
 int foyuPhase = 0;
 
 char lineBuf[48];
@@ -223,15 +227,29 @@ bool stopRequested() {
 
 // ---------------------------------------------------------------- step rails
 
-bool runSteps(Axis &a, long steps) {
+bool runSteps(Axis &a, long steps, long prealignMs) {
   int dir = steps > 0 ? 1 : -1;
   long n = labs(steps);
+  unsigned long turnStarted = 0;
+  unsigned long turnUs = labs(prealignMs) * 1000UL;
+  bool turning = false;
   digitalWrite(a.dirPin, dir > 0 ? LOW : HIGH);
   delayMicroseconds(100);
   for (long i = 0; i < n; i++) {
     if (stopRequested()) {
+      if (turning) servoRelease(prealignServo, false);
       idleRails();
       return false;
+    }
+    if (turnUs && i == n / 2) {
+      const int turnDirection = prealignMs > 0 ? 1 : -1;
+      servoDrive(prealignServo, PREALIGN_PIN, SERVO_NEUTRAL_US + turnDirection * THETA_SPEED_US);
+      turnStarted = micros();
+      turning = true;
+    }
+    if (turning && micros() - turnStarted >= turnUs) {
+      servoRelease(prealignServo, false);
+      turning = false;
     }
     long fromEdge = min(i, n - 1 - i);
     unsigned int us = halfPeriodUs;
@@ -244,6 +262,7 @@ bool runSteps(Axis &a, long steps) {
     delayMicroseconds(us);
     *a.pos += dir;
   }
+  if (turning) servoRelease(prealignServo, false);
   return true;
 }
 
@@ -269,9 +288,43 @@ void moveAxis(Axis &a, long steps) {
   Serial.print(a.name);
   Serial.print(" ");
   Serial.println(steps);
-  bool completed = runSteps(a, steps);
+  bool completed = runSteps(a, steps, 0);
   if (a.limited) savePosition();
   Serial.println(completed ? "DONE" : "STOP");
+}
+
+void prealignTransfer(long steps, long turnMs) {
+  if (!transferReferenced || posR1 != 0 || posR2 != 0) {
+    Serial.println("ERR PX return R1/R2 to registered transfer start");
+    return;
+  }
+  if (steps < -RAIL_MAX_MOVE_STEPS || steps > RAIL_MAX_MOVE_STEPS ||
+      steps == 0 || turnMs < -(long)PREALIGN_MAX_MS || turnMs > (long)PREALIGN_MAX_MS) {
+    Serial.println("ERR PX range");
+    return;
+  }
+  const long n = labs(steps);
+  const unsigned long turnUs = labs(turnMs) * 1000UL;
+  // Use the fastest possible step interval in this move, without ramp delays.
+  const unsigned long remainingUs = (n - n / 2) * 2UL * halfPeriodUs;
+  if (turnUs && (PREALIGN_POSITIONAL || labs(turnMs) < 20 || n < 2 ||
+                 turnUs + 4 > remainingUs)) {
+    Serial.println("ERR PX turn does not fit X move or servo mode");
+    return;
+  }
+  Serial.println(runSteps(axisR1, steps, turnMs) ? "DONE PX" : "STOP");
+}
+
+void moveDeliveryY(long target) {
+  if (!transferReferenced) {
+    Serial.println("ERR PY set transfer datum with PZERO");
+  } else if (target < -RAIL_MAX_MOVE_STEPS || target > RAIL_MAX_MOVE_STEPS) {
+    Serial.println("ERR PY target range");
+  } else if (target == posR2) {
+    Serial.println("DONE");
+  } else {
+    moveAxis(axisR2, target - posR2);
+  }
 }
 
 void jog(Axis &a, int dir) {
@@ -615,6 +668,14 @@ void processLine(char *line) {
     moveAxis(axisR1, n);
   } else if (sscanf(line, "R2 %ld %c", &n, &extra) == 1) {
     moveAxis(axisR2, n);
+  } else if (strcmp(line, "PZERO") == 0) {
+    posR1 = posR2 = 0;
+    transferReferenced = true;
+    Serial.println("DONE PZERO");
+  } else if (sscanf(line, "PY %ld %c", &n, &extra) == 1) {
+    moveDeliveryY(n);
+  } else if (sscanf(line, "PX %ld %ld %c", &n, &a, &extra) == 2) {
+    prealignTransfer(n, a);
   } else if (sscanf(line, "FY %ld %c", &n, &extra) == 1) {
     moveFoyu(n);
   } else if (line[0] == 'Z' && line[1] == ' ') {

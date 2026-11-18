@@ -14,5 +14,16 @@
     ]
   },
   "TRANSFER_SEQUENCE": [],
+  "PREALIGN": {
+    "notch_camera": null,
+    "notch_roi": null,
+    "target_notch_deg": null,
+    "theta_ms_per_degree": null,
+    "x_steps": null,
+    "precision_x_axis": "X",
+    "precision_to_transfer_x_ratio": null,
+    "y_max_steps": null,
+    "handoff": []
+  },
   "THETA_TOL_DEG": 1.5
 }

@@ -16,6 +16,7 @@ import os
 import threading
 import time
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import cv2
 import numpy as np
@@ -54,6 +55,12 @@ class World:
         with self.lock:
             return self.wafer0+self.A@self.eff
 
+    def deliver(self, transfer_x):
+        # R1 and precision Arduino Y share a direction at a 2:1 step ratio.
+        with self.lock:
+            error_steps = (transfer_x - 3900) / 2
+            self.wafer0 = self.mask + self.A[:, 1] * error_steps - self.A @ self.eff
+
     def frame(self):
         ss = 4
         canvas = np.full((H*ss, W*ss), 180, np.uint8)
@@ -69,8 +76,16 @@ class World:
 
 
 class FakeCap:
-    def __init__(self, world):
+    def __init__(self, world, notch=False):
         self.world = world
+        self.notch_frame = None
+        if notch:
+            frame = np.full((H, W, 3), 30, np.uint8)
+            x, y = W // 2, H // 2
+            cv2.circle(frame, (x, y), 100, (225,) * 3, -1)
+            notch_cut = np.array([(x + 110, y + 15), (x + 85, y), (x + 110, y - 15)], np.int32)
+            cv2.fillConvexPoly(frame, notch_cut, (30,) * 3)
+            self.notch_frame = frame
 
     def isOpened(self):
         return True
@@ -83,13 +98,15 @@ class FakeCap:
 
     def read(self):
         time.sleep(1/30)
-        return True, self.world.frame()
+        return self.retrieve()
 
     def grab(self):
         time.sleep(1/30)
         return True
 
     def retrieve(self):
+        if self.notch_frame is not None:
+            return True, self.notch_frame
         return True, self.world.frame()
 
     def release(self):
@@ -105,6 +122,9 @@ class FakeFirmware(threading.Thread):
         self.master, slave = os.openpty()
         self.port = os.ttyname(slave)
         self.log = []
+        self.transfer_referenced = False
+        self.delivery_y = 0
+        self.transfer_x = 0
 
     def reply(self, text):
         os.write(self.master, (text+'\r\n').encode())
@@ -139,8 +159,28 @@ class FakeFirmware(threading.Thread):
             self.world.step(axis, n)
             self.reply('DONE')
         elif line[:3] in ('R1 ', 'R2 ', 'FY '):
+            axis, n = line.split()
+            if axis == 'R1':
+                self.transfer_x += int(n)
+            elif axis == 'R2':
+                self.delivery_y += int(n)
             self.reply(f'MOVE {line}')
             time.sleep(.05)
+            self.reply('DONE')
+        elif line == 'PZERO':
+            self.transfer_referenced = True
+            self.delivery_y = 0
+            self.transfer_x = 0
+            self.reply('DONE PZERO')
+        elif line.startswith('PX '):
+            if self.transfer_referenced and self.transfer_x == self.delivery_y == 0:
+                self.transfer_x = int(line.split()[1])
+                self.reply('DONE PX')
+            else:
+                self.reply('ERR PX return to transfer datum')
+        elif line.startswith('PY '):
+            self.delivery_y = int(line.split()[1])
+            self.world.deliver(self.transfer_x)
             self.reply('DONE')
         elif line.startswith('Z '):
             _, which, d, ms = line.split()
@@ -160,7 +200,7 @@ def main():
     world = World()
     fw = FakeFirmware(world)
     fw.start()
-    cv2.VideoCapture = lambda *a, **k: FakeCap(world)
+    cv2.VideoCapture = lambda index, *a, **k: FakeCap(world, notch=index == 1)
 
     import calibrate_xy
     print('=== 1. calibrate_xy against the simulated stage')
@@ -178,7 +218,10 @@ def main():
     import mask_aligner_optimized_v4 as app_mod
     app_mod.ARDUINO_PORT = fw.port
     app_mod.load_calibration(SIM_CAL)
-    app = app_mod.MaskAlignerApp(camera_index=0, detector='opencv', skip_theta=True)
+    sim_state = TemporaryDirectory(dir=SIM_CAL.parent)
+    state_path = Path(sim_state.name) / 'prealign-x.json'
+    app = app_mod.MaskAlignerApp(camera_index=0, detector='opencv', skip_theta=True,
+                                 prealign_state_path=state_path)
     app.start()
     time.sleep(2.0)
     t0 = time.time()
@@ -218,11 +261,63 @@ def main():
     run('transfer', lambda: app.run_commands('transfer', [(l, 'DONE*', 5.0, 0.0) for l in app_mod.TRANSFER_SEQUENCE]))
     print('  sent:', fw.log[start:])
     print(f'  distance shown: {app.distance} mm, z mode: {app.z_last_mode}')
+
+    print('\n=== 4. Stationary notch, X + theta, maximum Y, and precision alignment')
+    app_mod.PREALIGN = {'notch_camera': 1, 'target_notch_deg': 20,
+                        'theta_ms_per_degree': 7, 'x_steps': 4000,
+                        'precision_x_axis': 'Y', 'precision_to_transfer_x_ratio': 2,
+                        'y_max_steps': 2400, 'handoff': ['Z 1 -1 50', 'MAG 1 0']}
+
+    def wait_for_prealign(calibrate_from_max=False):
+        assert app.start_prealign(calibrate_from_max=calibrate_from_max) is None, app.status
+        deadline = time.monotonic() + 15
+        while app.auto_running and time.monotonic() < deadline:
+            time.sleep(.05)
+        assert not app.auto_running, app.status
+
+    start = len(fw.log)
+    wait_for_prealign()
+    assert app.phase == 'FAULT' and fw.log[start] == 'PX 4000 140', app.status
+    assert not any(line.startswith('PY ') for line in fw.log[start:])
+    assert not state_path.exists()
+
+    run('datum', lambda: app.run_commands('Transfer datum', [('PZERO', 'DONE PZERO', 2.0, 0.0)]))
+    start = len(fw.log)
+    wait_for_prealign(calibrate_from_max=True)
+    assert fw.log[start:start+4] == ['PX 4000 140', 'PY 2400', 'Z 1 -1 50', 'MAG 1 0'], fw.log[start:]
+    assert fw.delivery_y == 2400 and app.camera_index == 0 and app.phase == 'DONE', app.status
+    first = json.loads(state_path.read_text())
+    measured = sum(int(line.split()[1]) for line in fw.log[start:] if line.startswith('Y '))
+    assert measured < 0 and first['precision_x_steps'] == measured, first
+    expected = 4000 + 2 * measured
+    assert first['transfer_x_steps'] == 4000 and expected < 4000, first
+
+    run('return datum', lambda: app.run_commands('Return datum', [
+        ('R2 -2400', 'DONE', 5.0, 0.0), ('R1 -4000', 'DONE', 5.0, 0.0)
+    ]))
+    start = len(fw.log)
+    wait_for_prealign()
+    assert fw.log[start:start+2] == [f'PX {expected} 140', 'PY 2400'], fw.log[start:]
+    assert app.phase == 'DONE', app.status
+    second = json.loads(state_path.read_text())
+    assert second['transfer_x_steps'] == expected, second
+    next_target = expected + 2 * second['precision_x_steps']
+    assert app_mod.prealign.load_transfer_x(
+        state_path, app_mod.prealign.transfer_plan(app_mod.PREALIGN)
+    ) == next_target
+
+    persisted = state_path.read_bytes()
+    fw.transfer_referenced = False
+    wait_for_prealign(calibrate_from_max=True)
+    assert app.phase == 'FAULT' and state_path.read_bytes() == persisted, app.status
+    print('  saved precision X steps, applied the next transfer target, and preserved feedback on failure')
+
     phase, nmoves, elapsed, true = xy_result
     print(f'\nresult: phase={phase}  moves={nmoves}  time={elapsed:.1f}s')
     print(f'TRUE remaining offset: dx={true[0]:+.3f} px  dy={true[1]:+.3f} px  |e|={np.linalg.norm(true):.3f} px')
     print(f'stage position (steps): X={int(world.pos[0])} Y={int(world.pos[1])}  (limit +-{fw.limit})')
     app.shutdown()
+    sim_state.cleanup()
     os._exit(0)
 
 

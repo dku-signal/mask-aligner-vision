@@ -10,6 +10,7 @@ from collections import OrderedDict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 import cv2
+import prealign
 """Four-square mask geometry and occlusion-masked wafer contrast matching."""
 from pathlib import Path
 from itertools import combinations
@@ -313,6 +314,7 @@ Z_MODES = {'contact': (2000, 2000, 2000), 'proximity': (1000, 2000, 1000)}
 # Transfer = list of firmware lines run in order, e.g. ["MAG 1 1", "R1 -20000", "Z ..."].
 # Empty until the loader positions are measured on the rig.
 TRANSFER_SEQUENCE = []
+PREALIGN = None
 LOADER_AXES = ('R1', 'R2', 'FY')
 # Dataset recording for YOLO/SAM2 training: raw camera frames (no overlay) every RECORD_INTERVAL_SEC.
 RECORD_INTERVAL_SEC = 0.5
@@ -597,7 +599,9 @@ class PreviewSmoother:
 
 class MaskAlignerApp:
 
-    def __init__(self, camera_index=CAMERA_INDEX, cache_mb=PATTERN_CACHE_MB, preview_fps=PREVIEW_FPS, overlay_smoothing_ms=OVERLAY_SMOOTHING_MS, detector='opencv', skip_theta=False):
+    def __init__(self, camera_index=CAMERA_INDEX, cache_mb=PATTERN_CACHE_MB, preview_fps=PREVIEW_FPS,
+                 overlay_smoothing_ms=OVERLAY_SMOOTHING_MS, detector='opencv', skip_theta=False,
+                 prealign_state_path=None):
         self.skip_theta = skip_theta
         self.lock = threading.RLock()
         self.frame_ready = threading.Condition(self.lock)
@@ -623,6 +627,10 @@ class MaskAlignerApp:
         self.cap = None
         self.camera_index = camera_index
         self.requested_camera_index = camera_index
+        self.prealign_camera_return = None
+        self.prealign_state_path = (Path(prealign_state_path) if prealign_state_path is not None
+                                    else Path(__file__).resolve().parent / 'out' / 'rig_config.prealign-x.json')
+        self.prealign_x_run = None
         self.last_jpeg = None
         self.history = deque(maxlen=STABLE_HISTORY)
         self.auto_running = False
@@ -842,7 +850,7 @@ class MaskAlignerApp:
                     if packet is None or packet[0] == last_seq:
                         continue
                     last_seq, frame, read_started, context = packet
-                    if (not self.current_packet(packet) or self.moving or
+                    if (not self.current_packet(packet) or self.moving or self.phase == 'PREALIGN' or
                             read_started < self.ignore_until or time.monotonic()-read_started > 1.5):
                         continue
                     source_phase = self.phase
@@ -966,7 +974,7 @@ class MaskAlignerApp:
             self.phase = 'FAULT'
             self.status = message
 
-    def start_align(self):
+    def start_align(self, transfer=None):
         with self.lock:
             if self.exit_event.is_set() or self.moving or self.auto_running:
                 return
@@ -983,6 +991,7 @@ class MaskAlignerApp:
                 self.next_info = None
                 self.status = 'ALIGN START'
             self.generation += 1
+            self.prealign_x_run = transfer
             self.clear_samples()
             # No theta motor on the current build: go straight to XY centring.
             self.phase = 'XY' if self.skip_theta else 'THETA'
@@ -999,7 +1008,11 @@ class MaskAlignerApp:
     def stop_align(self):
         with self.lock:
             self.stop_event.set()
+            if self.prealign_camera_return is not None:
+                self.requested_camera_index = self.prealign_camera_return
+                self.prealign_camera_return = None
             self.generation += 1
+            self.prealign_x_run = None
             self.auto_running = False
             self.align_finished = False
             self.phase = 'STOP'
@@ -1007,6 +1020,7 @@ class MaskAlignerApp:
             self.status = 'STOP'
             self.clear_samples()
             self.arduino.stop()
+            self.frame_ready.notify_all()
 
     def reset(self):
         self.stop_align()
@@ -1061,13 +1075,21 @@ class MaskAlignerApp:
                 self.motion_stage = 'REACQUIRE' if success else 'STOP'
                 if success and not self.stop_event.is_set():
                     self.status = 'ACK OK; WAIT fresh stable image'
-        if not success:
-            self.fail(error)
+                if not success and not self.stop_event.is_set():
+                    self.fail(error)
         return success
 
     def move_xy_sequential(self, steps_x, steps_y, generation=None):
-        commands = [(f'{arduino_axis(axis)} {steps}', 'DONE', 25.0, AXIS_SETTLE_SEC) for axis, steps in (('X', steps_x), ('Y', steps_y)) if steps != 0]
-        return self.execute(commands, generation)
+        moves = {arduino_axis('X'): steps_x, arduino_axis('Y'): steps_y}
+        commands = [(f'{axis} {steps}', 'DONE', 25.0, AXIS_SETTLE_SEC)
+                    for axis, steps in moves.items() if steps != 0]
+        completed = self.execute(commands, generation)
+        if completed:
+            with self.lock:
+                transfer = self.prealign_x_run
+                if transfer is not None and generation == self.generation:
+                    transfer.precision_x_steps += moves[transfer.plan.precision_x_axis]
+        return completed
 
     def manual_move(self, axis, steps, exact=False):
         with self.lock:
@@ -1149,6 +1171,104 @@ class MaskAlignerApp:
             thread.start()
         return True
 
+    def start_prealign(self, calibrate_from_max=False):
+        with self.lock:
+            if self.exit_event.is_set() or self.moving or self.auto_running:
+                return 'Rig is busy'
+            try:
+                plan = prealign.transfer_plan(PREALIGN)
+                x_steps = (plan.x_max_steps if calibrate_from_max
+                           else prealign.load_transfer_x(self.prealign_state_path, plan))
+            except ValueError as exc:
+                self.status = str(exc)
+                return self.status
+            if not self.arduino.connected():
+                self.status = 'Arduino disconnected'
+                return self.status
+            self.stop_event.clear()
+            self.auto_running = True
+            self.align_finished = False
+            self.generation += 1
+            self.clear_samples()
+            self.phase = 'PREALIGN'
+            self.motion_stage = 'NOTCH'
+            self.status = f'PREALIGN: reading notch at rest (X target {x_steps:+d} steps)'
+            camera = plan.notch_camera
+            if camera is not None and camera != self.requested_camera_index:
+                self.prealign_camera_return = self.requested_camera_index
+                self.requested_camera_index = camera
+            self.workers = [t for t in self.workers if t.is_alive()]
+            transfer = prealign.TransferXRun(plan, x_steps)
+            worker = threading.Thread(target=self.run_prealign, args=(self.generation, transfer),
+                                      name='prealign', daemon=True)
+            self.workers.append(worker)
+            worker.start()
+        return None
+
+    def wait_for_prealign_frame(self, generation, after, sequence, deadline):
+        with self.frame_ready:
+            while generation == self.generation and not self.exit_event.is_set():
+                packet = self.latest_frame
+                if (packet is not None and packet[0] > sequence and packet[2] >= after
+                        and self.current_packet(packet) and time.monotonic() - packet[2] < 1.5):
+                    return packet
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ValueError('Timed out waiting for a fresh camera frame')
+                self.frame_ready.wait(remaining)
+        return None
+
+    def run_prealign(self, generation, transfer):
+        plan = transfer.plan
+        x_steps = transfer.transfer_x_steps
+        target = plan.target_notch_deg
+        try:
+            with self.lock:
+                after = max(time.monotonic(), self.ignore_until)
+            deadline = after + VISION_TIMEOUT_SEC
+            sequence = -1
+            angles = []
+            while len(angles) < 3 and time.monotonic() < deadline:
+                packet = self.wait_for_prealign_frame(generation, after, sequence, deadline)
+                if packet is None:
+                    return
+                sequence = packet[0]
+                angle = prealign.notch_angle(packet[1], plan.notch_roi)
+                if angle is None or (angles and abs(prealign.angle_difference(angle, angles[0])) > 2):
+                    angles.clear()
+                if angle is not None:
+                    angles.append(angle)
+            if len(angles) < 3:
+                raise ValueError('Wafer notch not stable across three frames')
+
+            observed = angles[0] + sum(prealign.angle_difference(a, angles[0]) for a in angles) / len(angles)
+            turn = prealign.turn_duration(observed, target, plan.theta_ms_per_degree)
+            with self.lock:
+                if generation != self.generation:
+                    return
+                if self.prealign_camera_return is not None:
+                    self.requested_camera_index = self.prealign_camera_return
+                    self.prealign_camera_return = None
+                print(f'PREALIGN notch={observed:.2f} deg, target={target:.2f} deg, turn={turn} ms')
+            commands = [
+                (f'PX {x_steps} {turn}', 'DONE PX', abs(x_steps) / 4000 + 5, 0.3),
+                (f'PY {plan.y_max_steps}', 'DONE', 105.0, 0.3),
+                *plan.handoff,
+            ]
+            if not self.execute(commands, generation):
+                return
+            after = self.ignore_until
+            if self.wait_for_prealign_frame(generation, after, -1, after + VISION_TIMEOUT_SEC) is None:
+                return
+            with self.lock:
+                if generation == self.generation and not self.exit_event.is_set():
+                    self.auto_running = False
+                    self.start_align(transfer)
+        except Exception as exc:
+            with self.lock:
+                if generation == self.generation:
+                    self.fail(f'PREALIGN: {exc}')
+
     def z_mode(self, mode):
         down, hold, up = Z_MODES[mode]
         self.z_last_mode = mode
@@ -1171,7 +1291,7 @@ class MaskAlignerApp:
     def auto_loop(self):
         while not self.exit_event.wait(0.02):
             with self.lock:
-                if not self.auto_running or self.moving or self.phase == 'MANUAL':
+                if not self.auto_running or self.moving or self.phase in ('MANUAL', 'PREALIGN'):
                     continue
                 now = time.monotonic()
                 stale = now - self.last_good > VISION_TIMEOUT_SEC
@@ -1325,10 +1445,8 @@ class MaskAlignerApp:
             self.camera_index = requested
             self.history.clear()
             self.next_info = None
-            if self.cap is None:
-                self.status = f'Camera {requested} open failed'
-            else:
-                self.status = f'Camera {requested} opened'
+            if self.phase not in ('PREALIGN', 'FAULT'):
+                self.status = f'Camera {requested} ' + ('open failed' if self.cap is None else 'opened')
 
     def make_blank_frame(self):
         frame = np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
@@ -1345,6 +1463,24 @@ class MaskAlignerApp:
     def finish_align(self, message):
         self.arduino.stop()
         with self.lock:
+            transfer = self.prealign_x_run
+            self.prealign_x_run = None
+            if transfer is not None:
+                measured = transfer.precision_x_steps
+                message += f' | precision X [{transfer.plan.precision_x_axis}] {measured:+d} steps'
+                try:
+                    prealign.save_transfer_x(self.prealign_state_path, transfer)
+                except OSError as exc:
+                    message += f' | X feedback save failed: {exc}'
+                else:
+                    if transfer.plan.precision_to_transfer_x_ratio is None:
+                        message += ' | saved, set X step ratio to apply'
+                    else:
+                        try:
+                            next_steps = prealign.next_x_steps(transfer.plan, transfer.transfer_x_steps, measured)
+                            message += f' | next transfer X {next_steps:+d} steps'
+                        except ValueError as exc:
+                            message += f' | {exc}'
             self.auto_running = False
             self.align_finished = True
             self.moving = False
@@ -1530,6 +1666,15 @@ class RequestHandler(BaseHTTPRequestHandler):
         if parsed.path == '/api/dist':
             self.send_json({'ok': self.app.run_commands('DIST', [('DIST', 'DIST *', 2.0, 0.0)])})
             return
+        if parsed.path == '/api/prealign':
+            calibrate_from_max = query.get('calibrate', ['0'])[0] == '1'
+            error = self.app.start_prealign(calibrate_from_max=calibrate_from_max)
+            self.send_json({'ok': error is None, 'error': error}, 200 if error is None else 409)
+            return
+        if parsed.path == '/api/prealign/reference':
+            ok = self.app.run_commands('Transfer datum', [('PZERO', 'DONE PZERO', 2.0, 0.0)])
+            self.send_json({'ok': ok}, 200 if ok else 409)
+            return
         if parsed.path == '/api/transfer':
             if not TRANSFER_SEQUENCE:
                 self.send_json({'ok': False, 'error': 'TRANSFER_SEQUENCE is empty (rig_config.json)'}, 400)
@@ -1558,7 +1703,7 @@ def load_calibration(path):
           ', '.join(f'{k}={data[k]}' for k in CALIBRATED_KEYS if k in data))
 
 
-RIG_CONFIG_KEYS = ('Z_WHICH', 'Z_MODES', 'TRANSFER_SEQUENCE', 'THETA_TOL_DEG')
+RIG_CONFIG_KEYS = ('Z_WHICH', 'Z_MODES', 'TRANSFER_SEQUENCE', 'PREALIGN', 'THETA_TOL_DEG')
 
 
 def load_rig_config(path):
@@ -1633,12 +1778,16 @@ def main():
         cv2.setNumThreads(args.opencv_threads)
     load_calibration(args.calibration)
     load_rig_config(args.rig_config)
+    rig_path = Path(args.rig_config).resolve()
+    prealign_state_path = rig_path.parent / 'out' / f'{rig_path.stem}.prealign-x.json'
     if args.arduino_port:
         global ARDUINO_PORT
         ARDUINO_PORT = args.arduino_port
     args.camera = find_key_camera() if args.camera == 'auto' else int(args.camera)
     httpd = ThreadingHTTPServer((HOST, args.port), RequestHandler)
-    app = MaskAlignerApp(camera_index=args.camera, cache_mb=args.cache_mb, preview_fps=args.preview_fps, overlay_smoothing_ms=args.overlay_smoothing_ms, detector=args.detector, skip_theta=args.skip_theta)
+    app = MaskAlignerApp(camera_index=args.camera, cache_mb=args.cache_mb, preview_fps=args.preview_fps,
+                         overlay_smoothing_ms=args.overlay_smoothing_ms, detector=args.detector,
+                         skip_theta=args.skip_theta, prealign_state_path=prealign_state_path)
     httpd.app = app
     app.start()
     url = f'http://{HOST}:{args.port}'
@@ -1713,6 +1862,11 @@ pre{white-space:pre-wrap;line-height:1.7}small{display:block;margin-top:16px;lin
 <button onclick="post('/api/dist')">거리 측정</button>
 <button onclick="post('/api/transfer')">이송 실행</button>
 <small>모든 동작은 STOP으로 멈춥니다. 이송 순서는 rig_config.json의 TRANSFER_SEQUENCE에 적습니다.</small>
+<p><b>프리얼라인</b></p>
+<button onclick="post('/api/prealign/reference')">현재 이송 X·Y 위치를 기준점으로 등록</button>
+<button onclick="post('/api/prealign?calibrate=1')">오른쪽 끝에서 X 교정</button>
+<button onclick="post('/api/prealign')">프리얼라인 → 정밀 얼라인</button>
+<small>웨이퍼를 장착하고 이송 시작 위치에서 X·Y 기준점을 등록하세요. 첫 X 교정은 오른쪽 끝에서 전달합니다.</small>
 </div>
 <small>START 한 번으로 세타 구동·검증을 반복하고, 허용 각도(rig_config.json의 THETA_TOL_DEG) 이내 확인 후 X → Y 중심 정렬로 자동 전환합니다.<br>X·Y에서는 각도 검출을 요구하지 않습니다.<br>MASK의 검은 사각형 4개 배치와 WAFER의 남은 십자 팔로 중심을 구합니다. 각 축의 중심 오차가 6px 미만인 상태로 8프레임 연속 확인되면 ALIGN FINISH입니다. MASK 3/4는 3개 실측과 1개 위치 복원을 뜻합니다.</small>
 </aside></main>

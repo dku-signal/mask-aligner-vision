@@ -309,9 +309,10 @@ THETA_MAX_PULSES = 100
 THETA_TIMEOUT_SEC = 180.0
 VISION_TIMEOUT_SEC = 5.0
 # Loader / Z / magnets (firmware/aligner_mega). rig_config.json overrides these.
-# Z_WHICH = sum of Z1 (1), Z2 (2), Z3 (4) driven together for the exposure gap; default Z1+Z2.
+# Z_WHICH = sum of Z1 (1), Z2 (2), Z3 (4) driven together for the exposure gap. Mega_All_Control pins:
+# Z1 = the fine-stage gap Z (u/d); Z2 = transfer Z, Z3 = transfer Y linear (wafer transfer doc 11/18).
 # Z_MODES: down ms, hold ms, up ms. HW team tunes the times.
-Z_WHICH = 3
+Z_WHICH = 1
 Z_MODES = {'contact': (2000, 2000, 2000), 'proximity': (1000, 2000, 1000)}
 # Transfer = list of firmware lines run in order, e.g. ["MAG 1 1", "R1 -20000", "Z ..."].
 # Empty until the loader positions are measured on the rig.
@@ -1229,6 +1230,14 @@ class MaskAlignerApp:
             thread.start()
         return True
 
+    def z_step(self, mode, direction):
+        """Only the down (or up) part of a Z mode: lower the mask and keep it there until 'up'."""
+        down, _, up = Z_MODES[mode]
+        ms = down if direction < 0 else up
+        self.z_last_mode = f'{mode} {"down" if direction < 0 else "up"}'
+        return self.run_commands(f'Z {mode} {"down" if direction < 0 else "up"}',
+                                 [(f'Z {Z_WHICH} {direction} {ms}', 'DONE Z', ms/1000+3, 0.0)])
+
     def z_mode(self, mode):
         down, hold, up = Z_MODES[mode]
         self.z_last_mode = mode
@@ -1841,6 +1850,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.app.set_recording(query.get('on', ['0'])[0] == '1')
             self.send_json({'ok': True})
             return
+        if parsed.path == '/api/zstep':
+            mode, direction = query.get('mode', [''])[0], query.get('dir', [''])[0]
+            if mode not in Z_MODES or direction not in ('-1', '1'):
+                self.send_json({'ok': False, 'error': 'mode contact/proximity, dir -1 (down) / 1 (up)'}, 400)
+                return
+            self.send_json({'ok': self.app.z_step(mode, int(direction))})
+            return
         if parsed.path == '/api/zmode':
             mode = query.get('mode', [''])[0]
             if mode not in Z_MODES:
@@ -2063,9 +2079,12 @@ pre{white-space:pre-wrap;line-height:1.7}small{display:block;margin-top:16px;lin
 <div id="rig">
 <p><b>학습 데이터 녹화</b> (0.5초마다 원본 프레임 저장)</p>
 <button onclick="post('/api/record?on=1')">녹화 시작</button><button onclick="post('/api/record?on=0')">녹화 정지</button>
-<p><b>Z 노광 모드</b> (마스크 Z1+Z2: 내림 → 유지 → 올림)</p>
+<p><b>Z 노광 모드</b> (정밀부 Z1: 내림 → 유지 → 올림)</p>
 <button onclick="post('/api/zmode?mode=contact')">CONTACT</button>
-<button onclick="post('/api/zmode?mode=proximity')">PROXIMITY</button>
+<button onclick="post('/api/zmode?mode=proximity')">PROXIMITY</button><br>
+<small>위 두 버튼은 내림 → 유지 → 올림을 한 번에 합니다. 내린 채로 두려면 아래 버튼을 쓰세요.</small>
+<button onclick="post('/api/zstep?mode=contact&dir=-1')">CONTACT 내림</button><button onclick="post('/api/zstep?mode=contact&dir=1')">CONTACT 올림</button><br>
+<button onclick="post('/api/zstep?mode=proximity&dir=-1')">PROXIMITY 내림</button><button onclick="post('/api/zstep?mode=proximity&dir=1')">PROXIMITY 올림</button>
 <p><b>전자석</b></p>
 <button onclick="post('/api/magnet?n=1&on=1')">자석 ON</button><button onclick="post('/api/magnet?n=1&on=0')">자석 OFF</button>
 <p><b>이송부 수동</b></p>

@@ -1,6 +1,6 @@
 {
   "_note": "Z mode times (ms) and the transfer sequence. Edit on the rig, then restart the app.",
-  "Z_WHICH": 3,
+  "Z_WHICH": 1,
   "Z_MODES": {
     "contact": [
       2000,

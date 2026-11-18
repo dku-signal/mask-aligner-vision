@@ -19,7 +19,10 @@ import numpy as np
 
 WORK_WIDTH = 640          # Hough runs at this width
 RING = (0.88, 0.97)       # radii (fraction of r) sampled for the notch
-NOTCH_MIN_CONTRAST = 0.25  # notch arc must be this much darker than the rim median
+NOTCH_MIN_CONTRAST = 0.25  # notch arc (peak degree) must be this much darker than the rim median
+NOTCH_MAX_WIDTH_DEG = 40   # a wider dark arc is a hand / shadow over the rim, not the notch
+DISC_MIN_EDGE = 0.6        # the rim edge must be found on this fraction of the 360 rays
+DISC_MIN_STEP = 40         # and the disc must be this much brighter than just outside it
 
 
 def wrap180(a):
@@ -41,18 +44,8 @@ def _fit_circle(pts):
     return s[0], s[1], float(np.sqrt(s[2]+s[0]**2+s[1]**2))
 
 
-def find_disc(gray):
-    """(cx, cy, r) in full-resolution pixels, or None."""
-    h, w = gray.shape
-    s = min(1.0, WORK_WIDTH/w)
-    small = cv2.medianBlur(cv2.resize(gray, None, fx=s, fy=s, interpolation=cv2.INTER_AREA), 5)
-    m = min(small.shape)
-    circles = cv2.HoughCircles(small, cv2.HOUGH_GRADIENT, 1.5, m, param1=80, param2=50,
-                               minRadius=int(m*0.15), maxRadius=int(m*0.6))
-    if circles is None:
-        return None
-    cx, cy, r = circles[0][0]/s
-    # Refine: strongest bright->dark step along each ray near the rough rim.
+def _refine(gray, cx, cy, r):
+    """Least-squares circle on the rim edge near (cx, cy, r): (cx, cy, r, edge fraction, step) or None."""
     prof, radii = _ray_samples(gray, cx, cy, r, 0.85, 1.15, 120)
     prof = cv2.GaussianBlur(prof, (5, 1), 0)
     step = prof[:, :-2]-prof[:, 2:]
@@ -68,7 +61,30 @@ def find_disc(gray):
         cx, cy, r = _fit_circle(edge[keep])
         resid = np.hypot(edge[:, 0]-cx, edge[:, 1]-cy)-r
         keep &= abs(resid) < max(1.5, 3*np.median(abs(resid[keep])))
-    return float(cx), float(cy), float(r)
+    # A real disc has a bright face and a rim all round; clutter circles do not.
+    inside, _ = _ray_samples(gray, cx, cy, r, 0.80, 0.95, 4)
+    outside, _ = _ray_samples(gray, cx, cy, r, 1.05, 1.20, 4)
+    return float(cx), float(cy), float(r), float(keep.mean()), float(np.median(inside.mean(1)-outside.mean(1)))
+
+
+def find_disc(gray):
+    """(cx, cy, r) in full-resolution pixels, or None."""
+    h, w = gray.shape
+    s = min(1.0, WORK_WIDTH/w)
+    small = cv2.medianBlur(cv2.resize(gray, None, fx=s, fy=s, interpolation=cv2.INTER_AREA), 5)
+    m = min(small.shape)
+    circles = cv2.HoughCircles(small, cv2.HOUGH_GRADIENT, 1.5, m*0.05, param1=80, param2=40,
+                               minRadius=int(m*0.15), maxRadius=int(m*0.6))
+    if circles is None:
+        return None
+    best = None
+    for cx, cy, r in circles[0][:12]/s:  # Hough's ranking is unreliable in clutter: score each
+        c = _refine(gray, cx, cy, r)
+        if c is None or c[3] < DISC_MIN_EDGE or c[4] < DISC_MIN_STEP:
+            continue
+        if best is None or c[3]*c[4] > best[3]*best[4]:
+            best = c
+    return None if best is None else best[:3]
 
 
 def find_notch(frame):
@@ -82,10 +98,11 @@ def find_notch(frame):
     ring = prof.mean(1)
     base = np.median(ring)
     dark = np.clip(base-ring, 0, None)
-    smooth = np.convolve(np.r_[dark, dark, dark], np.ones(5)/5, 'same')[360:720]
+    smooth = np.convolve(np.r_[dark, dark, dark], np.ones(3)/3, 'same')[360:720]
     peak = int(smooth.argmax())
     contrast = smooth[peak]/max(base, 1.0)
-    if contrast < NOTCH_MIN_CONTRAST:
+    width = int((np.roll(smooth, 180-peak) >= 0.5*smooth[peak]).sum())
+    if contrast < NOTCH_MIN_CONTRAST or width > NOTCH_MAX_WIDTH_DEG:
         return None
     # Centroid of the dark arc around the peak (values above half the peak).
     offs = np.arange(-30, 31)

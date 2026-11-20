@@ -457,7 +457,11 @@ class ArduinoLink:
         self.rx_buffer = bytearray()
         self.last_rx = ''
         self.pt_done = set()  # "DONE PT <id>" lines that arrived during another command
-        self.last_error = '' 
+        self.last_error = ''
+        # 'aligner' = firmware/aligner_mega; 'previous' = firmware/mega_previous (the transfer team's
+        # board on main): the same moves as "#<letter> <n>" lines, found by its "#PING" -> "PONG".
+        self.dialect = 'aligner'
+        self.expect = {}  # this app's expected reply -> the reply mega_previous sends for the last line
         if serial is None:
             print('pyserial is not installed. Run: python -m pip install pyserial')
             return
@@ -470,7 +474,8 @@ class ArduinoLink:
             time.sleep(2.0)
             self.ser.reset_input_buffer()
             self.ser.reset_output_buffer()
-            print(f'Arduino connected: {self.port}')
+            self.dialect = self.probe_dialect()
+            print(f'Arduino connected: {self.port} (firmware {self.dialect})')
         except Exception as e:
             print(f'Arduino connection failed: {e}')
             self.ser = None
@@ -491,18 +496,70 @@ class ArduinoLink:
     def connected(self):
         return self.ser is not None
 
+    def probe_dialect(self):
+        # mega_previous answers "#PING" with PONG (after READY, ADS1115 timeouts can delay it).
+        # aligner_mega reads '#' as an unknown line and replies ERR.
+        self.ser.write(b'#PING\n')
+        deadline = time.monotonic()+3.0
+        while time.monotonic() < deadline:
+            line = self.ser.readline().decode(errors='replace').strip()
+            if line == 'PONG':
+                return 'previous'
+            if line.startswith('ERR'):
+                break
+        return 'aligner'
+
+    @staticmethod
+    def to_previous(cmd):
+        """(mega_previous line, its final reply) for an aligner_mega line, or (None, reason).
+
+        Same pins and the same DIR level for + (F, f, Q, E, u), so signs carry over.
+        """
+        f = cmd.split()
+        letters = {'X': 'FB', 'Y': 'fb', 'R1': 'QW', 'R2': 'ER'}
+        try:
+            if f[0] in ('s', 'stop'):
+                return 'X', None
+            if f[0] in letters and len(f) == 2:
+                n = int(f[1])
+                c = letters[f[0]][n < 0]
+                return f'#{c} {abs(n)}', f'DONE {c} {abs(n)}'
+            if f[0] == 'T' and len(f) == 4:  # T <id> <dir> <ms>: theta servo D5 turn
+                return f'#A {int(f[3])} {1 if int(f[2]) >= 0 else -1}', f'DONE A {int(f[3])}'
+            if f[0] == 'Z' and len(f) == 4 and f[1] == '1':  # Z1 only (exposure Z, pins 2/3)
+                c = 'u' if int(f[2]) > 0 else 'd'
+                return f'#{c} {int(f[3])}', f'DONE {c} {int(f[3])}'
+            if f[0] == 'MAG' and len(f) == 3 and f[1] == '1':
+                return f'#M {int(f[2])}', f'DONE M {int(f[2])}'
+        except ValueError:
+            pass
+        return None, f'not on mega_previous: {cmd}'
+
     def send(self, cmd):
         print(f'-> {cmd}')
         if not self.ser:
             print('Arduino not connected.')
             return False
+        line = cmd.strip()
+        if self.dialect == 'previous':
+            line, reply = self.to_previous(line)
+            if line is None:
+                self.last_error = reply
+                print(reply, flush=True)
+                return False
+            self.expect = {} if reply is None else {'DONE': reply, 'DONE*': reply, f'DONE {cmd.split()[0]}': reply}
+            if cmd.split()[0] == 'T':
+                self.expect[f'DONE T {cmd.split()[1]}'] = reply
+            elif cmd.split()[0] in ('Z', 'MAG'):
+                self.expect.update({'DONE Z': reply, 'DONE ' + ' '.join(cmd.split()): reply})
+            print(f'   (mega_previous: {line})')
         try:
             with self.lock:
                 self.ser.reset_input_buffer()
                 self.rx_buffer.clear()
                 if cmd.strip().lower() not in ('s', 'stop'):
                     self.last_error = ''
-                self.ser.write((cmd.strip() + '\n').encode('utf-8'))
+                self.ser.write((line + '\n').encode('utf-8'))
             return True
         except Exception as e:
             self.last_error = f'SERIAL WRITE FAILED: {e}'
@@ -531,6 +588,8 @@ class ArduinoLink:
             return ''
 
     def wait_done(self, stop_event, timeout=25.0, expected='DONE'):
+        if self.dialect == 'previous':
+            expected = self.expect.get(expected, expected)
         deadline = time.monotonic() + timeout
         self.last_error = ''
         while self.connected() and time.monotonic() < deadline:

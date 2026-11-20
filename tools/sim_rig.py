@@ -196,6 +196,10 @@ def main():
     app_mod.load_calibration(SIM_CAL)
     app = app_mod.MaskAlignerApp(camera_index=0, detector='opencv', skip_theta=True)
     app.start()
+    app.start_align()  # no frame yet: both keys unseen, so START must refuse and move nothing
+    with app.lock:
+        print(f'  START before any frame -> {app.phase}: {app.status}')
+        assert app.phase == 'FAULT' and not app.auto_running
     time.sleep(2.0)
     t0 = time.time()
     app.start_align()

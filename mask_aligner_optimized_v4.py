@@ -308,6 +308,7 @@ THETA_PROBE_MS = (100, 150, 200, 250)
 THETA_MAX_PULSES = 100
 THETA_TIMEOUT_SEC = 180.0
 VISION_TIMEOUT_SEC = 5.0
+START_SEEN_SEC = 1.0  # START needs both keys seen this recently (a single missed frame is no fault)
 # Loader / Z / magnets (firmware/aligner_mega). rig_config.json overrides these.
 # Z_WHICH = sum of Z1 (1), Z2 (2), Z3 (4) driven together for the exposure gap. Mega_All_Control pins:
 # Z1 = the fine-stage gap Z (u/d); Z2 = transfer Z, Z3 = transfer Y linear (wafer transfer doc 11/18).
@@ -705,6 +706,7 @@ class MaskAlignerApp:
         self.wafer_lost_count = 0
         self.mask_detected = False
         self.wafer_detected = False
+        self.mask_seen_at = self.wafer_seen_at = 0.0
         self.dx = None
         self.dy = None
         self.steps_x = 0
@@ -767,6 +769,10 @@ class MaskAlignerApp:
         self.frame_time = now
         self.mask_detected = md is not None
         self.wafer_detected = wd is not None
+        if md is not None:
+            self.mask_seen_at = now
+        if wd is not None:
+            self.wafer_seen_at = now
         self.mask_center = md['center'] if md is not None else None
         self.wafer_center = wd['center'] if wd is not None else None
         self.steps_x = self.steps_y = 0
@@ -1034,6 +1040,10 @@ class MaskAlignerApp:
                         self.jpeg_ready.notify_all()
             self.exit_event.wait(max(0, 1.0/self.preview_fps_limit-(time.monotonic()-started)))
 
+    def missing_keys(self, now, within):
+        return [name for name, seen in (('마스크 키', self.mask_seen_at), ('웨이퍼 키', self.wafer_seen_at))
+                if now-seen > within]
+
     def fail(self, message):
         self.stop_align()
         with self.lock:
@@ -1046,6 +1056,12 @@ class MaskAlignerApp:
                 return
             if not self.arduino.connected():
                 self.status = 'Arduino disconnected'
+                return
+            # Nothing moves unless both keys are in view: a missing wafer or mask is reported, not searched for.
+            missing = self.missing_keys(time.monotonic(), START_SEEN_SEC)
+            if missing:
+                self.phase = 'FAULT'
+                self.status = f"START 불가: {' · '.join(missing)} 미검출 - 카메라 화면에 키가 보이는지 확인하세요"
                 return
             with self.lock:
                 self.stop_event.clear()
@@ -1500,7 +1516,9 @@ class MaskAlignerApp:
                     self.motion_stage = 'DONE'
                     continue
                 if stale or expired:
-                    self.fail('Camera/key unavailable or theta timeout')
+                    missing = self.missing_keys(now, VISION_TIMEOUT_SEC)
+                    self.fail(f"정렬 중단: {' · '.join(missing)} {VISION_TIMEOUT_SEC:.0f}초 이상 미검출" if missing and not expired
+                              else 'Camera/key unavailable or theta timeout')
                     continue
                 if now < self.ignore_until or not result_current:
                     continue
@@ -2059,6 +2077,7 @@ pre{white-space:pre-wrap;line-height:1.7}small{display:block;margin-top:16px;lin
 <button class="stop" onclick="post('/api/stop')">STOP</button>
 <button onclick="post('/api/reset')">RESET</button>
 <button onclick="post('/api/camera_next')">NEXT CAMERA</button>
+<div id="alignError" role="alert" hidden style="padding:14px;margin:12px 0;background:#fee2e2;color:#991b1b;border:1px solid #fca5a5;border-radius:6px;font-weight:bold"></div>
 <div id="thetaDone" role="status" hidden style="padding:14px;margin:12px 0;background:#dcfce7;color:#166534;border:1px solid #86efac;border-radius:6px;font-weight:bold"></div>
 <pre id="status">연결 중...</pre>
 <small id="performance"></small>
@@ -2113,6 +2132,8 @@ let refreshing=false;
 async function refresh(){if(refreshing)return;refreshing=true;try{
 const d=await(await fetch('/api/status',{cache:'no-store',signal:AbortSignal.timeout(3000)})).json();
 const n=x=>x==null?'-':x.toFixed(2);
+const alarm=document.getElementById('alignError');
+alarm.hidden=d.phase!=='FAULT';alarm.textContent=d.status;
 const banner=document.getElementById('thetaDone');
 banner.hidden=!d.theta_aligned;
 banner.textContent=d.phase==='DONE'?'세타 정렬 완료 · X·Y 정렬 완료':'세타 정렬 완료 — X·Y 정렬 시작 / 진행 중';

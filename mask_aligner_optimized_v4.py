@@ -3,6 +3,7 @@
 import argparse
 import json
 import math
+import sys
 import threading
 import time
 import webbrowser
@@ -1718,16 +1719,19 @@ class MaskAlignerApp:
             worker.start()
 
     def open_camera(self, index):
-        cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+        cap = cv2.VideoCapture(index, cv2.CAP_DSHOW if sys.platform == 'win32' else cv2.CAP_ANY)
         if not cap.isOpened():
             cap.release()
             cap = cv2.VideoCapture(index)
         if not cap.isOpened():
             cap.release()
             return None
+        if sys.platform == 'darwin':
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-        cap.set(cv2.CAP_PROP_FPS, 30)
+        if sys.platform != 'darwin':
+            cap.set(cv2.CAP_PROP_FPS, 30)
         # Best effort only: some DirectShow drivers ignore this property.
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         return cap
@@ -2134,6 +2138,8 @@ def main():
     httpd = ThreadingHTTPServer((HOST, args.port), RequestHandler)
     app = MaskAlignerApp(camera_index=args.camera, cache_mb=args.cache_mb, preview_fps=args.preview_fps, overlay_smoothing_ms=args.overlay_smoothing_ms, detector=args.detector, skip_theta=args.skip_theta)
     httpd.app = app
+    if sys.platform == 'darwin':
+        app.ensure_camera()
     app.start()
     url = f'http://{HOST}:{args.port}'
     print('')

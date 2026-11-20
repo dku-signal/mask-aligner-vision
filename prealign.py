@@ -67,7 +67,7 @@ def _refine(gray, cx, cy, r):
     return float(cx), float(cy), float(r), float(keep.mean()), float(np.median(inside.mean(1)-outside.mean(1)))
 
 
-def find_disc(gray):
+def find_disc(gray, min_edge=DISC_MIN_EDGE):
     """(cx, cy, r) in full-resolution pixels, or None."""
     h, w = gray.shape
     s = min(1.0, WORK_WIDTH/w)
@@ -80,7 +80,7 @@ def find_disc(gray):
     best = None
     for cx, cy, r in circles[0][:12]/s:  # Hough's ranking is unreliable in clutter: score each
         c = _refine(gray, cx, cy, r)
-        if c is None or c[3] < DISC_MIN_EDGE or c[4] < DISC_MIN_STEP:
+        if c is None or c[3] < min_edge or c[4] < DISC_MIN_STEP:
             continue
         if best is None or c[3]*c[4] > best[3]*best[4]:
             best = c

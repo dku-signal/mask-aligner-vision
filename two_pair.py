@@ -43,6 +43,9 @@ MASK_CONFIRM = 3
 DARK_MARGIN = 60  # grey levels a held square must stay below the gap between the keys
 FIT_RADIUS = 6     # px the model fit may move a cross away from its disc-based place
 NEAR_SIDES = 2.5  # a cross this close to its key (in square widths) may be found without YOLO
+# Rim fraction the wafer disc needs while tracking: on the fine stage part of its rim lies against
+# bright aluminium (0.58-0.63 found, rig 2026-11-20); the rim step (>100 grey levels) still holds.
+TRACK_DISC_MIN_EDGE = 0.45
 # A square is found by shape, not by darkness: darker than 3 of its 4 sides by this fraction
 # of their brightness (over the black stage the film round a square is ~0.3 brighter, over the
 # white wafer ~0.7) and by this many grey levels.
@@ -530,11 +533,11 @@ class TwoPairKeys:
             d = None
             if self.disc_last is not None:
                 d = prealign._refine(self.gray, *self.disc_last)
-                if d is not None and (d[3] < prealign.DISC_MIN_EDGE or d[4] < prealign.DISC_MIN_STEP
+                if d is not None and (d[3] < TRACK_DISC_MIN_EDGE or d[4] < prealign.DISC_MIN_STEP
                                       or abs(d[2]-self.disc_last[2]) > 5):
                     d = None
             if d is None:
-                d = prealign.find_disc(self.gray)
+                d = prealign.find_disc(self.gray, TRACK_DISC_MIN_EDGE)
             self.disc_last = None if d is None else d[:3]
             self.disc = None if d is None else np.array(d[:2])
         return self.disc

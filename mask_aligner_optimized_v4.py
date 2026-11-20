@@ -2314,17 +2314,17 @@ pre{white-space:pre-wrap;line-height:1.7}small{display:block;margin-top:16px;lin
 <pre id="status">연결 중...</pre>
 <small id="performance"></small>
 <small>인식 표시는 작은 떨림을 완화해 보여줍니다. 정렬 제어와 위의 측정 수치는 원본 인식 결과를 사용합니다.</small>
-<p><b>수동 이동</b> (화살표 = 웨이퍼가 화면에서 움직이는 방향)</p>
+<p><b>정밀 얼라인 수동 이동 (FA)</b> · 카메라 화면 방향 기준</p>
 <div id="jogsize">
 <label><input type="radio" name="px" value="1">1px</label>
 <label><input type="radio" name="px" value="5">5px</label>
 <label><input type="radio" name="px" value="10" checked>10px</label>
 <label><input type="radio" name="px" value="50">50px</label>
 </div>
-<div style="display:grid;grid-template-columns:repeat(3,64px);justify-content:center">
-<span></span><button onclick="jog('Y',-1)">↑</button><span></span>
-<button onclick="jog('X',-1)">←</button><span></span><button onclick="jog('X',1)">→</button>
-<span></span><button onclick="jog('Y',1)">↓</button><span></span>
+<div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));text-align:center">
+<span></span><button onclick="jog('Y',-1)">↑ FA - up</button><span></span>
+<button onclick="jog('X',-1)">← FA - left</button><span></span><button onclick="jog('X',1)">→ FA - right</button>
+<span></span><button onclick="jog('Y',1)">↓ FA - down</button><span></span>
 </div>
 <small>키가 화면 밖에 있어도 동작합니다 (보정값 기준 이동, 실제 이동량은 약간 다를 수 있음). 이동 한계는 그대로 적용됩니다.</small>
 <div id="rig">
@@ -2338,10 +2338,11 @@ pre{white-space:pre-wrap;line-height:1.7}small{display:block;margin-top:16px;lin
 <button onclick="post('/api/zstep?mode=proximity&dir=-1')">PROXIMITY 내림</button><button onclick="post('/api/zstep?mode=proximity&dir=1')">PROXIMITY 올림</button>
 <p><b>전자석</b></p>
 <button onclick="post('/api/magnet?n=1&on=1')">자석 ON</button><button onclick="post('/api/magnet?n=1&on=0')">자석 OFF</button>
-<p><b>이송부 수동</b></p>
-<select id="laxis"><option value="R1">레일1 (R1)</option><option value="R2">레일2 (R2)</option></select>
+<p><b>프리얼라인 이송부 수동 (PA)</b></p>
+<p>방향은 로더 카메라 화면 기준입니다.</p>
 <input id="lsteps" type="number" value="1000" min="1" style="width:90px"> steps<br>
-<button onclick="loader(-1)">− 방향</button><button onclick="loader(1)">+ 방향</button>
+<button onclick="loader('R1',1)">PA - right (Q)</button><button onclick="loader('R1',-1)">PA - left (W)</button><br>
+<button onclick="loader('R2',1)">PA - up (E)</button><button onclick="loader('R2',-1)">PA - down (R)</button>
 <p><b>프리얼라인</b> (로더 카메라 · 노치)</p>
 <img id="pimg" alt="로더 카메라: 측정을 누르세요" style="max-width:100%;background:#111;border-radius:6px">
 <button onclick="pre('measure')">노치 측정</button><button onclick="pre('target')">기준 저장</button>
@@ -2358,7 +2359,7 @@ pre{white-space:pre-wrap;line-height:1.7}small{display:block;margin-top:16px;lin
 async function post(path){await fetch(path,{method:'POST'});await refresh()}
 function manual(axis,steps){return post(`/api/manual?axis=${axis}&steps=${steps}`)}
 async function pre(a){await post(`/api/prealign?action=${a}`);document.getElementById('pimg').src='/prealign.jpg?t='+Date.now()}
-function loader(dir){const a=document.getElementById('laxis').value,n=parseInt(document.getElementById('lsteps').value||'0');if(n>0)return post(`/api/loader?axis=${a}&steps=${dir*n}`)}
+function loader(axis,dir){const steps=parseInt(document.getElementById('lsteps').value||'0');if(steps>0)return post(`/api/loader?axis=${axis}&steps=${dir*steps}`)}
 function jog(axis,dir){const px=document.querySelector('input[name=px]:checked').value;return post(`/api/manual?axis=${axis}&dir=${dir}&px=${px}`)}
 let refreshing=false;
 async function refresh(){if(refreshing)return;refreshing=true;try{

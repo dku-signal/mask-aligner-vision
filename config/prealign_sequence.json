@@ -1,5 +1,5 @@
 {
-  "_note": "웨이퍼 이송·프리얼라인 자동 시퀀스. 화이트보드(2026-11-18) 14단계. 숫자가 적힌 단계만 그 값을 쓰고, '끝까지'는 axes의 full 값(실측 최대)을 쓴다.",
+  "_note": "2026-11-20 지정 시퀀스. 레일은 스텝, 리니어 액추에이터는 ms. 1단계 Q는 250,000스텝, 9단계 W는 250,000스텝이다.",
   "axes": {
     "x_rail": {
       "plus": "W",
@@ -9,7 +9,7 @@
       "model": "LM-4030R 400mm (긴 X)",
       "source": "2026-11-18 실측: FOUP 앞 -> 스테이지 끝 W 28초 x 10,000 스텝/초",
       "stage_from_box": 272000,
-      "_abs_note": "박스 끝(box_x)에서 box_margin(8,000스텝=0.8초) 앞에 멈추고, 스테이지는 box_x+stage_from_box(끝에서 8,000스텝 앞)에 멈춘다 (11/20 '너무 많이 감' → 3,000에서 8,000으로).",
+      "_abs_note": "box_margin은 원상 복구 위치의 여유다. 1·9단계 이동량은 steps에서 지정한다.",
       "box_margin": 8000
     },
     "y_rail": {
@@ -27,18 +27,18 @@
       "full": null,
       "model": "LM-2015R 200mm (정밀 얼라인 X)",
       "source": "끝까지 쓰는 단계 없음",
-      "receive_from_left": 32000,
       "left_home_steps": 40000,
-      "_abs_note": "0단계: 정밀 X를 왼쪽 끝까지 확실히 민다(장부상 왼쪽 끝 + left_overshoot). 9단계: X 레일 도착 후 F 32,000스텝(3.2초)을 항상 그대로 보낸다.",
-      "left_overshoot": 2000
+      "_abs_note": "오른쪽 위는 정밀 X·Y 복귀 기준이다. 9단계에서 이송 후 F 3,200스텝을 한 번 보낸다.",
+      "left_overshoot": 2000,
+      "receive_from_right_top": 3200
     },
     "y_linear": {
       "plus": "L",
       "minus": "K",
       "unit": "ms",
-      "full": 10000,
+      "full": 6500,
       "model": "DC 리니어 액추에이터",
-      "source": "2026-11-20 실장비: K 10000ms로 끝까지 빼고 L 10000ms로 최대까지 넣음 (사용자 확인). 이전 6.5초는 덜 들어갔음"
+      "source": "2026-11-20 사용자 지정 시퀀스 표의 L/K 구동 시간"
     },
     "z": {
       "plus": "P",
@@ -50,16 +50,62 @@
     }
   },
   "prealign": {
-    "enabled": false,
-    "camera": null,
-    "deg_per_s": null,
-    "target_deg": 0.0,
-    "_why_disabled": "프리얼라인 서보 회전 속도(°/초)와 노치를 비출 카메라가 아직 없음. 둘을 채우고 enabled=true로 바꾸면 9단계 이송 중에 회전한다."
+    "mask": {
+      "camera": 0,
+      "contrast_roi": [
+        0.502,
+        0.465,
+        0.653,
+        0.696
+      ],
+      "roi": [
+        0.25,
+        0.0,
+        0.5,
+        0.24
+      ],
+      "guide": [
+        [
+          0.36,
+          0.02
+        ],
+        [
+          0.36,
+          0.13
+        ]
+      ]
+    },
+    "wafer": {
+      "camera": 1,
+      "roi": [
+        0,
+        0,
+        1,
+        1
+      ],
+      "guide": [
+        [
+          0.45,
+          0.22
+        ],
+        [
+          0.55,
+          0.22
+        ]
+      ]
+    },
+    "confidence": 0.45,
+    "parallel_tolerance_deg": 1.5,
+    "camera_offset_deg": 0,
+    "camera_sign": 1,
+    "wafer_increasing_direction": -1,
+    "_note": "기준선·ROI는 현재 카메라 배치의 영상 비율. camera_sign × 웨이퍼 각도 + camera_offset_deg를 마스크 좌표와 비교. D8 방향 -1에서 카메라 1의 영상 각도가 증가 (실장비 확인).",
+    "quarter_turn_ms": 550
   },
   "steps": [
     {
       "no": 0,
-      "title": "시작 자세: Y 리니어 빼기, Z 맨 아래, 전자석 OFF, 정밀 X 왼쪽 끝",
+      "title": "시작 자세: Y 리니어 빼기, Z 맨 아래, 전자석 OFF",
       "cmds": [
         [
           "K",
@@ -72,30 +118,26 @@
         [
           "M",
           0
-        ],
-        [
-          "ALIGN_X_TO",
-          "left"
         ]
       ]
     },
     {
       "no": 1,
-      "title": "Q로 X 레일을 FOUP 끝까지",
+      "title": "Q로 X 레일을 FOUP 쪽으로 이송",
       "cmds": [
         [
-          "X_RAIL_TO",
-          "box"
+          "Q",
+          250000
         ]
       ]
     },
     {
       "no": 2,
-      "title": "E로 Y 레일 끝까지",
+      "title": "E로 Y 레일 넣기",
       "cmds": [
         [
           "E",
-          "full"
+          90000
         ]
       ]
     },
@@ -141,25 +183,25 @@
     },
     {
       "no": 8,
-      "title": "R로 Y 레일 빼기 (끝까지)",
+      "title": "Y 레일 후퇴 완료 후 정지 상태에서 마스크·웨이퍼 키 각도 측정",
       "cmds": [
         [
           "R",
-          "full"
+          90000
         ]
       ]
     },
     {
       "no": 9,
-      "title": "W로 X 레일을 정밀 스테이지까지 (+프리얼라인 회전) → 도착 후 정밀 X를 왼쪽 끝에서 F 32,000스텝(3.2초)",
+      "title": "W로 X 레일을 정밀 스테이지까지 (+프리얼라인 회전), 정밀 X 3,200스텝",
       "cmds": [
         [
-          "X_RAIL_TO",
-          "stage"
+          "W",
+          250000
         ],
         [
           "F",
-          32000
+          3200
         ]
       ],
       "prealign": true
@@ -176,21 +218,21 @@
     },
     {
       "no": 10,
-      "title": "E로 Y 레일 넣기 (끝까지)",
+      "title": "E로 Y 레일 넣기",
       "cmds": [
         [
           "E",
-          "full"
+          90000
         ]
       ]
     },
     {
       "no": 11,
-      "title": "L로 Y 리니어 넣기 (끝까지)",
+      "title": "L로 Y 리니어 넣기",
       "cmds": [
         [
           "L",
-          "full"
+          2700
         ]
       ]
     },
@@ -220,7 +262,7 @@
       "cmds": [
         [
           "R",
-          "full"
+          90000
         ],
         [
           "K",

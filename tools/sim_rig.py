@@ -217,6 +217,13 @@ def main():
     true = world.wafer()-world.mask
     moves = [l for l in fw.log if l[:2] in ('X ', 'Y ')]
     xy_result = (app.phase, len(moves), time.time()-t0, true.copy())
+    time.sleep(0.6)  # the Z up worker starts 0.3 s after ALIGN FINISH
+    while True:  # the mask plate goes back up after ALIGN FINISH
+        time.sleep(.1)
+        with app.lock:
+            if not app.moving:
+                break
+    print('  Z after align:', [l for l in fw.log if l.startswith('Z ')][-2:])
 
     print('\n=== 3. Z mode, magnet, loader, distance, transfer (aligner_mega lines)')
     app_mod.Z_MODES = {'contact': (200, 300, 200), 'proximity': (100, 300, 100)}

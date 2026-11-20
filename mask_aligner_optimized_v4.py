@@ -315,6 +315,12 @@ START_SEEN_SEC = 1.0  # START needs both keys seen this recently (a single misse
 # Z_MODES: down ms, hold ms, up ms. HW team tunes the times.
 Z_WHICH = 1
 Z_MODES = {'contact': (2000, 2000, 2000), 'proximity': (1000, 2000, 1000)}
+# Fine align runs with the mask plate (Z_WHICH) all the way down and leaves it all the way up, clear of
+# the transfer arm. Seen from above, a raised mask looks 15% larger than the wafer marks (key gap
+# 82.5 px vs cross gap 70 px; 71.4 px lowered, 2026-11-20), so both pairs can only match lowered.
+# Timed: longer than a full stroke (4 x 1000 ms reached the bottom). 0 skips the move.
+ALIGN_Z_DOWN_MS = 5000
+ALIGN_Z_UP_MS = 5000
 # Transfer = list of firmware lines run in order, e.g. ["MAG 1 1", "R1 -20000", "Z ..."].
 # Empty until the loader positions are measured on the rig.
 TRANSFER_SEQUENCE = []
@@ -1145,6 +1151,35 @@ class MaskAlignerApp:
             self.pulse_cap = THETA_MAX_MS
             self.last_used = self.frame_id
             self.started = self.last_good = time.monotonic()
+            if ALIGN_Z_DOWN_MS > 0:
+                self.phase = 'ZDOWN'
+                self.status = 'Z down: mask plate to the bottom before aligning'
+                threading.Thread(target=self.lower_for_align, args=(self.generation,), name='z_down', daemon=True).start()
+
+    def lower_for_align(self, generation):
+        ok = self.execute([(f'Z {Z_WHICH} -1 {ALIGN_Z_DOWN_MS}', 'DONE Z', ALIGN_Z_DOWN_MS/1000+3, 0.5)], generation)
+        with self.lock:
+            if generation != self.generation or not self.auto_running:
+                return
+            if not ok:
+                self.fail(f'Z down failed: {self.arduino.last_error or "stopped"}')
+                return
+            # Lowered, the mask looks smaller and shifted: a new run token makes the detector measure it afresh.
+            self.generation += 1
+            self.phase = 'XY' if self.skip_theta else 'THETA'
+            self.status = 'ALIGN START (mask lowered)'
+            self.clear_samples()
+            self.last_used = self.frame_id
+            self.started = self.last_good = time.monotonic()
+
+    def raise_after_align(self):
+        time.sleep(0.3)  # let the reply to finish_align's stop arrive first: the next send drops it
+        if self.execute([(f'Z {Z_WHICH} 1 {ALIGN_Z_UP_MS}', 'DONE Z', ALIGN_Z_UP_MS/1000+3, 0.0)]):
+            with self.lock:
+                self.status += ' / Z up'
+        else:
+            with self.lock:
+                self.status += f' / Z up failed: {self.arduino.last_error or "stopped"}'
 
     def stop_align(self):
         with self.lock:
@@ -1555,7 +1590,7 @@ class MaskAlignerApp:
     def auto_loop(self):
         while not self.exit_event.wait(0.02):
             with self.lock:
-                if not self.auto_running or self.moving or self.phase == 'MANUAL':
+                if not self.auto_running or self.moving or self.phase in ('MANUAL', 'ZDOWN'):
                     continue
                 now = time.monotonic()
                 stale = now - self.last_good > VISION_TIMEOUT_SEC
@@ -1743,6 +1778,8 @@ class MaskAlignerApp:
         if note:
             with self.lock:
                 self.status = f'{message} / {note}'
+        if ALIGN_Z_UP_MS > 0:
+            threading.Thread(target=self.raise_after_align, name='z_up', daemon=True).start()
 
     def y_feedback(self, fine):
         """Method 2: feed this align's fine-stage Y steps back into the next wafer's rail move."""
@@ -2008,7 +2045,7 @@ def load_calibration(path):
 RIG_CONFIG_KEYS = ('Z_WHICH', 'Z_MODES', 'TRANSFER_SEQUENCE', 'THETA_TOL_DEG',
                    'PREALIGN_CAMERA', 'PREALIGN_TARGET_DEG', 'PREALIGN_TOL_DEG', 'PREALIGN_DEG_PER_MS',
                    'PREALIGN_NET_MS', 'Y_RAIL_AXIS', 'Y_FINE_AXIS', 'Y_RAIL_MAX_STEPS', 'Y_RAIL_CORRECTION',
-                   'Y_RAIL_PER_FINE', 'Y_PROBE_STEPS', 'Y_FEEDBACK')
+                   'Y_RAIL_PER_FINE', 'Y_PROBE_STEPS', 'Y_FEEDBACK', 'ALIGN_Z_DOWN_MS', 'ALIGN_Z_UP_MS')
 
 
 def load_rig_config(path):

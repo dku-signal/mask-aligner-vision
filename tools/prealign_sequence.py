@@ -38,7 +38,8 @@ def resolve(cfg, c, n, ledger=None):
         left = ledger.d.get("align_left") if ledger else None
         if left is None:   # 왼쪽 끝을 모름: 먼저 왼쪽 끝까지 밀어 기준을 잡는다 (_run이 이어서 F를 보냄)
             return "B", int(ax["left_home_steps"])
-        delta = left + int(ax["receive_from_left"]) - ledger.d["pos"]["align_x"]
+        target = left if n == "left" else left + int(ax["receive_from_left"])
+        delta = target - ledger.d["pos"]["align_x"]
         return ("F" if delta >= 0 else "B"), abs(delta)
     if c == "M":
         return c, int(n)
@@ -179,7 +180,8 @@ class Sequence:
                 yield "B", int(ax["left_home_steps"])
                 self.board.ledger.snapshot("align_left", self.board.ledger.d["pos"]["align_x"])
                 self._log("  정밀 X 왼쪽 끝을 기준으로 기억")
-                yield "F", int(ax["receive_from_left"])
+                if n != "left":
+                    yield "F", int(ax["receive_from_left"])
             else:
                 yield resolve(self.cfg, c, n, self.board.ledger)
 

@@ -29,7 +29,7 @@
       "source": "끝까지 쓰는 단계 없음",
       "receive_from_left": 32000,
       "left_home_steps": 40000,
-      "_abs_note": "정밀 얼라인 X는 왼쪽 끝(align_left)에서 receive_from_left(32,000스텝=3.2초) 위치로 맞춘다. 왼쪽 끝을 모르면 B left_home_steps로 왼쪽 끝까지 밀어 기준을 잡는다(이때만 끝에 닿음). left_home_steps는 받는 위치에서 왼쪽 끝까지(32,000)+여유."
+      "_abs_note": "0단계에서 정밀 X를 왼쪽 끝(align_left)으로 보내 두고, 9단계에서 X 레일이 스테이지에 도착한 뒤 F receive_from_left(32,000스텝=3.2초) 이동한다. 왼쪽 끝을 모르면 B left_home_steps로 밀어 기준을 잡는다."
     },
     "y_linear": {
       "plus": "L",
@@ -58,7 +58,7 @@
   "steps": [
     {
       "no": 0,
-      "title": "시작 자세: Y 리니어 빼기, Z 맨 아래, 전자석 OFF",
+      "title": "시작 자세: Y 리니어 빼기, Z 맨 아래, 전자석 OFF, 정밀 X 왼쪽 끝",
       "cmds": [
         [
           "K",
@@ -71,6 +71,10 @@
         [
           "M",
           0
+        ],
+        [
+          "ALIGN_X_TO",
+          "left"
         ]
       ]
     },
@@ -146,7 +150,7 @@
     },
     {
       "no": 9,
-      "title": "W로 X 레일을 정밀 스테이지까지 (+프리얼라인 회전), 정밀 X = 왼쪽 끝 + 32,000스텝",
+      "title": "W로 X 레일을 정밀 스테이지까지 (+프리얼라인 회전) → 도착 후 정밀 X를 왼쪽 끝에서 F 32,000스텝(3.2초)",
       "cmds": [
         [
           "X_RAIL_TO",

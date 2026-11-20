@@ -49,6 +49,8 @@ NEAR_SIDES = 2.5  # a cross this close to its key (in square widths) may be foun
 SQUARE_CONTRAST = 0.12
 SQUARE_STEP = 8
 FIT_MAX_RMS = 0.12  # square widths: a worse two-key fit (squares merged with cross arms) is no mask
+SEED_SIZE = 25     # px square side to search with before any square was measured (1080p camera 0)
+SEED_PEAKS = 30    # clearest shape peaks tried as one edge of a key when YOLO finds no square
 FIT_RMS_SLACK = 0.3  # px: a fresh full mask replaces the held one unless its fit is clearly worse
 
 
@@ -127,6 +129,7 @@ class TwoPairKeys:
         self.disc_last = None    # (cx, cy, r) of the last disc found
         self.gray = None
         self.tracked = 0
+        self.square_size = SEED_SIZE  # last measured square side: the shape search scale without YOLO
         try:
             if not KEEP_MASK:
                 raise OSError
@@ -171,7 +174,10 @@ class TwoPairKeys:
 
     @classmethod
     def more_squares(cls, gray, boxes, reach=4.0):
-        """YOLO square boxes plus the squares it missed nearby, and the contrast of each.
+        """YOLO square boxes plus the squares it missed nearby: (boxes, contrast, centre or NaN).
+
+        A found square's centre is its sub-pixel contrast peak: next to the black stage a darkness
+        centroid is pulled towards the black side. YOLO squares get NaN (blob centroid later).
 
         YOLO misses squares over the black stage (the film there is only ~25 grey levels
         brighter than the square), so the others are found by their shape: local contrast peaks.
@@ -186,13 +192,22 @@ class TwoPairKeys:
         centers = lambda b: (b[:, :2]+b[:, 2:])/2
         merged = list(boxes)
         contrast = [float(near[int(np.clip(y-y0, 0, y1-y0-1)), int(np.clip(x-x0, 0, x1-x0-1))]) for x, y in centers(boxes)]
+        found = [np.full(2, np.nan)]*len(boxes)
         ys, xs = np.nonzero(peak)
+        h, w = ratio.shape
         for i in np.argsort(-ratio[ys, xs]):
-            c = np.array([x0+xs[i], y0+ys[i]], float)
+            y, x = ys[i], xs[i]
+            c = np.array([x0+x, y0+y], float)
             if min(np.linalg.norm(centers(np.array(merged))-c, axis=1)) > size/2:
+                if 0 < x < w-1 and 0 < y < h-1:  # parabola through the peak and its neighbours
+                    for k, (lo, mid, hi) in enumerate(((ratio[y, x-1], ratio[y, x], ratio[y, x+1]),
+                                                       (ratio[y-1, x], ratio[y, x], ratio[y+1, x]))):
+                        den = lo-2*mid+hi
+                        c[k] += 0.5*(lo-hi)/den if den < 0 else 0
                 merged.append(np.r_[c-size/2, c+size/2])
-                contrast.append(float(ratio[ys[i], xs[i]]))
-        return np.array(merged), np.array(contrast)
+                contrast.append(float(ratio[y, x]))
+                found.append(c)
+        return np.array(merged), np.array(contrast), np.array(found)
 
     @staticmethod
     def is_grid(pts, tol=0.25):
@@ -297,17 +312,55 @@ class TwoPairKeys:
         model = np.array(model)
         return model[:4], model[4:], rms
 
+    def seed_squares(self, gray):
+        """Square boxes of one 2x2 key found by shape alone, for frames where YOLO finds none.
+
+        Over the black stage YOLO may miss every square; then an edge of two of the clearest contrast
+        peaks over the whole frame, with any two peaks completing the square (a faint column over the
+        black stage), is the seed for the usual search around it.
+        """
+        s = self.square_size
+        ratio, step = self.square_contrast(gray, s)
+        k = int(s) | 1
+        peak = (ratio == cv2.dilate(ratio, np.ones((k, k), np.uint8))) & (ratio > SQUARE_CONTRAST) & (step > SQUARE_STEP)
+        ys, xs = np.nonzero(peak)
+        order = np.argsort(-ratio[ys, xs])
+        pts = np.c_[xs[order], ys[order]].astype(float)
+        value = ratio[ys[order], xs[order]]
+        best = None
+        for i, a in enumerate(pts[:SEED_PEAKS]):
+            for j, b in enumerate(pts[:SEED_PEAKS]):
+                e = b-a
+                side = np.linalg.norm(e)
+                if i == j or not 1.3*s < side < 3*s:
+                    continue
+                # (a, b) and (b, a) give the square on either side of the edge.
+                c, d = a+[-e[1], e[0]], b+[-e[1], e[0]]
+                ic, id_ = np.linalg.norm(pts-c, axis=1).argmin(), np.linalg.norm(pts-d, axis=1).argmin()
+                if np.linalg.norm(pts[ic]-c) < 0.25*side and np.linalg.norm(pts[id_]-d) < 0.25*side:
+                    score = value[[i, j, ic, id_]].sum()
+                    if best is None or score > best[0]:
+                        best = score, pts[[i, j, ic, id_]]
+        if best is None:
+            return np.empty((0, 4))
+        return np.c_[best[1]-s/2, best[1]+s/2]
+
     def measure_mask(self, gray, square_boxes):
         """Two square groups from 6-8 squares (YOLO + nearby blobs) in this frame, or None."""
+        seeded = len(square_boxes) < 2
+        if seeded:
+            square_boxes = self.seed_squares(gray)
         if len(square_boxes) < 2:
             return None
-        boxes, contrast = self.more_squares(gray, square_boxes)
+        boxes, contrast, peaks = self.more_squares(gray, square_boxes)
+        if seeded:  # the seed squares are contrast peaks too, centred in their boxes
+            peaks[:len(square_boxes)] = (square_boxes[:, :2]+square_boxes[:, 2:])/2
         # The combination search below is meant for 6-12 blobs: YOLO's first, then the clearest.
         keep = np.argsort(-(contrast+(np.arange(len(boxes)) < len(square_boxes))), kind='stable')[:12]
-        boxes, contrast = boxes[keep], contrast[keep]
+        boxes, contrast, peaks = boxes[keep], contrast[keep], peaks[keep]
         if len(boxes) < MASK_MIN_SEEN:
             return None
-        centers = [blob_center(gray, b) for b in boxes]
+        centers = [blob_center(gray, b) if np.isnan(p[0]) else p for b, p in zip(boxes, peaks)]
         if any(c is None for c in centers):
             return None
         pts = np.array(centers)
@@ -328,6 +381,7 @@ class TwoPairKeys:
         ga, gb, rms = self.fit_keys(ga, gb, measured, np.clip(weight, 0.05, 1)**2)
         if rms > FIT_MAX_RMS*size:
             return None  # squares merged with cross arms: their centres are off
+        self.square_size = size
         mean = np.vstack([ga, gb]).mean(0)
         axis = gb.mean(0)-ga.mean(0)
         axis /= np.linalg.norm(axis)

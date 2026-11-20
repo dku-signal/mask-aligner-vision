@@ -196,7 +196,7 @@ class Sequence:
                 self._log(f"{st['no']}단계 시작: {st['title']}")
                 turn = self._prealign_turn() if st.get("prealign") else None
                 for i, (c, n) in enumerate(self._expand(st["cmds"])):
-                    if n == 0:
+                    if n == 0 and c != "M":   # 전자석 M 0(끄기)은 건너뛰면 안 된다
                         self._log(f"  {c} 0 (이미 목표 위치)")
                         continue
                     if turn and i == 0:

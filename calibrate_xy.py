@@ -164,9 +164,9 @@ def solve(results):
         cal[f'MOTOR_SIGN_{img_axis}'] = -1 if v > 0 else 1
         cal[f'STEPS_PER_PIXEL_{img_axis}'] = round(1/abs(v), 4)
     px_per_step = max(np.linalg.norm(v) for v in vec.values())
-    # One move may cover ~60 px; dead band is two steps but never below 0.5 px.
+    # One move may cover ~60 px; dead band is two steps but never below 0.65 px.
     cal['MAX_STEPS_PER_AXIS'] = int(60*max(cal['STEPS_PER_PIXEL_X'], cal['STEPS_PER_PIXEL_Y']))
-    cal['DEAD_BAND_PX'] = round(max(.5, 2*px_per_step), 3)
+    cal['DEAD_BAND_PX'] = round(max(.65, 2*px_per_step), 3)
     cal['MANUAL_STEPS'] = int(round(10*max(cal['STEPS_PER_PIXEL_X'], cal['STEPS_PER_PIXEL_Y'])))
     report = {}
     for a, (n, fwd, back) in results.items():

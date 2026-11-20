@@ -3,6 +3,7 @@
 import argparse
 import json
 import math
+import sys
 import threading
 import time
 import webbrowser
@@ -11,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 import cv2
 import prealign
+from tools.fine_stage import DIRECTIONS, FineStage
 """Four-square mask geometry and occlusion-masked wafer contrast matching."""
 from pathlib import Path
 from itertools import combinations
@@ -321,6 +323,8 @@ Z_MODES = {'contact': (2000, 2000, 2000), 'proximity': (1000, 2000, 1000)}
 # Timed: longer than a full stroke (4 x 1000 ms reached the bottom). 0 skips the move.
 ALIGN_Z_DOWN_MS = 5000
 ALIGN_Z_UP_MS = 5000
+FINE_RETURN_DELAY_S = 10.0
+FINE_RETURN_LEFT_STEPS = 32000
 # Transfer = list of firmware lines run in order, e.g. ["MAG 1 1", "R1 -20000", "Z ..."].
 # Empty until the loader positions are measured on the rig.
 TRANSFER_SEQUENCE = []
@@ -463,6 +467,7 @@ class ArduinoLink:
         self.rx_buffer = bytearray()
         self.last_rx = ''
         self.pt_done = set()  # "DONE PT <id>" lines that arrived during another command
+        self.fine_stage = None
         self.last_error = ''
         # 'aligner' = firmware/aligner_mega; 'previous' = firmware/mega_previous (the transfer team's
         # board on main): the same moves as "#<letter> <n>" lines, found by its "#PING" -> "PONG".
@@ -476,11 +481,13 @@ class ArduinoLink:
             print('Arduino port not found. Motor commands disabled.')
             return
         try:
-            self.ser = serial.Serial(self.port, baud, timeout=0.05, write_timeout=2.0)
+            self.ser = serial.Serial(self.port, baud, timeout=0.05, write_timeout=2.0, exclusive=True)
             time.sleep(2.0)
             self.ser.reset_input_buffer()
             self.ser.reset_output_buffer()
             self.dialect = self.probe_dialect()
+            if any(p.device == self.port and p.vid for p in list_ports.comports()):
+                self.fine_stage = FineStage.for_port(self.port)
             print(f'Arduino connected: {self.port} (firmware {self.dialect})')
         except Exception as e:
             print(f'Arduino connection failed: {e}')
@@ -763,6 +770,8 @@ class MaskAlignerApp:
         self.prealign_center = None
         self.stage_offset = {'X': 0, 'Y': 0}  # fine-stage steps since the last @STAGE_HOME
         self.align_moved = {'X': 0, 'Y': 0}   # fine-stage steps of the current / last align
+        self.align_return_target = None
+        self.align_theta_pulses = []  # signed, board-confirmed pulse durations (ms)
         self.y_rail_sent = None               # rail steps @Y sent for the wafer now on the stage
         self.prealign_jpeg = None
         self.prealign_seq = 0
@@ -820,6 +829,8 @@ class MaskAlignerApp:
         self.wafer_center = None
         self.theta_done_error = None
         self.theta_recheck = None
+        self.xy_response = {}
+        self.xy_checked = set()
 
     def clear_samples(self):
         self.history.clear()
@@ -1122,6 +1133,16 @@ class MaskAlignerApp:
             if not self.arduino.connected():
                 self.status = 'Arduino disconnected'
                 return
+            stage = self.arduino.fine_stage
+            target = None
+            if stage and stage.data:
+                try:
+                    start_x, start_y = stage.position()
+                    target = (start_x - FINE_RETURN_LEFT_STEPS, start_y)
+                except ValueError as exc:
+                    self.status = str(exc)
+                    self.phase = 'FAULT'
+                    return
             # Nothing moves unless both keys are in view: a missing wafer or mask is reported, not searched for.
             missing = self.missing_keys(time.monotonic(), START_SEEN_SEC)
             if missing:
@@ -1138,6 +1159,8 @@ class MaskAlignerApp:
                 self.next_info = None
                 self.status = 'ALIGN START'
                 self.align_moved = {'X': 0, 'Y': 0}
+                self.align_return_target = target
+                self.align_theta_pulses.clear()
             self.generation += 1
             self.clear_samples()
             # No theta motor on the current build: go straight to XY centring.
@@ -1148,6 +1171,8 @@ class MaskAlignerApp:
             self.retry_ms = 0
             self.retry_direction = 1
             self.pulses = self.bad_response = self.confirm = 0
+            self.xy_response.clear()
+            self.xy_checked.clear()
             self.pulse_cap = THETA_MAX_MS
             self.last_used = self.frame_id
             self.started = self.last_good = time.monotonic()
@@ -1172,14 +1197,66 @@ class MaskAlignerApp:
             self.last_used = self.frame_id
             self.started = self.last_good = time.monotonic()
 
-    def raise_after_align(self):
-        time.sleep(0.3)  # let the reply to finish_align's stop arrive first: the next send drops it
-        if self.execute([(f'Z {Z_WHICH} 1 {ALIGN_Z_UP_MS}', 'DONE Z', ALIGN_Z_UP_MS/1000+3, 0.0)]):
+    def return_fine_stage(self, generation, target=None):
+        stage = self.arduino.fine_stage
+        if stage is None:
+            return '정밀 스테이지 기준 미설정'
+        try:
+            moves = stage.moves(*(target if target is not None else (0, 0)))
+        except ValueError as exc:
+            return str(exc)
+        for letter, remaining in moves:
+            axis, sign = DIRECTIONS[letter]
+            while remaining:
+                steps = min(remaining, 20000)
+                if not self.execute([(f'{axis} {sign * steps}', 'DONE', 25.0, 0.0)], generation):
+                    return '정밀 X·Y 복귀 중단'
+                remaining -= steps
+        return '정밀 X·Y 오른쪽 위 복귀 완료' if target is None else '정밀 X·Y 자동 복귀 완료'
+
+    def pulse_fine_theta(self, direction, duration, generation):
+        with self.lock:
+            self.seq += 1
+            seq = self.seq
+        command = (f'T {seq} {direction} {duration}', f'DONE T {seq}', 2.0, THETA_SETTLE_SEC)
+        if not self.execute([command], generation):
+            return False
+        with self.lock:
+            if generation != self.generation:
+                return False
+            if self.phase == 'THETA':
+                self.align_theta_pulses.append(direction * duration)
+        return True
+
+    def after_align(self, generation, deadline, target, theta_pulses):
+        if ALIGN_Z_UP_MS:
+            if self.stop_event.wait(.3):
+                return
+            lift = (f'Z {Z_WHICH} 1 {ALIGN_Z_UP_MS}', 'DONE Z', ALIGN_Z_UP_MS/1000+3, 0.0)
+            if not self.execute([lift], generation):
+                return
+        result = '정밀 얼라인 완료'
+        if target is not None or theta_pulses:
             with self.lock:
-                self.status += ' / Z up'
-        else:
-            with self.lock:
-                self.status += f' / Z up failed: {self.arduino.last_error or "stopped"}'
+                if generation != self.generation:
+                    return
+                self.status = '정밀 얼라인 완료 · 자동 복귀 대기'
+            if self.stop_event.wait(max(0, deadline - time.monotonic())):
+                return
+            # Undo individual pulses to preserve the servo's start/stop response.
+            for pulse in reversed(theta_pulses):
+                if not self.pulse_fine_theta(-1 if pulse > 0 else 1, abs(pulse), generation):
+                    return
+            if theta_pulses:
+                result = '정밀 세타 복귀 구동 완료'
+            if target is not None:
+                xy_result = self.return_fine_stage(generation, target)
+                result = f'{result} · {xy_result}' if theta_pulses else xy_result
+        with self.lock:
+            if generation == self.generation:
+                self.auto_running = False
+                self.motion_stage = 'DONE'
+                self.status = result
 
     def stop_align(self):
         with self.lock:
@@ -1218,18 +1295,25 @@ class MaskAlignerApp:
         try:
             for command, expected, timeout, settle in commands:
                 with self.lock:
-                    if self.exit_event.is_set() or self.stop_event.is_set():
+                    if self.exit_event.is_set() or self.stop_event.is_set() or (generation is not None and self.generation != generation):
                         success = False
                         error = 'Cancelled by STOP'
                         break
                     self.motion_stage = 'WAIT_ACK'
                     self.status = f'WAIT ACK: {command}'
+                    head, _, value = command.partition(' ')
+                    letter = None
+                    stage = self.arduino.fine_stage
+                    if head in ('X', 'Y') and stage and value.lstrip('-').isdigit():
+                        letter = ('FB' if head == 'X' else 'fb')[int(value) < 0]
+                        stage.begin(letter, abs(int(value)))
                     sent = self.arduino.send(command) if command else True  # '' = only wait
                 if not sent or not self.arduino.wait_done(self.stop_event, timeout, expected):
                     success = False
                     error = self.arduino.last_error or 'Serial command failed'
                     break
-                head, _, value = command.partition(' ')
+                if letter:
+                    stage.ack(letter, abs(int(value)))
                 if head in ('X', 'Y') and value.lstrip('-').isdigit():
                     with self.lock:
                         self.stage_offset[head] += int(value)
@@ -1253,12 +1337,34 @@ class MaskAlignerApp:
                 if success and not self.stop_event.is_set():
                     self.status = 'ACK OK; WAIT fresh stable image'
         if not success:
-            self.fail(error)
+            with self.lock:
+                if generation is None or self.generation == generation:
+                    self.fail(error)
         return success
 
     def move_xy_sequential(self, steps_x, steps_y, generation=None):
         commands = [(f'{arduino_axis(axis)} {steps}', 'DONE', 25.0, AXIS_SETTLE_SEC) for axis, steps in (('X', steps_x), ('Y', steps_y)) if steps != 0]
         return self.execute(commands, generation)
+
+    def checked_xy_steps(self, info):
+        steps = []
+        for axis, error, requested, scale in zip(('X', 'Y'), info[2:4], info[4:6],
+                                                  (STEPS_PER_PIXEL_X, STEPS_PER_PIXEL_Y)):
+            previous = self.xy_response.pop(axis, None)
+            if previous:
+                before, expected = previous
+                progress = math.copysign(1, before) * (before - error)
+                if progress < max(1.0, expected * .1):
+                    raise ValueError(f'{axis}축 영상 이동 확인 실패 · 예상 {expected:.1f}px, 관측 {progress:.1f}px')
+                self.xy_checked.add(axis)
+            if axis not in self.xy_checked:
+                limit = max(1, round(12 * abs(scale)))
+                requested = max(-limit, min(limit, requested))
+            expected = abs(requested) / max(abs(scale), .001)
+            if expected >= 7:
+                self.xy_response[axis] = error, expected
+            steps.append(requested)
+        return steps
 
     def manual_move(self, axis, steps, exact=False):
         with self.lock:
@@ -1590,7 +1696,7 @@ class MaskAlignerApp:
     def auto_loop(self):
         while not self.exit_event.wait(0.02):
             with self.lock:
-                if not self.auto_running or self.moving or self.phase in ('MANUAL', 'ZDOWN'):
+                if not self.auto_running or self.moving or self.phase in ('MANUAL', 'ZDOWN', 'DONE'):
                     continue
                 now = time.monotonic()
                 stale = now - self.last_good > VISION_TIMEOUT_SEC
@@ -1622,7 +1728,11 @@ class MaskAlignerApp:
                     if info is None:
                         continue
                     self.last_used = fid
-                    sx, sy = info[4], info[5]
+                    try:
+                        sx, sy = self.checked_xy_steps(info)
+                    except ValueError as exc:
+                        self.fail(str(exc))
+                        continue
                     if sx == 0 and sy == 0:
                         self.status = 'XY CENTERED - verifying fresh corner/wafer centers'
                         continue
@@ -1704,10 +1814,9 @@ class MaskAlignerApp:
                 direction = 1 if -err / self.response > 0 else -1
                 gain = THETA_FINE_GAIN if abs(err) <= THETA_FINE_RANGE_DEG else THETA_MOVE_GAIN
                 duration = int(np.clip(gain * abs(err / self.response), THETA_MIN_MS, self.pulse_cap))
-            self.seq += 1
             with self.lock:
                 self.status = f'THETA pulse {direction:+d}, {duration} ms; err={err:+.2f}'
-            if self.execute([(f'T {self.seq} {direction} {duration}', f'DONE T {self.seq}', 2.0, THETA_SETTLE_SEC)], generation):
+            if self.pulse_fine_theta(direction, duration, generation):
                 self.previous = (err, direction, duration)
                 self.pulses += 1
 
@@ -1718,16 +1827,19 @@ class MaskAlignerApp:
             worker.start()
 
     def open_camera(self, index):
-        cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+        cap = cv2.VideoCapture(index, cv2.CAP_DSHOW if sys.platform == 'win32' else cv2.CAP_ANY)
         if not cap.isOpened():
             cap.release()
             cap = cv2.VideoCapture(index)
         if not cap.isOpened():
             cap.release()
             return None
+        if sys.platform == 'darwin':
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-        cap.set(cv2.CAP_PROP_FPS, 30)
+        if sys.platform != 'darwin':
+            cap.set(cv2.CAP_PROP_FPS, 30)
         # Best effort only: some DirectShow drivers ignore this property.
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         return cap
@@ -1764,9 +1876,13 @@ class MaskAlignerApp:
                 self.jpeg_ready.notify_all()
 
     def finish_align(self, message):
+        deadline = time.monotonic() + FINE_RETURN_DELAY_S
         self.arduino.stop()
         with self.lock:
-            self.auto_running = False
+            target = self.align_return_target
+            theta_pulses = tuple(self.align_theta_pulses)
+            self.auto_running = bool(target is not None or theta_pulses or ALIGN_Z_UP_MS)
+            self.phase = 'DONE'
             self.align_finished = True
             self.moving = False
             self.centered_count = 0
@@ -1778,8 +1894,12 @@ class MaskAlignerApp:
         if note:
             with self.lock:
                 self.status = f'{message} / {note}'
-        if ALIGN_Z_UP_MS > 0:
-            threading.Thread(target=self.raise_after_align, name='z_up', daemon=True).start()
+        if self.auto_running:
+            worker = threading.Thread(target=self.after_align, args=(self.generation, deadline, target, theta_pulses),
+                                      name='after_align', daemon=True)
+            self.workers = [t for t in self.workers if t.is_alive()]
+            self.workers.append(worker)
+            worker.start()
 
     def y_feedback(self, fine):
         """Method 2: feed this align's fine-stage Y steps back into the next wafer's rail move."""
@@ -1856,7 +1976,7 @@ class RequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == '/':
-            data = HTML_PAGE.encode('utf-8')
+            data = HTML_PAGE.replace('{center_tolerance_px}', f'{DEAD_BAND_PX:g}').encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.send_header('Content-Length', str(len(data)))
@@ -1921,6 +2041,18 @@ class RequestHandler(BaseHTTPRequestHandler):
         if parsed.path == '/api/stop':
             self.app.stop_align()
             self.send_json({'ok': True})
+            return
+        if parsed.path == '/api/fine_home':
+            self.send_json({'ok': self.app.start_worker('fine_home', self.app.return_fine_stage)})
+            return
+        if parsed.path == '/api/fine_teach':
+            with self.app.lock:
+                stage = self.app.arduino.fine_stage
+                ok = bool(stage and not self.app.auto_running and not self.app.moving)
+                if ok:
+                    stage.teach()
+                    self.app.status = '현재 정밀 X·Y를 오른쪽 위 기준으로 저장했습니다'
+            self.send_json({'ok': ok})
             return
         if parsed.path == '/api/reset':
             self.app.reset()
@@ -2134,6 +2266,8 @@ def main():
     httpd = ThreadingHTTPServer((HOST, args.port), RequestHandler)
     app = MaskAlignerApp(camera_index=args.camera, cache_mb=args.cache_mb, preview_fps=args.preview_fps, overlay_smoothing_ms=args.overlay_smoothing_ms, detector=args.detector, skip_theta=args.skip_theta)
     httpd.app = app
+    if sys.platform == 'darwin':
+        app.ensure_camera()
     app.start()
     url = f'http://{HOST}:{args.port}'
     print('')
@@ -2172,23 +2306,25 @@ pre{white-space:pre-wrap;line-height:1.7}small{display:block;margin-top:16px;lin
 <button class="start" onclick="post('/api/start')">START ALIGN</button>
 <button class="stop" onclick="post('/api/stop')">STOP</button>
 <button onclick="post('/api/reset')">RESET</button>
+<button onclick="post('/api/fine_home')">정밀 X·Y 초기화</button>
+<button onclick="post('/api/fine_teach')">현재 위치를 오른쪽 위 기준으로 저장</button>
 <button onclick="post('/api/camera_next')">NEXT CAMERA</button>
 <div id="alignError" role="alert" hidden style="padding:14px;margin:12px 0;background:#fee2e2;color:#991b1b;border:1px solid #fca5a5;border-radius:6px;font-weight:bold"></div>
 <div id="thetaDone" role="status" hidden style="padding:14px;margin:12px 0;background:#dcfce7;color:#166534;border:1px solid #86efac;border-radius:6px;font-weight:bold"></div>
 <pre id="status">연결 중...</pre>
 <small id="performance"></small>
 <small>인식 표시는 작은 떨림을 완화해 보여줍니다. 정렬 제어와 위의 측정 수치는 원본 인식 결과를 사용합니다.</small>
-<p><b>수동 이동</b> (화살표 = 웨이퍼가 화면에서 움직이는 방향)</p>
+<p><b>정밀 얼라인 수동 이동 (FA)</b> · 카메라 화면 방향 기준</p>
 <div id="jogsize">
 <label><input type="radio" name="px" value="1">1px</label>
 <label><input type="radio" name="px" value="5">5px</label>
 <label><input type="radio" name="px" value="10" checked>10px</label>
 <label><input type="radio" name="px" value="50">50px</label>
 </div>
-<div style="display:grid;grid-template-columns:repeat(3,64px);justify-content:center">
-<span></span><button onclick="jog('Y',-1)">↑</button><span></span>
-<button onclick="jog('X',-1)">←</button><span></span><button onclick="jog('X',1)">→</button>
-<span></span><button onclick="jog('Y',1)">↓</button><span></span>
+<div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));text-align:center">
+<span></span><button onclick="jog('Y',-1)">↑ FA - up</button><span></span>
+<button onclick="jog('X',-1)">← FA - left</button><span></span><button onclick="jog('X',1)">→ FA - right</button>
+<span></span><button onclick="jog('Y',1)">↓ FA - down</button><span></span>
 </div>
 <small>키가 화면 밖에 있어도 동작합니다 (보정값 기준 이동, 실제 이동량은 약간 다를 수 있음). 이동 한계는 그대로 적용됩니다.</small>
 <div id="rig">
@@ -2202,10 +2338,11 @@ pre{white-space:pre-wrap;line-height:1.7}small{display:block;margin-top:16px;lin
 <button onclick="post('/api/zstep?mode=proximity&dir=-1')">PROXIMITY 내림</button><button onclick="post('/api/zstep?mode=proximity&dir=1')">PROXIMITY 올림</button>
 <p><b>전자석</b></p>
 <button onclick="post('/api/magnet?n=1&on=1')">자석 ON</button><button onclick="post('/api/magnet?n=1&on=0')">자석 OFF</button>
-<p><b>이송부 수동</b></p>
-<select id="laxis"><option value="R1">레일1 (R1)</option><option value="R2">레일2 (R2)</option></select>
+<p><b>프리얼라인 이송부 수동 (PA)</b></p>
+<p>방향은 로더 카메라 화면 기준입니다.</p>
 <input id="lsteps" type="number" value="1000" min="1" style="width:90px"> steps<br>
-<button onclick="loader(-1)">− 방향</button><button onclick="loader(1)">+ 방향</button>
+<button onclick="loader('R1',1)">PA - right (Q)</button><button onclick="loader('R1',-1)">PA - left (W)</button><br>
+<button onclick="loader('R2',1)">PA - up (E)</button><button onclick="loader('R2',-1)">PA - down (R)</button>
 <p><b>프리얼라인</b> (로더 카메라 · 노치)</p>
 <img id="pimg" alt="로더 카메라: 측정을 누르세요" style="max-width:100%;background:#111;border-radius:6px">
 <button onclick="pre('measure')">노치 측정</button><button onclick="pre('target')">기준 저장</button>
@@ -2216,13 +2353,13 @@ pre{white-space:pre-wrap;line-height:1.7}small{display:block;margin-top:16px;lin
 <button onclick="post('/api/transfer')">이송 실행</button>
 <small>모든 동작은 STOP으로 멈춥니다. 이송 순서는 rig_config.json의 TRANSFER_SEQUENCE에 적습니다.</small>
 </div>
-<small>START 한 번으로 세타 구동·검증을 반복하고, 허용 각도(rig_config.json의 THETA_TOL_DEG) 이내 확인 후 X → Y 중심 정렬로 자동 전환합니다.<br>X·Y에서는 각도 검출을 요구하지 않습니다.<br>MASK의 검은 사각형 4개 배치와 WAFER의 남은 십자 팔로 중심을 구합니다. 각 축의 중심 오차가 6px 미만인 상태로 8프레임 연속 확인되면 ALIGN FINISH입니다. MASK 3/4는 3개 실측과 1개 위치 복원을 뜻합니다.</small>
+<small>START 한 번으로 세타 구동·검증을 반복하고, 허용 각도(rig_config.json의 THETA_TOL_DEG) 이내 확인 후 X → Y 중심 정렬로 자동 전환합니다.<br>X·Y에서는 각도 검출을 요구하지 않습니다.<br>MASK의 검은 사각형 4개 배치와 WAFER의 남은 십자 팔로 중심을 구합니다. 각 축의 중심 오차가 {center_tolerance_px}px 미만인 상태로 8프레임 연속 확인되면 ALIGN FINISH입니다. MASK 3/4는 3개 실측과 1개 위치 복원을 뜻합니다.</small>
 </aside></main>
 <script>
 async function post(path){await fetch(path,{method:'POST'});await refresh()}
 function manual(axis,steps){return post(`/api/manual?axis=${axis}&steps=${steps}`)}
 async function pre(a){await post(`/api/prealign?action=${a}`);document.getElementById('pimg').src='/prealign.jpg?t='+Date.now()}
-function loader(dir){const a=document.getElementById('laxis').value,n=parseInt(document.getElementById('lsteps').value||'0');if(n>0)return post(`/api/loader?axis=${a}&steps=${dir*n}`)}
+function loader(axis,dir){const steps=parseInt(document.getElementById('lsteps').value||'0');if(steps>0)return post(`/api/loader?axis=${axis}&steps=${dir*steps}`)}
 function jog(axis,dir){const px=document.querySelector('input[name=px]:checked').value;return post(`/api/manual?axis=${axis}&dir=${dir}&px=${px}`)}
 let refreshing=false;
 async function refresh(){if(refreshing)return;refreshing=true;try{

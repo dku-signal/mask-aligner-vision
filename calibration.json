@@ -5,7 +5,7 @@
   "STEPS_PER_PIXEL_X": 93.02,
   "STEPS_PER_PIXEL_Y": 74.88,
   "MAX_STEPS_PER_AXIS": 8000,
-  "DEAD_BAND_PX": 0.5,
+  "DEAD_BAND_PX": 0.65,
   "MANUAL_STEPS": 93,
   "_measured_at": "2026-11-18 camera 0 at 1920x1080, new pins: +2000 X steps = +21.50 px, +2000 Y steps = +26.71 px (round trip within 0.3 px)"
 }

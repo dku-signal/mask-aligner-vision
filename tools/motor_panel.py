@@ -20,6 +20,10 @@ import cv2
 
 import serial
 import serial.tools.list_ports
+if __package__:
+    from .fine_stage import DIRECTIONS, FineStage
+else:
+    from fine_stage import DIRECTIONS, FineStage
 
 # 펌웨어 명령표 (Mega_All_Control.ino handleCommand)
 MOVES = {  # 누르고 있는 동안만 움직이는 명령
@@ -27,6 +31,7 @@ MOVES = {  # 누르고 있는 동안만 움직이는 명령
 }
 ONESHOT = {"T", "G", "t", "M", "X"}
 HOLD_TIMEOUT_S = 0.5
+FINE_JOG_STEPS = 2500
 
 
 class MockSerial:
@@ -121,9 +126,10 @@ class Ledger:
 
 class Board:
     def __init__(self):
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.port = None
         self.ser = None
+        self.revision = 0
         self.lines = deque(maxlen=200)
         self.sensor = None
         self.sensor_at = None
@@ -136,6 +142,7 @@ class Board:
         self.pulse_cancel = threading.Event()
         self.replies = queue.Queue()   # 줄 명령 응답(DONE/ERR/STOP/PONG)
         self.ledger = Ledger()
+        self.fine_stage = None
         self.unmatched = []
         self.servo_dir = {"t": 1, "A": 1}   # 회전 명령의 방향 (DONE에는 방향이 없어서 보낼 때 기억)
         self.pulses = deque(maxlen=100)  # 시간 지정 구동 기록 (값 측정용)
@@ -146,9 +153,10 @@ class Board:
         if port == "mock":
             ser = MockSerial()
         else:
-            ser = serial.Serial(port, 9600, timeout=0.3, write_timeout=0.5)
+            ser = serial.Serial(port, 9600, timeout=0.3, write_timeout=0.5, exclusive=True)
             time.sleep(2.0)  # Mega는 포트를 열면 리셋됨
         with self.lock:
+            self.fine_stage = FineStage.for_port(port)
             self.ser, self.port = ser, port
             self.magnet, self.theta, self.prealign = False, "90°", "90°"  # 리셋 직후: 서보 정지(90), 전자석 OFF
         threading.Thread(target=self._reader, args=(ser,), daemon=True).start()
@@ -171,6 +179,11 @@ class Board:
                 raw = ser.readline()
             except Exception as e:
                 self._note(f"읽기 오류: {e}")
+                with self.lock:
+                    if self.ser is ser:
+                        self.ser, self.port, self.moving = None, None, None
+                        ser.close()
+                        self.replies.put("ERR disconnected")
                 break
             line = raw.decode(errors="replace").strip()
             if not line:
@@ -181,6 +194,15 @@ class Board:
                 if p[0] in ("DONE", "STOP") and len(p) == 3 and p[1] != "M":
                     # DONE = 끝까지 감, STOP <c> <n> = 중간 정지 시 실제로 간 양 → 둘 다 장부에 반영
                     self.ledger.apply(p[1], int(p[2]), self.servo_dir.get(p[1], 1))
+                    if p[1] in DIRECTIONS:
+                        with self.lock:
+                            if self.ser is not ser:
+                                break
+                            self.fine_stage.ack(p[1], int(p[2]), partial=p[0] == "STOP")
+                            if p[0] == "DONE" and self.moving == p[1]:
+                                if time.time() - self.last_beat < HOLD_TIMEOUT_S:
+                                    self.line_nowait(f"{p[1]} {FINE_JOG_STEPS}")
+                                continue
                     if p[0] == "STOP":
                         continue   # 이어서 오는 단독 "STOP"이 대기 중인 명령을 끝낸다
                 self.replies.put(line)
@@ -196,9 +218,16 @@ class Board:
         with self.lock:
             if not self.ser:
                 raise RuntimeError("보드가 연결되지 않았습니다")
+            if c in DIRECTIONS:
+                self.moving, self.last_beat = c, time.time()
+                self.line_nowait(f"{c} {FINE_JOG_STEPS}")
+                return
+            if c in ("X", "x"):
+                self.moving = None
             self.ser.write(c.encode("ascii"))
+            if c not in ("X", "x"):
+                self.revision += 1
         if c in ("X", "x"):
-            self.moving = None
             self.pulse_cancel.set()
         elif c in MOVES:
             self.moving, self.last_beat = c, time.time()
@@ -241,23 +270,30 @@ class Board:
 
     # ---- 줄 명령 (펌웨어가 스텝/ms를 세어 스스로 멈추고 DONE을 보냄) ----
     def line_nowait(self, cmd):
+        c, *rest = cmd.split()
         with self.lock:
             if not self.ser:
                 raise RuntimeError("보드가 연결되지 않았습니다")
+            if c in DIRECTIONS:
+                self.fine_stage.begin(c, int(rest[0]))
+            if c in self.servo_dir:
+                self.servo_dir[c] = 1 if int(rest[1]) >= 0 else -1
             self.ser.write(f"#{cmd}\n".encode("ascii"))
-        c, *rest = cmd.split()
-        if c == "M":
-            self.magnet = rest[0] == "1"
-        if c in self.servo_dir:
-            self.servo_dir[c] = 1 if int(rest[1]) >= 0 else -1
+            self.revision += 1
+            if c == "M":
+                self.magnet = rest[0] == "1"
         self._note(f"보냄 #{cmd}")
 
-    def wait_done(self, c, timeout, stop_evt=None):
+    def wait_done(self, c, timeout, stop_evt=None, amount=None):
+        def matches(reply):
+            fields = reply.split()
+            return len(fields) == 3 and fields[:2] == ["DONE", c] and (amount is None or fields[2] == str(amount))
+
         end = time.time() + timeout
         while time.time() < end:
             if stop_evt is not None and stop_evt.is_set():
                 raise InterruptedError("정지됨")
-            early = next((r for r in self.unmatched if r.startswith(f"DONE {c}")), None)
+            early = next((r for r in self.unmatched if matches(r)), None)
             if early:
                 self.unmatched.remove(early)
                 return early
@@ -265,7 +301,7 @@ class Board:
                 r = self.replies.get(timeout=0.1)
             except queue.Empty:
                 continue
-            if r.startswith(f"DONE {c}"):
+            if matches(r):
                 return r
             if r.startswith("DONE"):
                 self.unmatched.append(r)   # 동시에 돌던 다른 명령의 완료 (예: 레일 이동 중 서보 회전)
@@ -277,13 +313,31 @@ class Board:
         self.send("X")
         raise TimeoutError(f"{c}: {timeout:.0f}초 안에 DONE 없음 → 정지")
 
-    def line(self, cmd, timeout, stop_evt=None):
+    def clear_replies(self):
         # 이전 응답 찌꺼기는 버린다 (같은 글자의 옛 DONE을 새 완료로 착각하지 않게)
         self.unmatched.clear()
         while not self.replies.empty():
             self.replies.get_nowait()
-        self.line_nowait(cmd)
-        return self.wait_done(cmd.split()[0], timeout, stop_evt)
+
+    def line(self, cmd, timeout, stop_evt=None):
+        with self.lock:
+            if stop_evt is not None and stop_evt.is_set():
+                raise InterruptedError("정지됨")
+            self.clear_replies()
+            self.line_nowait(cmd)
+        c, amount, *_ = cmd.split()
+        return self.wait_done(c, timeout, stop_evt, amount)
+
+    def transfer_turn(self, rail, steps, ms, direction, stop_evt):
+        # Clear old replies once, before either command. A short rail can finish first.
+        with self.lock:
+            if stop_evt.is_set():
+                raise InterruptedError("정지됨")
+            self.clear_replies()
+            self.line_nowait(f"{rail} {steps}")
+            self.line_nowait(f"t {ms} {direction}")
+        self.wait_done("t", ms / 1000 + 5, stop_evt, ms)
+        self.wait_done(rail, steps / 10000 * 1.5 + 5, stop_evt, steps)
 
     def beat(self):
         self.last_beat = time.time()
@@ -326,32 +380,43 @@ class CameraCapture:
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, size[0])
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, size[1])
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        self.latest, self.latest_at, self.error = None, None, None
+        self.sample, self.error = None, None
         self.closed = threading.Event()
-        threading.Thread(target=self._read, daemon=True).start()
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
 
     def _read(self):
         while not self.closed.is_set():
             ok, bgr = self.cap.read()
             if ok:
-                self.latest, self.latest_at, self.error = bgr, time.monotonic(), None
+                self.sample, self.error = (time.monotonic(), bgr), None
             else:
                 self.error = "Camera read failed"
                 self.closed.wait(0.1)
 
+        self.cap.release()
+
     def close(self):
         self.closed.set()
-        self.cap.release()
+        self.reader.join(timeout=1)
 
 
 class Cameras:
     """카메라 3대 관찰용. 0.3초마다 화면을 JPEG로 내보낸다. 모터 제어와 무관."""
 
     def __init__(self):
+        self.indices, self.size = [], (320, 240)
         self.views = {}  # index -> dict(capture, error)
 
     def open(self, indices, size=(640, 480)):
+        size_unchanged = size == self.size
+        self.indices, self.size = indices, size
         for i in indices:
+            previous = self.views.get(i, {}).get("capture")
+            if size_unchanged and previous and previous.sample and time.monotonic() - previous.sample[0] < 1:
+                continue
+            if previous:
+                previous.close()
             try:
                 self.views[i] = dict(capture=CameraCapture(i, size), error=None)
             except Exception as e:
@@ -359,23 +424,35 @@ class Cameras:
 
     def state(self):
         out = []
-        for i, v in self.views.items():
+        for i, v in list(self.views.items()):
             cap = v["capture"]
-            frame = getattr(cap, "latest", None)
-            err = None if frame is not None else v["error"] or getattr(cap, "error", None)
-            age = None if frame is None else round(time.monotonic() - cap.latest_at, 1)
+            sample = cap.sample if cap else None
+            frame = sample[1] if sample else None
+            err = v["error"] or getattr(cap, "error", None)
+            age = None if sample is None else round(time.monotonic() - sample[0], 1)
             out.append({"index": i, "error": err, "age": age,
                         "size": None if frame is None else [frame.shape[1], frame.shape[0]]})
         return out
 
     def frame_bgr(self, i):
         cap = self.views.get(i, {}).get("capture")
-        return getattr(cap, "latest", None)
+        return cap.sample[1] if cap and cap.sample else None
+
+    def fresh_frames(self, indices):
+        # Both frames must arrive after pickup/the request. Never use the last image of a lost USB device.
+        started = time.monotonic()
+        while time.monotonic() - started < 1.5:
+            samples = [getattr(self.views.get(i, {}).get("capture"), "sample", None) for i in indices]
+            stamps = [s[0] for s in samples if s and s[0] >= started]
+            if len(stamps) == len(indices) and max(stamps) - min(stamps) <= 0.25:
+                return [s[1] for s in samples]
+            time.sleep(0.02)
+        raise ValueError(f"카메라 {indices}: 새 프레임이 필요합니다")
 
     def jpeg(self, i):
         cap = self.views.get(i, {}).get("capture")
-        frame = getattr(cap, "latest", None)
-        if frame is None:
+        frame = self.frame_bgr(i)
+        if frame is None or time.monotonic() - cap.sample[0] > 1:
             return None
         ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
         return buf.tobytes() if ok else None
@@ -389,6 +466,7 @@ class Cameras:
 BOARD = Board()
 CAMS = Cameras()
 SEQ = None
+OPERATION = threading.Lock()
 
 
 def seq():
@@ -426,7 +504,18 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/ports":
             self._json(ports())
         elif self.path == "/seq":
-            self._json({"plan": seq().plan(), **seq().state})
+            self._json({"plan": seq().plan(), **seq().state, "prepared": seq().prepared})
+        elif self.path == "/prealign/timing":
+            from quarter_turn import quarter_turn_ms, read_timing
+            from prealign_sequence import load
+            cfg = load()["prealign"]
+            ms = quarter_turn_ms(cfg)
+            measured = read_timing(cfg)
+            self._json({"quarter_turn_ms": ms, "directions": {d: {"ms": ms} for d in ("1", "-1")},
+                        "measured_directions": measured["directions"] if measured else None})
+        elif self.path == "/prealign/settings":
+            from prealign_sequence import load
+            self._json(load()["prealign"])
         elif self.path == "/cameras":
             self._json(CAMS.state())
         elif self.path.startswith("/cam/"):
@@ -445,8 +534,31 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
         data = json.loads(self.rfile.read(n) or b"{}")
+        emergency = self.path in ("/seq/stop", "/beat") or (self.path == "/cmd" and data.get("c") == "X")
+        acquired = False
         try:
-            if self.path == "/connect":
+            if not emergency:
+                acquired = OPERATION.acquire(blocking=False)
+                if not acquired or seq().state["running"] or BOARD.moving:
+                    raise RuntimeError("진행 중인 동작이 있습니다")
+            if self.path == "/prealign/measure":
+                from prealign_sequence import load
+                return self._json({"ok": True, **seq().measure_angle(load()["prealign"], preview=True)})
+            elif self.path == "/prealign/wafer":
+                from prealign_sequence import load
+                return self._json({"ok": True, **seq().vision.measure_wafer(CAMS, load()["prealign"])})
+            elif self.path == "/prealign/calibration":
+                from prealign_sequence import save_calibration
+                save_calibration(data)
+                seq().measured_settings = None
+            elif self.path == "/cameras/open":
+                width = data.get("width", CAMS.size[0])
+                sizes = {320: (320, 240), 640: (640, 480), 1280: (1280, 720)}
+                if width not in sizes:
+                    raise ValueError("지원하지 않는 카메라 해상도")
+                seq().measured_settings = None
+                CAMS.open(CAMS.indices, sizes[width])
+            elif self.path == "/connect":
                 BOARD.connect(data["port"])
             elif self.path == "/disconnect":
                 BOARD.disconnect()
@@ -454,7 +566,10 @@ class Handler(BaseHTTPRequestHandler):
                 c = data["c"]
                 if c not in MOVES | ONESHOT:
                     raise ValueError(f"알 수 없는 명령 {c!r}")
-                BOARD.send(c)
+                if c == "X" and seq().state["running"]:
+                    seq().stop()
+                else:
+                    BOARD.send(c)
             elif self.path == "/pulse":
                 return self._json({"ok": True, **BOARD.pulse(data["c"], int(data["ms"]))})
             elif self.path == "/seq/start":
@@ -465,6 +580,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True})
             elif self.path == "/ledger/reset":
                 BOARD.ledger.reset()
+            elif self.path == "/fine/teach":
+                if not BOARD.port:
+                    raise RuntimeError("보드를 연결하세요")
+                BOARD.fine_stage.teach()
             elif self.path == "/ledger/mark":
                 # 지금 위치를 기준점으로 기억: align_left(정밀 X 왼쪽 끝) 또는 box_x(X 레일 박스 끝)
                 key = data["key"]
@@ -496,11 +615,15 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, **BOARD.status()})
         except Exception as e:
             self._json({"ok": False, "error": str(e)}, 400)
+        finally:
+            if acquired:
+                OPERATION.release()
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", help="시리얼 포트 (기본: 자동)")
+    ap.add_argument("--standby", action="store_true", help="포트와 카메라는 패널에서 연결")
     ap.add_argument("--mock", action="store_true", help="보드 없이 가상 포트로 실행")
     ap.add_argument("--http", type=int, default=8790)
     ap.add_argument("--no-browser", action="store_true")
@@ -509,14 +632,16 @@ def main():
     # 카메라 3대가 USB 2.0 허브 하나를 같이 쓰면 640×480 무압축은 대역폭을 넘어 1대가 영상을 못 받는다.
     ap.add_argument("--camera-size", type=int, nargs=2, default=[320, 240], metavar=("W", "H"))
     a = ap.parse_args()
+    seq()
     threading.Thread(target=BOARD.watchdog, daemon=True).start()
     target = "mock" if a.mock else a.port or next((p["device"] for p in ports() if p["arduino"]), None)
-    if target:
+    if target and not a.standby:
         try:
             BOARD.connect(target)
         except Exception as e:
             print("연결 실패:", e)
-    if a.cameras:
+    CAMS.indices, CAMS.size = a.cameras, tuple(a.camera_size)
+    if a.cameras and not a.standby:
         print("카메라 여는 중:", a.cameras)
         CAMS.open(a.cameras, tuple(a.camera_size))  # macOS 카메라 권한 요청은 메인 스레드에서만 동작
         for c in CAMS.state():

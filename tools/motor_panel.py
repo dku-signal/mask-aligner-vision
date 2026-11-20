@@ -462,6 +462,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True})
             elif self.path == "/ledger/reset":
                 BOARD.ledger.reset()
+            elif self.path == "/ledger/mark":
+                # 지금 위치를 기준점으로 기억: align_left(정밀 X 왼쪽 끝) 또는 box_x(X 레일 박스 끝)
+                key = data["key"]
+                axis = {"align_left": "align_x", "box_x": "x_rail"}[key]
+                BOARD.ledger.snapshot(key, BOARD.ledger.d["pos"][axis])
             elif self.path == "/turn":
                 c, ms, d = data["c"], int(data["ms"]), int(data["dir"])
                 if c not in ("t", "A") or not 20 <= ms <= 20000:

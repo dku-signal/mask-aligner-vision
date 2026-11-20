@@ -67,6 +67,7 @@
     <p>장부에 적힌 만큼 되돌립니다: Y 빼기 → 프리얼라인·정밀 θ 서보를 돈 만큼 반대로 → 정밀 스테이지 처음 위치 → X 레일 박스 위치 → Z 맨 아래.
        <b>장부에는 자동 시퀀스·정확한 이동·아래 회전 버튼으로 움직인 것만 기록됩니다</b> (누르는 동안 움직이는 수동 버튼은 기록 안 됨).</p>
     <div class="row"><button class="tog" id="restoreBtn">↩ 원상 복구</button><button class="tog" id="ledgerReset">지금 위치를 기준(0)으로</button></div>
+    <div class="row"><button class="tog" id="markLeft">지금 정밀 X = 왼쪽 끝으로 기억</button><button class="tog" id="markBox">지금 X 레일 = 박스 끝으로 기억</button></div>
     <pre id="ledger"></pre>
     <div class="row"><span class="lbl">회전</span>
       <select id="trC" style="flex:1;padding:10px;font:inherit;border-radius:8px;border:1px solid var(--line);background:var(--btn);color:var(--ink)"><option value="A">정밀 θ (D5)</option><option value="t">프리얼라인 (D8)</option></select>
@@ -244,6 +245,8 @@ async function seqPoll() {
 $('#seqAll').onclick = () => { if (confirm('전체 시퀀스를 실행합니다. 장비 주변을 비우고 SMPS 전원을 확인하세요.')) post('/seq/start', {}); };
 $('#seqStop').onclick = () => post('/seq/stop', {});
 $('#restoreBtn').onclick = () => { if (confirm('원상 복구를 실행합니다. 장부대로 레일·서보·Z를 되돌립니다.')) post('/seq/restore', {}); };
+$('#markLeft').onclick = () => post('/ledger/mark', {key: 'align_left'});
+$('#markBox').onclick = () => post('/ledger/mark', {key: 'box_x'});
 $('#ledgerReset').onclick = () => { if (confirm('지금 위치를 기준(0)으로 삼고 장부를 비웁니다.')) post('/ledger/reset', {}); };
 ['#trP', '#trM'].forEach(id => $(id).onclick = () => post('/turn', {c: $('#trC').value, ms: Number($('#trMs').value), dir: Number($(id).dataset.dir)}));
 $('#lnGo').onclick = async () => {

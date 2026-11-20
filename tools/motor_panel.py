@@ -178,8 +178,11 @@ class Board:
             self.lines.append(line)
             if line.split()[0] in ("DONE", "ERR", "STOP", "PONG"):
                 p = line.split()
-                if p[0] == "DONE" and len(p) == 3 and p[1] != "M":
+                if p[0] in ("DONE", "STOP") and len(p) == 3 and p[1] != "M":
+                    # DONE = 끝까지 감, STOP <c> <n> = 중간 정지 시 실제로 간 양 → 둘 다 장부에 반영
                     self.ledger.apply(p[1], int(p[2]), self.servo_dir.get(p[1], 1))
+                    if p[0] == "STOP":
+                        continue   # 이어서 오는 단독 "STOP"이 대기 중인 명령을 끝낸다
                 self.replies.put(line)
                 continue
             try:

@@ -28,7 +28,8 @@
 //   #A <ms> <+1|-1>                  precision theta continuous servo (D5) timed turn -> "DONE A <ms>"
 //   #M <0|1>                         magnet off/on (absolute) -> "DONE M <0|1>"
 //   #PING                            -> "PONG"
-// X/x also cancels a pending line command and replies "STOP".
+// X/x also cancels a pending line command and replies "STOP". If a rail or servo was stopped
+// part-way it first reports how far it actually went: "STOP <c> <steps|ms>" (for the PC ledger).
 // Four STEP/DIR rails share one pulse generator: one rail moves at a time.
 // Z axes operate independently. No limit switches or automatic travel stop.
 // ADS1115 laser measurement and calibration retained from supplied sketch.
@@ -474,10 +475,21 @@ void moveZ(byte in1Pin, byte in2Pin, bool upward) {
 
 void stopAllMotion() {
   bool pending = railCmd || dcCmd || servoTurning || thetaTurning;
+  // 중간 정지 시 실제로 간 양을 알려 PC 장부가 어긋나지 않게 한다: "STOP <c> <n>"
+  long railDoneSteps = 0;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    if (railCmd && stepsLeft > 0) railDoneSteps = railTotal - stepsLeft;
+  }
+  char stoppedRail = railCmd;
+  unsigned long servoDoneMs = servoTurning ? millis() - servoStart : 0;
+  unsigned long thetaDoneMs = thetaTurning ? millis() - thetaStart : 0;
   if (thetaTurning) { thetaServo.write(SERVO_STOP); thetaTurning = false; }
   stopRails();
   stepsLeft = -1; railDone = false; railCmd = 0; dcCmd = 0;
   if (servoTurning) { prealignServo.write(SERVO_STOP); servoTurning = false; }
+  if (stoppedRail && railDoneSteps > 0) { Serial.print(F("STOP ")); Serial.print(stoppedRail); Serial.print(' '); Serial.println(railDoneSteps); }
+  if (servoDoneMs) { Serial.print(F("STOP t ")); Serial.println(servoDoneMs); }
+  if (thetaDoneMs) { Serial.print(F("STOP A ")); Serial.println(thetaDoneMs); }
   if (pending) Serial.println(F("STOP"));
 
   stopZ(Z1_IN1_PIN, Z1_IN2_PIN);

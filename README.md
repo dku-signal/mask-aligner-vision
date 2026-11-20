@@ -192,7 +192,12 @@ python preflight.py
 python mask_aligner_optimized_v4.py --camera auto --detector opencv
 ```
 
-**YOLO + SAM2 실험 경로**는 추가 의존성과 키 학습 가중치가 필요합니다. [설치·학습·실행 방법](docs/model-pipeline.md)을 먼저 확인하세요. 기존 가중치 경로는 `runs/keys/weights/best.pt`이며 가중치를 저장소에 포함하지 않습니다.
+**YOLO + SAM2 실험 경로**는 추가 의존성과 키 학습 가중치가 필요합니다. [설치·학습·실행 방법](docs/model-pipeline.md)을 먼저 확인하세요. 실장비 파인튜닝 가중치는 저장소에 커밋하지 않고 [Release `weights-v1`](https://github.com/dku-signal/mask-aligner-vision/releases/tag/weights-v1)에 올려 두었습니다. `runs/keys_real/weights/best.pt`에 두면 `--detector yolo-2pair`가 자동으로 사용합니다.
+
+```bash
+mkdir -p runs/keys_real/weights
+gh release download weights-v1 -R dku-signal/mask-aligner-vision -p keys_real_best.pt -O runs/keys_real/weights/best.pt
+```
 
 실제 장비의 설치, 교정, θ 제외 실행, 포트 충돌과 종료 절차는 [팀 실행 가이드](docs/team-guide.md)에 정리했습니다.
 

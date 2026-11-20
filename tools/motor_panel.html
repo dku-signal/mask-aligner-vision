@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>모터 조작 패널</title>
+<style>
+  :root { --bg:#f4f5f7; --card:#fff; --ink:#1d2330; --mute:#6b7280; --line:#dde1e7;
+          --btn:#eef1f5; --btnon:#2563eb; --stop:#dc2626; --ok:#16a34a; --warn:#d97706; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14171c; --card:#1d2128; --ink:#e7eaf0; --mute:#9aa3b2; --line:#2e343e;
+            --btn:#2a3039; --btnon:#3b82f6; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.4 -apple-system, "Apple SD Gothic Neo", sans-serif; background:var(--bg); color:var(--ink); }
+  header { display:flex; flex-wrap:wrap; gap:10px; align-items:center; padding:12px 16px; border-bottom:1px solid var(--line); background:var(--card); position:sticky; top:0; z-index:2; }
+  header h1 { font-size:17px; margin:0 12px 0 0; }
+  select, header button { font:inherit; padding:6px 10px; border-radius:8px; border:1px solid var(--line); background:var(--btn); color:var(--ink); }
+  .pill { padding:4px 10px; border-radius:99px; font-size:13px; background:var(--btn); }
+  .pill.ok { background:var(--ok); color:#fff; } .pill.bad { background:var(--stop); color:#fff; }
+  main { max-width:1100px; margin:0 auto; padding:16px; display:grid; gap:14px; grid-template-columns:repeat(auto-fit, minmax(250px, 1fr)); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; }
+  .card h2 { font-size:15px; margin:0 0 4px; } .card p { margin:0 0 10px; color:var(--mute); font-size:12.5px; }
+  .row { display:flex; gap:8px; align-items:center; margin:6px 0; }
+  .row .lbl { width:62px; font-weight:600; font-size:13.5px; }
+  .hold, .tog, .pul { flex:1; padding:14px 6px; font:inherit; font-weight:600; border:1px solid var(--line); border-radius:10px; background:var(--btn); color:var(--ink); cursor:pointer; user-select:none; touch-action:none; }
+  .hold.on, .tog.on, .pul.on { background:var(--btnon); color:#fff; border-color:var(--btnon); }
+  .hold small { display:block; font-weight:400; opacity:.7; font-size:11px; }
+  #stop { grid-column:1/-1; padding:18px; font-size:20px; font-weight:800; color:#fff; background:var(--stop); border:0; border-radius:14px; cursor:pointer; }
+  .sensor { font-size:34px; font-weight:700; font-variant-numeric:tabular-nums; }
+  .warn { color:var(--warn); font-size:13px; }
+  .cams { display:grid; gap:10px; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); }
+  .cam { border:1px solid var(--line); border-radius:10px; overflow:hidden; background:#000; }
+  .cam img { display:block; width:100%; aspect-ratio:4/3; object-fit:contain; }
+  .cam div { padding:6px 8px; font-size:12.5px; background:var(--card); color:var(--mute); }
+  pre { margin:0; font-size:12px; color:var(--mute); white-space:pre-wrap; max-height:150px; overflow:auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>모터 조작 패널 · MEGA_PREVIOUS</h1>
+  <select id="port"></select>
+  <button id="connect">연결</button>
+  <button id="disc">해제</button>
+  <span id="conn" class="pill bad">연결 안 됨</span>
+  <span id="mv" class="pill">정지</span>
+</header>
+<main>
+  <section class="card" style="grid-column:1/-1">
+    <h2>카메라</h2>
+    <p>관찰용 화면(0.3초 갱신). 번호는 연결 순서에 따라 바뀔 수 있으니 화면을 보고 역할을 확인하세요.</p>
+    <div id="cams" class="cams"></div>
+  </section>
+
+  <button id="stop">■ 전체 정지 (Space / Esc)</button>
+
+  <section class="card" style="grid-column:1/-1">
+    <h2>자동 시퀀스 · 웨이퍼 이송 + 프리얼라인 (화이트보드 14단계)</h2>
+    <p>보드가 스텝/ms를 직접 세어 멈춥니다(펌웨어 줄 명령). 각 단계는 끝나면 다음으로 넘어갑니다. 정지 버튼/Space로 즉시 중단.</p>
+    <div class="row"><button class="tog" id="seqAll">▶ 전체 실행</button><button class="tog" id="seqStop">■ 시퀀스 정지</button></div>
+    <table id="seqTable" style="width:100%;border-collapse:collapse;font-size:13px"></table>
+    <pre id="seqLog" style="margin-top:8px"></pre>
+  </section>
+
+  <section class="card" style="grid-column:1/-1">
+    <h2>원상 복구 (얼라인 끝난 뒤)</h2>
+    <p>장부에 적힌 만큼 되돌립니다: Y 빼기 → 프리얼라인·정밀 θ 서보를 돈 만큼 반대로 → 정밀 스테이지 처음 위치 → X 레일 박스 위치 → Z 맨 아래.
+       <b>장부에는 자동 시퀀스·정확한 이동·아래 회전 버튼으로 움직인 것만 기록됩니다</b> (누르는 동안 움직이는 수동 버튼은 기록 안 됨).</p>
+    <div class="row"><button class="tog" id="restoreBtn">↩ 원상 복구</button><button class="tog" id="ledgerReset">지금 위치를 기준(0)으로</button></div>
+    <pre id="ledger"></pre>
+    <div class="row"><span class="lbl">회전</span>
+      <select id="trC" style="flex:1;padding:10px;font:inherit;border-radius:8px;border:1px solid var(--line);background:var(--btn);color:var(--ink)"><option value="A">정밀 θ (D5)</option><option value="t">프리얼라인 (D8)</option></select>
+      <input id="trMs" type="number" value="300" min="20" max="20000" step="50" style="flex:1;padding:10px;font:inherit;border-radius:8px;border:1px solid var(--line);background:var(--btn);color:var(--ink)"> <span>ms</span>
+      <button class="tog" data-dir="1" id="trP">+ 방향</button><button class="tog" data-dir="-1" id="trM">− 방향</button></div>
+  </section>
+
+  <section class="card" style="grid-column:1/-1">
+    <h2>정확한 이동 (스텝 / ms 지정)</h2>
+    <p>레일(F·B·f·b·Q·W·E·R·J·H)은 스텝, DC(u·d·O·P·K·L)는 ms. 보드가 세어서 멈추고 DONE을 보냅니다. 레일은 1초에 약 10,000스텝.</p>
+    <div class="row"><select id="lnC" style="flex:1;padding:10px;font:inherit;border-radius:8px;border:1px solid var(--line);background:var(--btn);color:var(--ink)">
+      <option>Q</option><option>W</option><option>E</option><option>R</option><option>F</option><option>B</option><option>f</option><option>b</option><option>J</option><option>H</option>
+      <option>P</option><option>O</option><option>L</option><option>K</option><option>u</option><option>d</option></select>
+      <input id="lnN" type="number" value="1000" min="1" style="flex:2;padding:10px;font:inherit;border-radius:8px;border:1px solid var(--line);background:var(--btn);color:var(--ink)">
+      <button class="tog" id="lnGo">이동</button></div>
+    <pre id="lnOut"></pre>
+  </section>
+
+  <section class="card" style="grid-column:1/-1">
+    <h2>시간 측정 (DC 축 하드코딩 값)</h2>
+    <p>명령을 정해진 시간만 보낸 뒤 자동으로 멈춥니다. 정지 버튼 / Space 로 언제든 중단됩니다. 결과를 보고 시간을 조금씩 바꿔 가며 맞추세요.</p>
+    <div class="row"><span class="lbl">시간</span><input id="pms" type="number" value="500" min="20" max="15000" step="50" style="flex:1;padding:10px;font:inherit;border-radius:8px;border:1px solid var(--line);background:var(--btn);color:var(--ink)"> <span>ms</span></div>
+    <div class="row"><span class="lbl">Z</span><button class="pul" data-c="P">P 올리기</button><button class="pul" data-c="O">O 내리기</button></div>
+    <div class="row"><span class="lbl">Y 리니어</span><button class="pul" data-c="L">L 넣기</button><button class="pul" data-c="K">K 빼기</button></div>
+    <div class="row"><span class="lbl">기존 Z</span><button class="pul" data-c="u">u ↑</button><button class="pul" data-c="d">d ↓</button></div>
+    <pre id="pulses"></pre>
+  </section>
+
+  <section class="card">
+    <h2>정렬 스테이지 X · Y</h2>
+    <p>누르고 있는 동안만 움직입니다. 스텝 수 지정 없음, 리밋 스위치 없음.</p>
+    <div class="row"><span class="lbl">X</span><button class="hold" data-c="F">F<small>DIR LOW</small></button><button class="hold" data-c="B">B<small>DIR HIGH</small></button></div>
+    <div class="row"><span class="lbl">Y</span><button class="hold" data-c="f">f<small>DIR LOW</small></button><button class="hold" data-c="b">b<small>DIR HIGH</small></button></div>
+  </section>
+
+  <section class="card">
+    <h2>이송 레일</h2>
+    <p>이송부는 양쪽 모터를 같이 움직이는 <b>1+2 동시</b>를 쓰세요. 한쪽만 움직이는 개별 버튼은 아래에 있습니다.</p>
+    <div class="row"><span class="lbl">1+2 동시</span><button class="hold" data-c="J">J<small>DIR LOW</small></button><button class="hold" data-c="H">H<small>DIR HIGH</small></button></div>
+    <div class="row"><span class="lbl">레일 1</span><button class="hold" data-c="Q">Q<small>DIR LOW</small></button><button class="hold" data-c="W">W<small>DIR HIGH</small></button></div>
+    <div class="row"><span class="lbl">레일 2</span><button class="hold" data-c="E">E<small>DIR LOW</small></button><button class="hold" data-c="R">R<small>DIR HIGH</small></button></div>
+  </section>
+
+  <section class="card">
+    <h2>Z 축 (DC 모터)</h2>
+    <p>↑ = IN1 HIGH, ↓ = IN2 HIGH. 실제 위/아래 방향은 배선에 따라 다를 수 있음.</p>
+    <div class="row"><span class="lbl">Z1</span><button class="hold" data-c="u">↑ u</button><button class="hold" data-c="d">↓ d</button></div>
+    <div class="row"><span class="lbl">Z2</span><button class="hold" data-c="O">↑ O</button><button class="hold" data-c="P">↓ P</button></div>
+    <div class="row"><span class="lbl">Z3</span><button class="hold" data-c="K">↑ K</button><button class="hold" data-c="L">↓ L</button></div>
+  </section>
+
+  <section class="card">
+    <h2>레이저 변위 (Z 간격)</h2>
+    <p>보드가 0.2초마다 보내는 값 (mm)</p>
+    <div class="sensor" id="sensor">–</div>
+    <div class="warn" id="sensorNote"></div>
+  </section>
+
+  <section class="card">
+    <h2>θ 서보 · 전자석</h2>
+    <p>연속회전 서보: 90 = 정지, 0 = 한 방향 최고속 회전. 부팅 시 둘 다 정지(90). 전체 정지 버튼은 서보를 멈추지 않으니 T 또는 t로 멈추세요.</p>
+    <div class="row"><span class="lbl">θ (D5)</span><button class="tog" data-c="G" id="th0">회전 (G · 0)</button><button class="tog" data-c="T" id="th90">정지 (T · 90)</button></div>
+    <div class="row"><span class="lbl">프리얼라인 (D8)</span><button class="tog" data-c="t" id="pre">정지 ↔ 회전 (t)</button></div>
+    <div class="row"><span class="lbl">전자석 (D11)</span><button class="tog" data-c="M" id="mag">OFF (M)</button></div>
+  </section>
+
+  <section class="card">
+    <h2>기록</h2>
+    <pre id="log"></pre>
+    <p style="margin-top:8px">보드 원문</p>
+    <pre id="raw"></pre>
+  </section>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+let holding = null, beatTimer = null, lastErr = '';
+
+async function post(path, body) {
+  const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body||{})});
+  const j = await r.json();
+  if (!j.ok) { lastErr = j.error; alert(j.error); }
+  return j;
+}
+function stopAll() {
+  release();
+  post('/seq/stop', {});
+  post('/cmd', {c:'X'});
+}
+function press(btn) {
+  if (holding) release();
+  holding = btn; btn.classList.add('on');
+  post('/cmd', {c:btn.dataset.c});
+  beatTimer = setInterval(() => post('/beat'), 150);
+}
+function release() {
+  if (!holding) return;
+  holding.classList.remove('on'); holding = null;
+  clearInterval(beatTimer); beatTimer = null;
+  post('/cmd', {c:'X'});
+}
+document.querySelectorAll('.hold').forEach(b => {
+  b.addEventListener('pointerdown', e => { e.preventDefault(); b.setPointerCapture(e.pointerId); press(b); });
+  ['pointerup','pointercancel','lostpointercapture'].forEach(ev => b.addEventListener(ev, release));
+});
+document.querySelectorAll('.tog').forEach(b => b.addEventListener('click', () => post('/cmd', {c:b.dataset.c})));
+$('#stop').addEventListener('click', stopAll);
+document.querySelectorAll('.pul').forEach(b => b.addEventListener('click', async () => {
+  if (document.querySelector('.pul.on')) return;
+  b.classList.add('on');
+  try { await post('/pulse', {c:b.dataset.c, ms:Number($('#pms').value)}); } finally { b.classList.remove('on'); }
+}));
+window.addEventListener('blur', release);
+document.addEventListener('visibilitychange', () => document.hidden && release());
+window.addEventListener('keydown', e => { if (e.code === 'Space' || e.code === 'Escape') { e.preventDefault(); stopAll(); } });
+
+async function loadPorts() {
+  const ps = await (await fetch('/ports')).json();
+  $('#port').innerHTML = ps.map(p => `<option value="${p.device}">${p.arduino ? '★ ' : ''}${p.device} — ${p.desc}</option>`).join('');
+}
+$('#connect').onclick = async () => { $('#conn').textContent = '연결 중… (보드 리셋 2초)'; await post('/connect', {port:$('#port').value}); };
+$('#disc').onclick = () => post('/disconnect');
+
+async function poll() {
+  try {
+    const s = await (await fetch('/status')).json();
+    $('#conn').textContent = s.port ? `연결됨 ${s.port}` : '연결 안 됨';
+    $('#conn').className = 'pill ' + (s.port ? 'ok' : 'bad');
+    $('#mv').textContent = s.moving ? `움직이는 중: ${s.moving}` : '정지';
+    $('#mv').className = 'pill ' + (s.moving ? 'bad' : '');
+    $('#sensor').textContent = s.sensor === null ? '–' : (typeof s.sensor === 'number' ? s.sensor.toFixed(2) + ' mm' : s.sensor);
+    $('#sensorNote').textContent = s.sensor === 'ADS_ERROR' ? 'ADS1115 응답 없음 (센서 배선/전원 확인)' : s.sensor === 'ERR' ? '측정 범위 밖' : (s.sensor_age > 2 ? `${s.sensor_age}초 전 값` : '');
+    $('#th0').classList.toggle('on', s.theta === '0°'); $('#th90').classList.toggle('on', s.theta === '90°');
+    $('#pre').textContent = s.prealign === '90°' ? '정지 중 · 누르면 회전 (t)' : '회전 중 · 누르면 정지 (t)'; $('#pre').classList.toggle('on', s.prealign === '90°');
+    $('#mag').textContent = s.magnet ? 'ON (M)' : 'OFF (M)'; $('#mag').classList.toggle('on', s.magnet);
+    $('#pulses').textContent = (s.pulses||[]).map(p => `${p.at}  ${p.c}  ${p.ms} ms (실제 ${p.actual_ms})${p.cancelled ? '  중단' : ''}`).join('\n'); $('#log').textContent = s.log.join('\n'); $('#raw').textContent = s.raw.join('\n');
+  } catch (e) { $('#conn').textContent = '패널 서버 꺼짐'; $('#conn').className = 'pill bad'; }
+}
+async function cams() {
+  const cs = await (await fetch('/cameras')).json();
+  const box = $('#cams');
+  if (!cs.length) { box.textContent = '카메라를 여는 중이거나 사용하지 않도록 실행했습니다.'; return; }
+  cs.forEach(c => {
+    let el = document.getElementById('cam' + c.index);
+    if (!el) {
+      el = document.createElement('div'); el.className = 'cam'; el.id = 'cam' + c.index;
+      el.innerHTML = `<img alt="카메라 ${c.index}"><div></div>`; box.appendChild(el);
+    }
+    if (!c.error && c.age !== null) el.querySelector('img').src = `/cam/${c.index}.jpg?t=${Date.now()}`;
+    el.querySelector('div').textContent = `카메라 ${c.index} · ` +
+      (c.error ? `오류: ${c.error}` : c.age === null ? '대기 중' : `${c.size[0]}×${c.size[1]} · ${c.age > 2 ? c.age + '초 멈춤' : '실시간'}`);
+  });
+}
+let seqPlanDrawn = false;
+async function seqPoll() {
+  const s = await (await fetch('/seq')).json();
+  const t = $('#seqTable');
+  if (!seqPlanDrawn) {
+    t.innerHTML = '<tr><th style="text-align:left">단계</th><th style="text-align:left">동작</th><th style="text-align:left">명령</th><th>예상</th><th></th></tr>' +
+      s.plan.map(p => `<tr id="seq-${String(p.no).replace('.','_')}" style="border-top:1px solid var(--line)"><td>${p.no}</td><td>${p.title}${p.prealign?' 🔄':''}</td><td><code>${p.cmds.join(', ')}</code></td><td style="text-align:right">${p.seconds}s</td><td><button class="tog seqOne" data-no="${p.no}" style="padding:6px 10px">이 단계만</button></td></tr>`).join('');
+    document.querySelectorAll('.seqOne').forEach(b => b.onclick = () => post('/seq/start', {only: Number(b.dataset.no)}));
+    seqPlanDrawn = true;
+  }
+  s.plan.forEach(p => {
+    const r = document.getElementById('seq-' + String(p.no).replace('.','_'));
+    r.style.background = s.current === p.no ? 'rgba(37,99,235,.18)' : s.done.includes(p.no) ? 'rgba(22,163,74,.12)' : '';
+  });
+  $('#seqAll').classList.toggle('on', s.running);
+  const st = await (await fetch('/status')).json(), L = st.ledger;
+  if (L) $('#ledger').textContent =
+    `레일 위치(스텝): X레일 ${L.pos.x_rail} · Y레일 ${L.pos.y_rail} · 정밀X ${L.pos.align_x} · 정밀Y ${L.pos.align_y}\n` +
+    `회전 누적(ms, +/−=방향): 프리얼라인 ${L.servo_ms.t} · 정밀 θ ${L.servo_ms.A}\n` +
+    `기준: 시작 ${L.home ? JSON.stringify(L.home) : '0'} · 박스 X ${L.box_x ?? '(1단계 후 기록)'}`;
+  $('#seqLog').textContent = (s.error ? '⚠ ' + s.error + '\n' : '') + s.log.slice(0, 14).join('\n');
+}
+$('#seqAll').onclick = () => { if (confirm('전체 시퀀스를 실행합니다. 장비 주변을 비우고 SMPS 전원을 확인하세요.')) post('/seq/start', {}); };
+$('#seqStop').onclick = () => post('/seq/stop', {});
+$('#restoreBtn').onclick = () => { if (confirm('원상 복구를 실행합니다. 장부대로 레일·서보·Z를 되돌립니다.')) post('/seq/restore', {}); };
+$('#ledgerReset').onclick = () => { if (confirm('지금 위치를 기준(0)으로 삼고 장부를 비웁니다.')) post('/ledger/reset', {}); };
+['#trP', '#trM'].forEach(id => $(id).onclick = () => post('/turn', {c: $('#trC').value, ms: Number($('#trMs').value), dir: Number($(id).dataset.dir)}));
+$('#lnGo').onclick = async () => {
+  $('#lnOut').textContent = '이동 중…';
+  const j = await post('/line', {c: $('#lnC').value, n: Number($('#lnN').value)});
+  $('#lnOut').textContent = j.ok ? '완료: ' + j.reply : '실패: ' + j.error;
+};
+loadPorts(); poll(); cams(); seqPoll(); setInterval(poll, 300); setInterval(cams, 300); setInterval(seqPoll, 500);
+</script>
+</body>
+</html>

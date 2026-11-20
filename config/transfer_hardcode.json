@@ -1,0 +1,96 @@
+{
+  "_note": "웨이퍼 이송 하드코딩 값 (2026-11-18 실장비 측정). 펌웨어: firmware/mega_previous, 레일 약 10,000 스텝/초",
+  "z_bottom": {
+    "cmd": "O",
+    "ms": 5000,
+    "why": "Z를 맨 아래(0)로"
+  },
+  "y_linear_retract": {
+    "cmd": "K",
+    "ms": 10000,
+    "why": "Y 리니어 끝까지 빼기 (2026-11-20)"
+  },
+  "y_linear_extend_max": {
+    "cmd": "L",
+    "ms": 10000,
+    "why": "Y 리니어 최대로 넣기 (2026-11-20 확인, K 10000으로 먼저 끝까지 뺀 뒤)"
+  },
+  "z_pickup": {
+    "cmd": "P",
+    "ms": 900,
+    "why": "맨 아래에서 올려 웨이퍼가 전자석에 붙는 높이",
+    "verified": "1회 (15:07:44)"
+  },
+  "x_rail_to_foup": {
+    "cmd": "Q",
+    "ms": 24300,
+    "approx_steps": 243000,
+    "why": "X 레일 FOUP 앞까지 (오늘 출발점 기준, 기준점 미정)"
+  },
+  "y_rail_to_box": {
+    "cmd": "E",
+    "ms": 9500,
+    "approx_steps": 95000,
+    "why": "Y 레일 박스 끝까지 (출발점 기준)"
+  },
+  "directions": {
+    "P": "Z up",
+    "O": "Z down",
+    "L": "Y linear extend into box",
+    "K": "Y linear retract",
+    "Q": "X rail toward FOUP",
+    "W": "X rail toward stage",
+    "E": "Y rail toward box",
+    "R": "Y rail away from box",
+    "F": "align stage X right",
+    "B": "align stage X left"
+  },
+  "x_rail_foup_to_stage_end": {
+    "cmd": "W",
+    "ms": 28000,
+    "approx_steps": 280000,
+    "why": "FOUP 앞 -> 정밀 스테이지 쪽 끝"
+  },
+  "z_clear_after_pickup": {
+    "cmd": "P",
+    "ms": 200,
+    "why": "잡은 뒤 슬롯에서 띄우는 추가 상승 (누적 1100ms)"
+  },
+  "align_stage_x_receive": {
+    "cmd": "F",
+    "ms": 3200,
+    "approx_steps": 32000,
+    "why": "정밀 얼라인 스테이지 X를 오늘 처음 위치에서 오른쪽(F)으로 옮겨 웨이퍼 받을 자리에 맞춤",
+    "note": "F = 오른쪽, B = 왼쪽 (2026-11-18 확인). 기준점이 리밋 없이 '오늘 처음 위치'라 원점 정의 필요"
+  },
+  "z_lift_at_stage_before_retract": {
+    "cmd": "P",
+    "ms": 700,
+    "why": "스테이지 쪽에서 Y 빼기 전 걸리지 않게 Z 올리기 (100+100+300+200)"
+  },
+  "z_insert_to_stage": {
+    "cmd": "P",
+    "ms": 1200,
+    "from": "bottom",
+    "why": "스테이지 쪽으로 Y 넣기 전 Z 높이 (맨 아래 기준)"
+  },
+  "z_at_stage_after_insert": {
+    "cmd": "P",
+    "ms": 1000,
+    "from": "z_insert_to_stage",
+    "total_from_bottom_ms": 2200,
+    "why": "Y 넣은 뒤 스테이지 위 높이로 더 올림 (100+400+500)"
+  },
+  "z_up_for_stage_insert": {
+    "cmd": "P",
+    "ms": 5000,
+    "from": "bottom",
+    "why": "스테이지로 넣기 전 Z를 맨 아래에서 올리는 시간 (500+1500+2000+1000, 사용자 OK)"
+  },
+  "z_lower_to_stage": {
+    "cmd": "O",
+    "ms": 3000,
+    "from": "z_up_for_stage_insert (5000 from bottom)",
+    "why": "스테이지 위에서 Z를 내려 웨이퍼 전달 (500+2500, 전자석 ON 상태)"
+  }
+}

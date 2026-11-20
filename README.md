@@ -207,6 +207,10 @@ python mask_aligner_optimized_v4.py --camera auto --detector opencv
 | [`preflight.py`](preflight.py) | 실행 전 카메라·통신·키 인식 점검 |
 | [`firmware/xy_tb6560/xy_tb6560.ino`](firmware/xy_tb6560/xy_tb6560.ino) | Mega의 유한 펄스 이동과 θ 제어 |
 | [`tools/sim_rig.py`](tools/sim_rig.py) | 가상 장비로 제어 흐름 확인 |
+| [`tools/motor_panel.py`](tools/motor_panel.py) | 이송·프리얼라인 웹 패널: 수동 조작, 정확한 이동, 자동 시퀀스(화이트보드 14단계), 원상 복구 |
+| [`config/prealign_sequence.json`](config/prealign_sequence.json) | 자동 시퀀스 단계·값 (하드코딩 값은 여기서 수정) |
+| [`notch.py`](notch.py) | 웨이퍼 노치 각도 측정, 프리얼라인 회전량 계산 |
+| [`docs/handover-2026-11-20.md`](docs/handover-2026-11-20.md) | **인계 자료**: 구조, 핀, 명령, 시퀀스, 측정 기록, 문제 해결, 남은 과제 |
 | [`tools/test_detectors.py`](tools/test_detectors.py) | 같은 영상에서 검출기 비교 |
 | [`tools/bench_precision.py`](tools/bench_precision.py) | 합성 정답을 이용한 측정 오차 비교 |
 

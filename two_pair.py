@@ -50,7 +50,7 @@ SQUARE_CONTRAST = 0.12
 SQUARE_STEP = 8
 FIT_MAX_RMS = 0.12  # square widths: a worse two-key fit (squares merged with cross arms) is no mask
 SEED_SIZE = 25     # px square side to search with before any square was measured (1080p camera 0)
-SEED_PEAKS = 30    # clearest shape peaks tried as one edge of a key when YOLO finds no square
+SEED_PEAKS = 300   # clearest shape peaks searched for the key pattern when YOLO finds no square
 FIT_RMS_SLACK = 0.3  # px: a fresh full mask replaces the held one unless its fit is clearly worse
 
 
@@ -313,37 +313,53 @@ class TwoPairKeys:
         return model[:4], model[4:], rms
 
     def seed_squares(self, gray):
-        """Square boxes of one 2x2 key found by shape alone, for frames where YOLO finds none.
+        """Square boxes of the mask found by shape alone, for frames where YOLO finds no square.
 
-        Over the black stage YOLO may miss every square; then an edge of two of the clearest contrast
-        peaks over the whole frame, with any two peaks completing the square (a faint column over the
-        black stage), is the seed for the usual search around it.
+        Over the black stage YOLO may miss every square, and those squares are fainter than much
+        of the clutter, so the whole pattern decides: every 4 contrast peaks forming a square are a
+        key candidate, and two such keys of one size side by side (the mask) win over any single one.
         """
         s = self.square_size
         ratio, step = self.square_contrast(gray, s)
         k = int(s) | 1
         peak = (ratio == cv2.dilate(ratio, np.ones((k, k), np.uint8))) & (ratio > SQUARE_CONTRAST) & (step > SQUARE_STEP)
         ys, xs = np.nonzero(peak)
-        order = np.argsort(-ratio[ys, xs])
+        order = np.argsort(-ratio[ys, xs])[:SEED_PEAKS]
         pts = np.c_[xs[order], ys[order]].astype(float)
         value = ratio[ys[order], xs[order]]
-        best = None
-        for i, a in enumerate(pts[:SEED_PEAKS]):
-            for j, b in enumerate(pts[:SEED_PEAKS]):
-                e = b-a
-                side = np.linalg.norm(e)
-                if i == j or not 1.3*s < side < 3*s:
-                    continue
-                # (a, b) and (b, a) give the square on either side of the edge.
-                c, d = a+[-e[1], e[0]], b+[-e[1], e[0]]
-                ic, id_ = np.linalg.norm(pts-c, axis=1).argmin(), np.linalg.norm(pts-d, axis=1).argmin()
-                if np.linalg.norm(pts[ic]-c) < 0.25*side and np.linalg.norm(pts[id_]-d) < 0.25*side:
-                    score = value[[i, j, ic, id_]].sum()
-                    if best is None or score > best[0]:
-                        best = score, pts[[i, j, ic, id_]]
-        if best is None:
+        if len(pts) < 4:
             return np.empty((0, 4))
-        return np.c_[best[1]-s/2, best[1]+s/2]
+        dist = np.linalg.norm(pts[:, None]-pts[None], axis=2)
+        i, j = np.nonzero((dist > 1.3*s) & (dist < 3*s))  # both orders: the square on either side
+        e = pts[j]-pts[i]
+        side = dist[i, j]
+        perp = np.c_[-e[:, 1], e[:, 0]]
+        nc = np.linalg.norm((pts[i]+perp)[:, None]-pts[None], axis=2)
+        nd = np.linalg.norm((pts[j]+perp)[:, None]-pts[None], axis=2)
+        ic, id_ = nc.argmin(1), nd.argmin(1)
+        ok = (nc.min(1) < 0.25*side) & (nd.min(1) < 0.25*side)
+        quads = {}
+        for a, b, c, d, w in zip(i[ok], j[ok], ic[ok], id_[ok], side[ok]):
+            members = frozenset((a, b, c, d))
+            if len(members) == 4 and self.is_grid(pts[list(members)]):
+                quads[members] = w
+        if not quads:
+            return np.empty((0, 4))
+        keys = list(quads)
+        centre = np.array([pts[list(q)].mean(0) for q in keys])
+        sides = np.array([quads[q] for q in keys])
+        score = np.array([value[list(q)].sum() for q in keys])
+        best, best_score, paired = keys[int(score.argmax())], score.max(), False
+        for m, q in enumerate(keys):
+            for n in range(m+1, len(keys)):
+                r = keys[n]
+                gap = np.linalg.norm(centre[n]-centre[m])
+                if q & r or not 0.85 < sides[n]/sides[m] < 1.18 or not 1.5*sides[m] < gap < 3*sides[m]:
+                    continue
+                if not paired or score[m]+score[n] > best_score:  # any pair beats a single key
+                    best, best_score, paired = q | r, score[m]+score[n], True
+        c = pts[list(best)]
+        return np.c_[c-s/2, c+s/2]
 
     def measure_mask(self, gray, square_boxes):
         """Two square groups from 6-8 squares (YOLO + nearby blobs) in this frame, or None."""

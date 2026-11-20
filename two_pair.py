@@ -605,6 +605,11 @@ class TwoPairKeys:
                 # found earlier in this run holds, but only while MASK_CONFIRM squares seen in this
                 # frame still sit on it: a moved plate or camera drops it at once.
                 mask = self.confirm_held(gray, square_boxes)
+                if mask is not None and fresh is not None:
+                    # Squares found by shape this frame that sit on the held mask count as seen too.
+                    seen = fresh['squares'][:fresh['observed']]
+                    hits = sum(min(np.linalg.norm(mask['squares']-c, axis=1)) < mask['size']/3 for c in seen)
+                    mask = dict(mask, observed=max(mask['observed'], int(hits)))
         else:
             if fresh is not None and stationary:
                 self.keep_mask(gray, fresh)

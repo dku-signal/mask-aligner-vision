@@ -175,6 +175,13 @@ class Sequence:
     def _expand(self, cmds):
         """명령을 하나씩 계산해 내보낸다. 정밀 X 왼쪽 끝을 모르면 기준을 잡은 뒤 받는 위치로 간다."""
         for c, n in cmds:
+            if c == "ALIGN_X_TO" and n == "left" and self.board.ledger.d.get("align_left") is not None:
+                # 왼쪽 끝까지 확실히 밀고(끝 + 여유) 그 자리를 다시 기준으로 잡는다
+                ax = self.cfg["axes"]["align_x"]
+                led = self.board.ledger.d
+                yield "B", max(0, led["pos"]["align_x"] - led["align_left"]) + int(ax.get("left_overshoot", 2000))
+                self.board.ledger.snapshot("align_left", led["pos"]["align_x"])
+                continue
             if c == "ALIGN_X_TO" and self.board.ledger.d.get("align_left") is None:
                 ax = self.cfg["axes"]["align_x"]
                 yield "B", int(ax["left_home_steps"])

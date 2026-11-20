@@ -821,6 +821,8 @@ class MaskAlignerApp:
         self.wafer_center = None
         self.theta_done_error = None
         self.theta_recheck = None
+        self.xy_response = {}
+        self.xy_checked = set()
 
     def clear_samples(self):
         self.history.clear()
@@ -1149,6 +1151,8 @@ class MaskAlignerApp:
             self.retry_ms = 0
             self.retry_direction = 1
             self.pulses = self.bad_response = self.confirm = 0
+            self.xy_response.clear()
+            self.xy_checked.clear()
             self.pulse_cap = THETA_MAX_MS
             self.last_used = self.frame_id
             self.started = self.last_good = time.monotonic()
@@ -1260,6 +1264,26 @@ class MaskAlignerApp:
     def move_xy_sequential(self, steps_x, steps_y, generation=None):
         commands = [(f'{arduino_axis(axis)} {steps}', 'DONE', 25.0, AXIS_SETTLE_SEC) for axis, steps in (('X', steps_x), ('Y', steps_y)) if steps != 0]
         return self.execute(commands, generation)
+
+    def checked_xy_steps(self, info):
+        steps = []
+        for axis, error, requested, scale in zip(('X', 'Y'), info[2:4], info[4:6],
+                                                  (STEPS_PER_PIXEL_X, STEPS_PER_PIXEL_Y)):
+            previous = self.xy_response.pop(axis, None)
+            if previous:
+                before, expected = previous
+                progress = math.copysign(1, before) * (before - error)
+                if progress < max(1.0, expected * .1):
+                    raise ValueError(f'{axis}축 영상 이동 확인 실패 · 예상 {expected:.1f}px, 관측 {progress:.1f}px')
+                self.xy_checked.add(axis)
+            if axis not in self.xy_checked:
+                limit = max(1, round(12 * abs(scale)))
+                requested = max(-limit, min(limit, requested))
+            expected = abs(requested) / max(abs(scale), .001)
+            if expected >= 7:
+                self.xy_response[axis] = error, expected
+            steps.append(requested)
+        return steps
 
     def manual_move(self, axis, steps, exact=False):
         with self.lock:
@@ -1623,7 +1647,11 @@ class MaskAlignerApp:
                     if info is None:
                         continue
                     self.last_used = fid
-                    sx, sy = info[4], info[5]
+                    try:
+                        sx, sy = self.checked_xy_steps(info)
+                    except ValueError as exc:
+                        self.fail(str(exc))
+                        continue
                     if sx == 0 and sy == 0:
                         self.status = 'XY CENTERED - verifying fresh corner/wafer centers'
                         continue
@@ -1860,7 +1888,7 @@ class RequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == '/':
-            data = HTML_PAGE.encode('utf-8')
+            data = HTML_PAGE.replace('{center_tolerance_px}', f'{DEAD_BAND_PX:g}').encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.send_header('Content-Length', str(len(data)))
@@ -2222,7 +2250,7 @@ pre{white-space:pre-wrap;line-height:1.7}small{display:block;margin-top:16px;lin
 <button onclick="post('/api/transfer')">이송 실행</button>
 <small>모든 동작은 STOP으로 멈춥니다. 이송 순서는 rig_config.json의 TRANSFER_SEQUENCE에 적습니다.</small>
 </div>
-<small>START 한 번으로 세타 구동·검증을 반복하고, 허용 각도(rig_config.json의 THETA_TOL_DEG) 이내 확인 후 X → Y 중심 정렬로 자동 전환합니다.<br>X·Y에서는 각도 검출을 요구하지 않습니다.<br>MASK의 검은 사각형 4개 배치와 WAFER의 남은 십자 팔로 중심을 구합니다. 각 축의 중심 오차가 6px 미만인 상태로 8프레임 연속 확인되면 ALIGN FINISH입니다. MASK 3/4는 3개 실측과 1개 위치 복원을 뜻합니다.</small>
+<small>START 한 번으로 세타 구동·검증을 반복하고, 허용 각도(rig_config.json의 THETA_TOL_DEG) 이내 확인 후 X → Y 중심 정렬로 자동 전환합니다.<br>X·Y에서는 각도 검출을 요구하지 않습니다.<br>MASK의 검은 사각형 4개 배치와 WAFER의 남은 십자 팔로 중심을 구합니다. 각 축의 중심 오차가 {center_tolerance_px}px 미만인 상태로 8프레임 연속 확인되면 ALIGN FINISH입니다. MASK 3/4는 3개 실측과 1개 위치 복원을 뜻합니다.</small>
 </aside></main>
 <script>
 async function post(path){await fetch(path,{method:'POST'});await refresh()}

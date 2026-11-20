@@ -10,6 +10,7 @@ from collections import OrderedDict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 import cv2
+import prealign
 """Four-square mask geometry and occlusion-masked wafer contrast matching."""
 from pathlib import Path
 from itertools import combinations
@@ -263,6 +264,7 @@ HTTP_PORT = 8765
 CAMERA_INDEX = 0
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
+PREVIEW_MAX_WIDTH = 960
 JPEG_QUALITY = 72
 PREVIEW_FPS = 20
 PATTERN_CACHE_MB = 64
@@ -306,20 +308,71 @@ THETA_PROBE_MS = (100, 150, 200, 250)
 THETA_MAX_PULSES = 100
 THETA_TIMEOUT_SEC = 180.0
 VISION_TIMEOUT_SEC = 5.0
+START_SEEN_SEC = 1.0  # START needs both keys seen this recently (a single missed frame is no fault)
 # Loader / Z / magnets (firmware/aligner_mega). rig_config.json overrides these.
-# Z moves both mask actuators (Z1+Z2 = 3): down ms, hold ms, up ms. HW team tunes the times.
-Z_WHICH = 3
+# Z_WHICH = sum of Z1 (1), Z2 (2), Z3 (4) driven together for the exposure gap. Mega_All_Control pins:
+# Z1 = the fine-stage gap Z (u/d); Z2 = transfer Z, Z3 = transfer Y linear (wafer transfer doc 11/18).
+# Z_MODES: down ms, hold ms, up ms. HW team tunes the times.
+Z_WHICH = 1
 Z_MODES = {'contact': (2000, 2000, 2000), 'proximity': (1000, 2000, 1000)}
+# Fine align runs with the mask plate (Z_WHICH) all the way down and leaves it all the way up, clear of
+# the transfer arm. Seen from above, a raised mask looks 15% larger than the wafer marks (key gap
+# 82.5 px vs cross gap 70 px; 71.4 px lowered, 2026-11-20), so both pairs can only match lowered.
+# Timed: longer than a full stroke (4 x 1000 ms reached the bottom). 0 skips the move.
+ALIGN_Z_DOWN_MS = 5000
+ALIGN_Z_UP_MS = 5000
 # Transfer = list of firmware lines run in order, e.g. ["MAG 1 1", "R1 -20000", "Z ..."].
 # Empty until the loader positions are measured on the rig.
 TRANSFER_SEQUENCE = []
-LOADER_AXES = ('R1', 'R2', 'FY')
+LOADER_AXES = ('R1', 'R2')
 # Dataset recording for YOLO/SAM2 training: raw camera frames (no overlay) every RECORD_INTERVAL_SEC.
 RECORD_INTERVAL_SEC = 0.5
 RECORD_ROOT = 'data/raw'
+# Pre-align (prealign.py, OpenCV only): notch angle on the loader camera -> PT pulses on the
+# continuous pre-align servo, re-measured after every pulse. PREALIGN_TARGET_DEG is the notch angle
+# saved with "기준 저장" after one good fine align, so a pre-aligned wafer arrives with its key
+# within a few degrees of the mask key. rig_config.json overrides these.
+PREALIGN_CAMERA = 1
+PREALIGN_TARGET_DEG = None
+PREALIGN_TOL_DEG = 1.0
+PREALIGN_MIN_MS = 60
+PREALIGN_MAX_MS = 2000  # must not exceed firmware PREALIGN_MAX_MS
+PREALIGN_PROBE_MS = 150
+PREALIGN_GAIN = 0.7
+PREALIGN_MAX_PULSES = 30
+PREALIGN_SETTLE_SEC = 0.4
+# Transfer with pre-align (TRANSFER_SEQUENCE steps that start with @, see transfer_run):
+#   @MEASURE  notch + disc centre on the loader camera (fails if no wafer)
+#   @TURN     start a background PT turn sized from the last @MEASURE; the next rail line runs
+#             while the wafer turns (needs PREALIGN_DEG_PER_MS, learnt by any closed-loop PREALIGN)
+#   @THETA    wait for that turn, then closed-loop PREALIGN to PREALIGN_TOL_DEG
+#   @Y        method 2 (wafer transfer doc, 2026-11-18): move Y_RAIL_AXIS by
+#             Y_RAIL_MAX_STEPS - Y_RAIL_CORRECTION. After every ALIGN FINISH the fine-stage Y steps that
+#             align needed are fed back: Y_RAIL_CORRECTION -= fine_steps * Y_RAIL_PER_FINE, so the next
+#             wafer arrives where the last one ended. Y_RAIL_PER_FINE (rail steps per fine Y step, signed)
+#             is learnt from two wafers sent with different rail moves; the second one is sent
+#             Y_PROBE_STEPS shorter for that. The first wafer goes uncorrected.
+#   @STAGE_HOME  move the fine stage X/Y back by everything aligns and jogs moved since the last home
+#   @UNWIND   turn the pre-align servo back by this cycle's net PT time (magnet cable untwist)
+PREALIGN_DEG_PER_MS = None
+PREALIGN_TURN_GAIN = 0.9
+PREALIGN_NET_MS = 0        # net PT time since the last @UNWIND (+ = direction 1)
+Y_RAIL_AXIS = 'R2'
+Y_FINE_AXIS = 'Y'          # Arduino axis of the fine stage that matches the transfer Y rail
+Y_RAIL_MAX_STEPS = None    # rail travel to the right end, signed (measure on the rig)
+Y_RAIL_CORRECTION = 0
+Y_RAIL_PER_FINE = None
+Y_PROBE_STEPS = 2000
+Y_FEEDBACK = []            # [[rail steps sent, fine Y steps the align then needed], ...] newest last
+RIG_CONFIG_PATH = None
+
+# Key angles repeat every 90 deg for one square key; the two-pair baseline (yolo-2pair) only every 180.
+ANGLE_PERIOD = 90.0
+
 
 def wrap90(a):
-    return (a + 45.0) % 90.0 - 45.0
+    """Wrap an angle difference to +-ANGLE_PERIOD/2 (name kept from the one-key build)."""
+    return (a + ANGLE_PERIOD/2) % ANGLE_PERIOD - ANGLE_PERIOD/2
 
 def clamp_steps(value):
     value = int(round(value))
@@ -334,14 +387,23 @@ def draw_detection(frame, det, label, color):
     if det is None:
         return
     cx, cy = det['center']
-    x, y, w, h = det['rect']
-    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+    if det.get('keys'):
+        # Two-pair detector: one box per key, numbered so each mask key pairs with its wafer key.
+        for n, (x0, y0, x1, y1) in enumerate(det['keys'], 1):
+            cv2.rectangle(frame, (x0, y0), (x1, y1), color, 3)
+            put_text(frame, f'{label} {n}', (x1 + 8, (y0 + y1) // 2 + 10), color, 0.9, 2)  # beside: the keys touch
+    else:
+        x, y, w, h = det['rect']
+        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
     cv2.circle(frame, (int(cx), int(cy)), 3, color, -1)
     for i,quad in enumerate(det.get('quads', [])):
         measured = i < det.get('observed', 4)
         cv2.polylines(frame, [quad.astype(np.int32)], True, color if measured else (0,165,255), 2 if measured else 1)
-    detail = f"{det['observed']}/4" if label == 'MASK' else f"score={det['score']:.2f}"
-    put_text(frame, f"{label} {detail}", (int(cx) + 12, int(cy) - 12), color, 0.65, 2)
+    detail = f"{det['observed']}/{max(4, len(det.get('quads', [])))}" if label == 'MASK' else f"score={det['score']:.2f}"
+    if det.get('keys'):  # summary goes left of the pair, the key numbers are on the right
+        put_text(frame, f"{label} {detail}", (min(k[0] for k in det['keys']) - 230, int(cy)), color, 0.9, 2)
+    else:
+        put_text(frame, f"{label} {detail}", (int(cx) + 12, int(cy) - 12), color, 0.65, 2)
 
 def is_stable(history):
     if len(history) < STABLE_HISTORY:
@@ -400,7 +462,12 @@ class ArduinoLink:
         self.lock = threading.Lock()
         self.rx_buffer = bytearray()
         self.last_rx = ''
-        self.last_error = '' 
+        self.pt_done = set()  # "DONE PT <id>" lines that arrived during another command
+        self.last_error = ''
+        # 'aligner' = firmware/aligner_mega; 'previous' = firmware/mega_previous (the transfer team's
+        # board on main): the same moves as "#<letter> <n>" lines, found by its "#PING" -> "PONG".
+        self.dialect = 'aligner'
+        self.expect = {}  # this app's expected reply -> the reply mega_previous sends for the last line
         if serial is None:
             print('pyserial is not installed. Run: python -m pip install pyserial')
             return
@@ -413,7 +480,8 @@ class ArduinoLink:
             time.sleep(2.0)
             self.ser.reset_input_buffer()
             self.ser.reset_output_buffer()
-            print(f'Arduino connected: {self.port}')
+            self.dialect = self.probe_dialect()
+            print(f'Arduino connected: {self.port} (firmware {self.dialect})')
         except Exception as e:
             print(f'Arduino connection failed: {e}')
             self.ser = None
@@ -434,18 +502,70 @@ class ArduinoLink:
     def connected(self):
         return self.ser is not None
 
+    def probe_dialect(self):
+        # mega_previous answers "#PING" with PONG (after READY, ADS1115 timeouts can delay it).
+        # aligner_mega reads '#' as an unknown line and replies ERR.
+        self.ser.write(b'#PING\n')
+        deadline = time.monotonic()+3.0
+        while time.monotonic() < deadline:
+            line = self.ser.readline().decode(errors='replace').strip()
+            if line == 'PONG':
+                return 'previous'
+            if line.startswith('ERR'):
+                break
+        return 'aligner'
+
+    @staticmethod
+    def to_previous(cmd):
+        """(mega_previous line, its final reply) for an aligner_mega line, or (None, reason).
+
+        Same pins and the same DIR level for + (F, f, Q, E, u), so signs carry over.
+        """
+        f = cmd.split()
+        letters = {'X': 'FB', 'Y': 'fb', 'R1': 'QW', 'R2': 'ER'}
+        try:
+            if f[0] in ('s', 'stop'):
+                return 'X', None
+            if f[0] in letters and len(f) == 2:
+                n = int(f[1])
+                c = letters[f[0]][n < 0]
+                return f'#{c} {abs(n)}', f'DONE {c} {abs(n)}'
+            if f[0] == 'T' and len(f) == 4:  # T <id> <dir> <ms>: theta servo D5 turn
+                return f'#A {int(f[3])} {1 if int(f[2]) >= 0 else -1}', f'DONE A {int(f[3])}'
+            if f[0] == 'Z' and len(f) == 4 and f[1] == '1':  # Z1 only (exposure Z, pins 2/3)
+                c = 'u' if int(f[2]) > 0 else 'd'
+                return f'#{c} {int(f[3])}', f'DONE {c} {int(f[3])}'
+            if f[0] == 'MAG' and len(f) == 3 and f[1] == '1':
+                return f'#M {int(f[2])}', f'DONE M {int(f[2])}'
+        except ValueError:
+            pass
+        return None, f'not on mega_previous: {cmd}'
+
     def send(self, cmd):
         print(f'-> {cmd}')
         if not self.ser:
             print('Arduino not connected.')
             return False
+        line = cmd.strip()
+        if self.dialect == 'previous':
+            line, reply = self.to_previous(line)
+            if line is None:
+                self.last_error = reply
+                print(reply, flush=True)
+                return False
+            self.expect = {} if reply is None else {'DONE': reply, 'DONE*': reply, f'DONE {cmd.split()[0]}': reply}
+            if cmd.split()[0] == 'T':
+                self.expect[f'DONE T {cmd.split()[1]}'] = reply
+            elif cmd.split()[0] in ('Z', 'MAG'):
+                self.expect.update({'DONE Z': reply, 'DONE ' + ' '.join(cmd.split()): reply})
+            print(f'   (mega_previous: {line})')
         try:
             with self.lock:
                 self.ser.reset_input_buffer()
                 self.rx_buffer.clear()
                 if cmd.strip().lower() not in ('s', 'stop'):
                     self.last_error = ''
-                self.ser.write((cmd.strip() + '\n').encode('utf-8'))
+                self.ser.write((line + '\n').encode('utf-8'))
             return True
         except Exception as e:
             self.last_error = f'SERIAL WRITE FAILED: {e}'
@@ -474,6 +594,8 @@ class ArduinoLink:
             return ''
 
     def wait_done(self, stop_event, timeout=25.0, expected='DONE'):
+        if self.dialect == 'previous':
+            expected = self.expect.get(expected, expected)
         deadline = time.monotonic() + timeout
         self.last_error = ''
         while self.connected() and time.monotonic() < deadline:
@@ -490,8 +612,10 @@ class ArduinoLink:
                 return False
             if line:
                 print(f'<- {line}', flush=True)
-            if line == expected or (expected.endswith('*') and line.startswith(expected[:-1])):
+            if line == expected or (expected.endswith('*') and line.startswith(expected[:-1]) and not line.startswith('DONE PT ')):
                 return True
+            if line.startswith('DONE PT '):
+                self.pt_done.add(line)
             if line == 'STOP' or line.startswith('ERR'):
                 self.last_error = f'Arduino replied: {line}'
                 return False
@@ -583,7 +707,7 @@ class PreviewSmoother:
             state['extent']+=alpha*(target['extent']-state['extent'])
             for q,destination in zip(state['quads'],target['quads']):q+=alpha*(destination-q)
             if target['angle'] is None or state['angle'] is None:state['angle']=target['angle']
-            else:state['angle']=(state['angle']+alpha*wrap90(target['angle']-state['angle']))%90
+            else:state['angle']=(state['angle']+alpha*wrap90(target['angle']-state['angle']))%ANGLE_PERIOD
             shown=dict(det)
             shown['center']=tuple(float(x) for x in state['center'])
             width,height=state['extent'];cx,cy=state['center']
@@ -633,11 +757,21 @@ class MaskAlignerApp:
         self.record_dir = None
         self.record_count = 0
         self.record_last = 0.0
+        self.prealign_cap = None
+        self.prealign_lock = threading.Lock()
+        self.prealign_angle = None
+        self.prealign_center = None
+        self.stage_offset = {'X': 0, 'Y': 0}  # fine-stage steps since the last @STAGE_HOME
+        self.align_moved = {'X': 0, 'Y': 0}   # fine-stage steps of the current / last align
+        self.y_rail_sent = None               # rail steps @Y sent for the wafer now on the stage
+        self.prealign_jpeg = None
+        self.prealign_seq = 0
         self.stable = False
         self.centered_count = 0
         self.wafer_lost_count = 0
         self.mask_detected = False
         self.wafer_detected = False
+        self.mask_seen_at = self.wafer_seen_at = 0.0
         self.dx = None
         self.dy = None
         self.steps_x = 0
@@ -652,6 +786,11 @@ class MaskAlignerApp:
             # Default path needs only opencv/numpy; sam2_keys pulls in torch.
             from subpixel import PreciseKeys
             self.key_detector = PreciseKeys(center_tolerance=DEAD_BAND_PX, cache_mb=cache_mb)
+        elif detector == 'yolo-2pair':
+            global ANGLE_PERIOD
+            ANGLE_PERIOD = 180.0
+            from two_pair import TwoPairKeys
+            self.key_detector = TwoPairKeys(center_tolerance=DEAD_BAND_PX)
         else:
             from sam2_keys import make_detector
             self.key_detector = make_detector(detector, center_tolerance=DEAD_BAND_PX, cache_mb=cache_mb)
@@ -695,6 +834,10 @@ class MaskAlignerApp:
         self.frame_time = now
         self.mask_detected = md is not None
         self.wafer_detected = wd is not None
+        if md is not None:
+            self.mask_seen_at = now
+        if wd is not None:
+            self.wafer_seen_at = now
         self.mask_center = md['center'] if md is not None else None
         self.wafer_center = wd['center'] if wd is not None else None
         self.steps_x = self.steps_y = 0
@@ -740,7 +883,7 @@ class MaskAlignerApp:
             self.stable = bool(is_stable(self.history))
             if len(self.samples) == STABLE_HISTORY:
                 arr = np.asarray(self.samples)
-                unwrapped = arr[-1] + (arr - arr[-1] + 45) % 90 - 45
+                unwrapped = arr[-1] + (arr - arr[-1] + ANGLE_PERIOD/2) % ANGLE_PERIOD - ANGLE_PERIOD/2
                 med = np.median(unwrapped, axis=0)
                 self.stable &= bool(np.max(abs(unwrapped - med)) <= THETA_JITTER_DEG)
                 self.theta_error = wrap90(float(med[1] - med[0]))
@@ -933,6 +1076,8 @@ class MaskAlignerApp:
                         cv2.line(display, (int(cx-vx),int(cy-vy)), (int(cx+vx),int(cy+vy)),color,2)
             if md is not None and wd is not None:
                 cv2.line(display, tuple(int(v) for v in md['center']), tuple(int(v) for v in wd['center']), (255,255,255),1)
+            if display.shape[1] > PREVIEW_MAX_WIDTH:  # 1080p capture: keep the stream light and the text readable
+                display = cv2.resize(display, None, fx=PREVIEW_MAX_WIDTH/display.shape[1], fy=PREVIEW_MAX_WIDTH/display.shape[1], interpolation=cv2.INTER_AREA)
             put_text(display, ('ALIGNING / ' if phase in ('THETA','XY') else '')+phase+' / '+status, (12,28),scale=0.48)
             if phase in ('XY','DONE'):
                 text = 'THETA ALIGN DONE / ' + ('XY CENTER ALIGN' if phase=='XY' else 'ALIGN FINISH')
@@ -960,6 +1105,10 @@ class MaskAlignerApp:
                         self.jpeg_ready.notify_all()
             self.exit_event.wait(max(0, 1.0/self.preview_fps_limit-(time.monotonic()-started)))
 
+    def missing_keys(self, now, within):
+        return [name for name, seen in (('마스크 키', self.mask_seen_at), ('웨이퍼 키', self.wafer_seen_at))
+                if now-seen > within]
+
     def fail(self, message):
         self.stop_align()
         with self.lock:
@@ -973,6 +1122,12 @@ class MaskAlignerApp:
             if not self.arduino.connected():
                 self.status = 'Arduino disconnected'
                 return
+            # Nothing moves unless both keys are in view: a missing wafer or mask is reported, not searched for.
+            missing = self.missing_keys(time.monotonic(), START_SEEN_SEC)
+            if missing:
+                self.phase = 'FAULT'
+                self.status = f"START 불가: {' · '.join(missing)} 미검출 - 카메라 화면에 키가 보이는지 확인하세요"
+                return
             with self.lock:
                 self.stop_event.clear()
                 self.auto_running = True
@@ -982,6 +1137,7 @@ class MaskAlignerApp:
                 self.history.clear()
                 self.next_info = None
                 self.status = 'ALIGN START'
+                self.align_moved = {'X': 0, 'Y': 0}
             self.generation += 1
             self.clear_samples()
             # No theta motor on the current build: go straight to XY centring.
@@ -995,6 +1151,35 @@ class MaskAlignerApp:
             self.pulse_cap = THETA_MAX_MS
             self.last_used = self.frame_id
             self.started = self.last_good = time.monotonic()
+            if ALIGN_Z_DOWN_MS > 0:
+                self.phase = 'ZDOWN'
+                self.status = 'Z down: mask plate to the bottom before aligning'
+                threading.Thread(target=self.lower_for_align, args=(self.generation,), name='z_down', daemon=True).start()
+
+    def lower_for_align(self, generation):
+        ok = self.execute([(f'Z {Z_WHICH} -1 {ALIGN_Z_DOWN_MS}', 'DONE Z', ALIGN_Z_DOWN_MS/1000+3, 0.5)], generation)
+        with self.lock:
+            if generation != self.generation or not self.auto_running:
+                return
+            if not ok:
+                self.fail(f'Z down failed: {self.arduino.last_error or "stopped"}')
+                return
+            # Lowered, the mask looks smaller and shifted: a new run token makes the detector measure it afresh.
+            self.generation += 1
+            self.phase = 'XY' if self.skip_theta else 'THETA'
+            self.status = 'ALIGN START (mask lowered)'
+            self.clear_samples()
+            self.last_used = self.frame_id
+            self.started = self.last_good = time.monotonic()
+
+    def raise_after_align(self):
+        time.sleep(0.3)  # let the reply to finish_align's stop arrive first: the next send drops it
+        if self.execute([(f'Z {Z_WHICH} 1 {ALIGN_Z_UP_MS}', 'DONE Z', ALIGN_Z_UP_MS/1000+3, 0.0)]):
+            with self.lock:
+                self.status += ' / Z up'
+        else:
+            with self.lock:
+                self.status += f' / Z up failed: {self.arduino.last_error or "stopped"}'
 
     def stop_align(self):
         with self.lock:
@@ -1039,11 +1224,17 @@ class MaskAlignerApp:
                         break
                     self.motion_stage = 'WAIT_ACK'
                     self.status = f'WAIT ACK: {command}'
-                    sent = self.arduino.send(command)
+                    sent = self.arduino.send(command) if command else True  # '' = only wait
                 if not sent or not self.arduino.wait_done(self.stop_event, timeout, expected):
                     success = False
                     error = self.arduino.last_error or 'Serial command failed'
                     break
+                head, _, value = command.partition(' ')
+                if head in ('X', 'Y') and value.lstrip('-').isdigit():
+                    with self.lock:
+                        self.stage_offset[head] += int(value)
+                        if self.auto_running and self.phase in ('THETA', 'XY'):
+                            self.align_moved[head] += int(value)
                 with self.lock:
                     self.motion_stage = 'SETTLING'
                     self.status = f'ACK OK; settling {settle:.2f}s'
@@ -1149,12 +1340,240 @@ class MaskAlignerApp:
             thread.start()
         return True
 
+    def z_step(self, mode, direction):
+        """Only the down (or up) part of a Z mode: lower the mask and keep it there until 'up'."""
+        down, _, up = Z_MODES[mode]
+        ms = down if direction < 0 else up
+        self.z_last_mode = f'{mode} {"down" if direction < 0 else "up"}'
+        return self.run_commands(f'Z {mode} {"down" if direction < 0 else "up"}',
+                                 [(f'Z {Z_WHICH} {direction} {ms}', 'DONE Z', ms/1000+3, 0.0)])
+
     def z_mode(self, mode):
         down, hold, up = Z_MODES[mode]
         self.z_last_mode = mode
         return self.run_commands(f'Z {mode}', [
             (f'Z {Z_WHICH} -1 {down}', 'DONE Z', down/1000+3, hold/1000),
             (f'Z {Z_WHICH} 1 {up}', 'DONE Z', up/1000+3, 0.0)])
+
+    def prealign_grab(self):
+        """One fresh loader-camera frame, or None (the main camera keeps its own thread)."""
+        if PREALIGN_CAMERA == self.camera_index:
+            return None
+        if self.prealign_cap is None:
+            self.prealign_cap = self.open_camera(PREALIGN_CAMERA)
+            if self.prealign_cap is None:
+                return None
+        for _ in range(4):  # drop frames buffered while the servo turned
+            self.prealign_cap.grab()
+        ok, frame = self.prealign_cap.read()
+        return frame if ok else None
+
+    def prealign_measure(self, frames=3):
+        """Median notch angle over a few loader-camera frames (prealign.find_notch), or None."""
+        with self.prealign_lock:
+            angles, centers, frame, result = [], [], None, None
+            for _ in range(frames):
+                frame = self.prealign_grab()
+                if frame is None:
+                    break
+                result = prealign.find_notch(frame)
+                if result is not None:
+                    angles.append(result['angle'])
+                    centers.append(result['center'])
+            angle = center = None
+            if angles:
+                ref = angles[0]
+                angle = (ref+float(np.median([prealign.wrap180(a-ref) for a in angles]))) % 360
+                center = tuple(float(v) for v in np.median(centers, axis=0))
+            if frame is not None:
+                ok, jpg = cv2.imencode('.jpg', prealign.draw(frame, result, PREALIGN_TARGET_DEG))
+                if ok:
+                    self.prealign_jpeg = jpg.tobytes()
+        with self.lock:
+            self.prealign_angle = angle
+            self.prealign_center = center
+        return angle
+
+    def save_rig_config(self, **values):
+        """Set module constants and write them into rig_config.json (values learnt on the rig)."""
+        globals().update(values)
+        if RIG_CONFIG_PATH is None:
+            return
+        data = json.loads(RIG_CONFIG_PATH.read_text()) if RIG_CONFIG_PATH.is_file() else {}
+        data.update(values)
+        RIG_CONFIG_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False)+'\n')
+
+    def prealign_set_target(self):
+        """Save the current notch angle as the pre-align target (do this right after a good fine align)."""
+        angle = self.prealign_measure()
+        if angle is None:
+            return False
+        self.save_rig_config(PREALIGN_TARGET_DEG=round(angle, 2))
+        with self.lock:
+            self.status = f'PREALIGN target saved: {PREALIGN_TARGET_DEG:.2f} deg'
+        return True
+
+    def prealign_run(self, generation):
+        """Turn the wafer until its notch sits at PREALIGN_TARGET_DEG. Returns the final status text."""
+        response = None  # notch degrees per ms for direction +1, learnt from the pulses
+        last = None      # (angle, direction, ms) before the previous pulse
+        for pulse in range(PREALIGN_MAX_PULSES+1):
+            if self.stop_event.is_set() or generation != self.generation:
+                return 'PREALIGN: stopped'
+            angle = self.prealign_measure()
+            if angle is None:
+                return 'PREALIGN FAIL: no wafer / notch on the loader camera'
+            err = prealign.wrap180(PREALIGN_TARGET_DEG-angle)
+            with self.lock:
+                self.status = f'PREALIGN notch {angle:.1f} deg, err {err:+.1f} deg (pulse {pulse})'
+            if abs(err) <= PREALIGN_TOL_DEG:
+                return f'PREALIGN DONE: notch {angle:.1f} deg, err {err:+.2f} deg, {pulse} pulses'
+            if last is not None:
+                moved = prealign.wrap180(angle-last[0])
+                if abs(moved) > 0.3:
+                    response = moved/(last[1]*last[2])
+                    self.save_rig_config(PREALIGN_DEG_PER_MS=round(response, 5))
+                elif last[2] >= PREALIGN_MAX_MS:
+                    return f'PREALIGN FAIL: no measured rotation at {PREALIGN_MAX_MS} ms (servo power / coupling?)'
+            if response is None and pulse == 0 and PREALIGN_DEG_PER_MS:
+                response = PREALIGN_DEG_PER_MS  # learnt on an earlier run; refined below
+            if response is None:
+                direction, ms = 1, PREALIGN_PROBE_MS if last is None else min(PREALIGN_MAX_MS, last[2]*2)
+            else:
+                direction = 1 if err/response > 0 else -1
+                ms = int(np.clip(PREALIGN_GAIN*abs(err/response), PREALIGN_MIN_MS, PREALIGN_MAX_MS))
+            self.prealign_seq += 1
+            seq = self.prealign_seq
+            if not self.execute([(f'PT {seq} {direction} {ms}', f'DONE PT {seq}', ms/1000+3, PREALIGN_SETTLE_SEC)], generation):
+                return 'PREALIGN: stopped'
+            self.add_turn(direction*ms)
+            last = (angle, direction, ms)
+        return f'PREALIGN FAIL: not within {PREALIGN_TOL_DEG} deg after {PREALIGN_MAX_PULSES} pulses'
+
+    def add_turn(self, signed_ms):
+        """Net pre-align servo time since the last unwind (+ = direction 1), kept across restarts."""
+        self.save_rig_config(PREALIGN_NET_MS=int(PREALIGN_NET_MS+signed_ms))
+
+    def unwind(self, generation):
+        """Turn the pre-align servo back by the net time turned since the last unwind."""
+        left = PREALIGN_NET_MS
+        while left:
+            ms = int(min(abs(left), PREALIGN_MAX_MS))
+            direction = -1 if left > 0 else 1
+            self.prealign_seq += 1
+            seq = self.prealign_seq
+            if not self.execute([(f'PT {seq} {direction} {ms}', f'DONE PT {seq}', ms/1000+3, 0.1)], generation):
+                return False
+            left += direction*ms
+            self.save_rig_config(PREALIGN_NET_MS=int(left))
+        return True
+
+    def wait_pt(self, seq, timeout, generation):
+        """Wait for "DONE PT seq" of a background turn (it may have arrived during a rail move)."""
+        line = f'DONE PT {seq}'
+        if line in self.arduino.pt_done:
+            self.arduino.pt_done.discard(line)
+            return True
+        return self.execute([('', line, timeout, PREALIGN_SETTLE_SEC)], generation)
+
+    @staticmethod
+    def reply_for(line):
+        """Final firmware reply for a plain transfer line (a background "DONE PT" must not match)."""
+        head = line.split()[0]
+        if head in ('X', 'Y', 'R1', 'R2'):
+            return 'DONE'
+        if head == 'Z':
+            return 'DONE Z'
+        if head == 'MAG':
+            return 'DONE ' + ' '.join(line.split())
+        return 'DONE*'
+
+    def transfer_run(self, generation):
+        """TRANSFER_SEQUENCE: firmware lines plus the @ pre-align steps (see the constants)."""
+        pending = None
+        for i, step in enumerate(TRANSFER_SEQUENCE):
+            if self.stop_event.is_set() or generation != self.generation:
+                return 'transfer: stopped'
+            with self.lock:
+                self.status = f'transfer {i+1}/{len(TRANSFER_SEQUENCE)}: {step}'
+            if step == '@MEASURE':
+                if self.prealign_measure() is None:
+                    return f'transfer FAIL at {i+1}: no wafer / notch on the loader camera'
+            elif step == '@TURN':
+                if PREALIGN_TARGET_DEG is None or self.prealign_angle is None or not PREALIGN_DEG_PER_MS:
+                    continue  # nothing learnt yet: @THETA does all the turning after the move
+                err = prealign.wrap180(PREALIGN_TARGET_DEG-self.prealign_angle)
+                ms = int(abs(err/PREALIGN_DEG_PER_MS)*PREALIGN_TURN_GAIN)
+                if ms < PREALIGN_MIN_MS:
+                    continue
+                direction = 1 if err/PREALIGN_DEG_PER_MS > 0 else -1
+                self.prealign_seq += 1
+                pending = (self.prealign_seq, min(ms, PREALIGN_MAX_MS))
+                if not self.execute([(f'PT {pending[0]} {direction} {pending[1]}', f'START PT {pending[0]}', 2.0, 0.0)], generation):
+                    return 'transfer: stopped'
+                self.add_turn(direction*pending[1])
+            elif step == '@THETA':
+                if pending is not None:
+                    if not self.wait_pt(pending[0], pending[1]/1000+3, generation):
+                        return 'transfer: stopped'
+                    pending = None
+                if PREALIGN_TARGET_DEG is None:
+                    return 'transfer FAIL: no PREALIGN_TARGET_DEG (press 기준 저장 once)'
+                message = self.prealign_run(generation)
+                if not message.startswith('PREALIGN DONE'):
+                    return f'transfer FAIL at {i+1}: {message}'
+            elif step == '@Y':
+                if Y_RAIL_MAX_STEPS is None:
+                    return f'transfer FAIL at {i+1}: Y_RAIL_MAX_STEPS not measured (rig_config.json)'
+                rail = int(Y_RAIL_MAX_STEPS-Y_RAIL_CORRECTION)
+                if rail and not self.execute([(f'{Y_RAIL_AXIS} {rail}', 'DONE', abs(rail)/4000+5, 0.3)], generation):
+                    return 'transfer: stopped'
+                self.y_rail_sent = rail
+            elif step == '@STAGE_HOME':
+                with self.lock:
+                    back = {k: -v for k, v in self.stage_offset.items()}
+                moves = [(f'{k} {v}', 'DONE', abs(v)/4000+5, AXIS_SETTLE_SEC) for k, v in back.items() if v]
+                if moves and not self.execute(moves, generation):
+                    return 'transfer: stopped'
+            elif step == '@UNWIND':
+                if not self.unwind(generation):
+                    return 'transfer: stopped'
+            elif not self.execute([(step, self.reply_for(step), 120.0, 0.3)], generation):
+                return 'transfer: stopped'
+        if pending is not None and not self.wait_pt(pending[0], pending[1]/1000+3, generation):
+            return 'transfer: stopped'
+        return f'transfer DONE ({len(TRANSFER_SEQUENCE)} steps)'
+
+    def start_worker(self, name, job):
+        """Run job(generation) -> status text in a thread, as one STOP-able automatic action."""
+        with self.lock:
+            if self.exit_event.is_set() or self.moving or self.auto_running:
+                return False
+            self.auto_running = True
+            self.phase = 'MANUAL'
+            self.stop_event.clear()
+            self.generation += 1
+            generation = self.generation
+
+        def worker():
+            message = job(generation)
+            with self.lock:
+                if generation == self.generation:
+                    self.auto_running = False
+                    self.status = message
+        thread = threading.Thread(target=worker, name=name, daemon=True)
+        with self.lock:
+            self.workers = [t for t in self.workers if t.is_alive()]
+            self.workers.append(thread)
+            thread.start()
+        return True
+
+    def start_prealign(self):
+        if PREALIGN_TARGET_DEG is None:
+            with self.lock:
+                self.status = 'PREALIGN: no target yet (fine-align once, then press 기준 저장)'
+            return False
+        return self.start_worker('prealign', self.prealign_run)
 
     def begin_theta_recheck(self, before, direction, duration, err, reason):
         with self.lock:
@@ -1171,7 +1590,7 @@ class MaskAlignerApp:
     def auto_loop(self):
         while not self.exit_event.wait(0.02):
             with self.lock:
-                if not self.auto_running or self.moving or self.phase == 'MANUAL':
+                if not self.auto_running or self.moving or self.phase in ('MANUAL', 'ZDOWN'):
                     continue
                 now = time.monotonic()
                 stale = now - self.last_good > VISION_TIMEOUT_SEC
@@ -1191,7 +1610,9 @@ class MaskAlignerApp:
                     self.motion_stage = 'DONE'
                     continue
                 if stale or expired:
-                    self.fail('Camera/key unavailable or theta timeout')
+                    missing = self.missing_keys(now, VISION_TIMEOUT_SEC)
+                    self.fail(f"정렬 중단: {' · '.join(missing)} {VISION_TIMEOUT_SEC:.0f}초 이상 미검출" if missing and not expired
+                              else 'Camera/key unavailable or theta timeout')
                     continue
                 if now < self.ignore_until or not result_current:
                     continue
@@ -1352,12 +1773,40 @@ class MaskAlignerApp:
             self.history.clear()
             self.next_info = None
             self.status = message
+            fine = self.align_moved[Y_FINE_AXIS]
+        note = self.y_feedback(fine)
+        if note:
+            with self.lock:
+                self.status = f'{message} / {note}'
+        if ALIGN_Z_UP_MS > 0:
+            threading.Thread(target=self.raise_after_align, name='z_up', daemon=True).start()
+
+    def y_feedback(self, fine):
+        """Method 2: feed this align's fine-stage Y steps back into the next wafer's rail move."""
+        if self.y_rail_sent is None:
+            return None  # this wafer did not come through @Y (placed by hand)
+        rail, self.y_rail_sent = self.y_rail_sent, None
+        history = (Y_FEEDBACK+[[rail, fine]])[-5:]
+        ratio = Y_RAIL_PER_FINE
+        if len(history) >= 2:
+            (r0, f0), (r1, f1) = history[-2], history[-1]
+            if abs(r1-r0) >= 100 and abs(f1-f0) >= 20:
+                ratio = round(-(r1-r0)/(f1-f0), 4)  # rail steps that cancel one fine step
+        if ratio is None:
+            correction = Y_RAIL_CORRECTION+Y_PROBE_STEPS  # no ratio yet: probe with a shorter move
+        else:
+            correction = int(round(Y_RAIL_CORRECTION-fine*ratio))
+        self.save_rig_config(Y_FEEDBACK=history, Y_RAIL_PER_FINE=ratio, Y_RAIL_CORRECTION=correction)
+        nxt = '?' if Y_RAIL_MAX_STEPS is None else Y_RAIL_MAX_STEPS-correction
+        return f'Y feedback: fine {fine:+d} steps -> next rail {nxt}'
 
     def get_status(self):
         with self.lock:
             return {'version': APP_VERSION, 'axis_mapping': f"image X -> Arduino {arduino_axis('X')}; image Y -> Arduino {arduino_axis('Y')}", 'status': self.status, 'camera_index': self.camera_index, 'arduino_connected': self.arduino.connected(), 'arduino_port': self.arduino.port or '-', 'auto_running': self.auto_running, 'align_finished': self.align_finished, 'moving': self.moving, 'stable': self.stable, 'history_len': len(self.history), 'stable_history': STABLE_HISTORY, 'mask_detected': self.mask_detected, 'wafer_detected': self.wafer_detected, 'wafer_lost_count': self.wafer_lost_count, 'dx': self.dx, 'dy': self.dy, 'steps_x': self.steps_x, 'steps_y': self.steps_y, 'quadrant': self.quadrant, 'quadrant_fix': self.quadrant_fix, 'phase': self.phase, 'theta_aligned': self.phase in ('XY', 'DONE'), 'theta_error': self.theta_error, 'theta_done_error': self.theta_done_error, 'mask_center': self.mask_center, 'wafer_center': self.wafer_center, 'motion_stage': self.motion_stage, 'last_rx': self.arduino.last_rx, 'serial_error': self.arduino.last_error,
                     'distance': self.distance, 'z_mode': self.z_last_mode, 'transfer_steps': len(TRANSFER_SEQUENCE),
                     'recording': self.record_dir is not None, 'record_count': self.record_count,
+                    'prealign_angle': self.prealign_angle, 'prealign_target': PREALIGN_TARGET_DEG,
+                    'prealign_camera': PREALIGN_CAMERA,
                     'capture_fps': self.capture_fps if time.monotonic()-self.capture_time < 1.5 else 0,
                     'preview_fps': self.preview_fps if time.monotonic()-self.capture_time < 1.5 else 0,
                     'vision_fps': self.vision_fps if not self.moving and time.monotonic()-self.frame_time < VISION_TIMEOUT_SEC else 0,
@@ -1381,6 +1830,9 @@ class MaskAlignerApp:
             if worker is not threading.current_thread():
                 worker.join(timeout=.75)
         self.arduino.close()
+        with self.prealign_lock:
+            if self.prealign_cap is not None:
+                self.prealign_cap.release()
 
 class RequestHandler(BaseHTTPRequestHandler):
     server_version = 'MaskAlignerHTTP/1.0'
@@ -1413,6 +1865,18 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == '/api/status':
             self.send_json(self.app.get_status())
+            return
+        if parsed.path == '/prealign.jpg':
+            jpg = self.app.prealign_jpeg
+            if jpg is None:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header('Content-Type', 'image/jpeg')
+            self.send_header('Content-Length', str(len(jpg)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(jpg)
             return
         if parsed.path == '/video.mjpg':
             self.send_response(200)
@@ -1500,6 +1964,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.app.set_recording(query.get('on', ['0'])[0] == '1')
             self.send_json({'ok': True})
             return
+        if parsed.path == '/api/zstep':
+            mode, direction = query.get('mode', [''])[0], query.get('dir', [''])[0]
+            if mode not in Z_MODES or direction not in ('-1', '1'):
+                self.send_json({'ok': False, 'error': 'mode contact/proximity, dir -1 (down) / 1 (up)'}, 400)
+                return
+            self.send_json({'ok': self.app.z_step(mode, int(direction))})
+            return
         if parsed.path == '/api/zmode':
             mode = query.get('mode', [''])[0]
             if mode not in Z_MODES:
@@ -1509,8 +1980,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == '/api/magnet':
             n, on = query.get('n', [''])[0], query.get('on', [''])[0]
-            if n not in ('1', '2') or on not in ('0', '1'):
-                self.send_json({'ok': False, 'error': 'n 1/2, on 0/1'}, 400)
+            if n != '1' or on not in ('0', '1'):
+                self.send_json({'ok': False, 'error': 'n 1, on 0/1'}, 400)
                 return
             self.send_json({'ok': self.app.run_commands(f'MAG {n}', [(f'MAG {n} {on}', f'DONE MAG {n} {on}', 2.0, 0.0)])})
             return
@@ -1521,21 +1992,34 @@ class RequestHandler(BaseHTTPRequestHandler):
             except ValueError:
                 steps = 0
             if axis not in LOADER_AXES or steps == 0 or abs(steps) > 400000:
-                self.send_json({'ok': False, 'error': 'axis R1/R2/FY, 0 < |steps| <= 400000'}, 400)
+                self.send_json({'ok': False, 'error': 'axis R1/R2, 0 < |steps| <= 400000'}, 400)
                 return
-            # Rails run ~5000 steps/s, the Foyu axis 125 steps/s.
-            timeout = abs(steps)/(125 if axis == 'FY' else 4000)+5
+            timeout = abs(steps)/4000+5  # rails run ~5000 steps/s
             self.send_json({'ok': self.app.run_commands(f'{axis} move', [(f'{axis} {steps}', 'DONE', timeout, 0.2)])})
             return
         if parsed.path == '/api/dist':
             self.send_json({'ok': self.app.run_commands('DIST', [('DIST', 'DIST *', 2.0, 0.0)])})
             return
+        if parsed.path == '/api/prealign':
+            action = query.get('action', [''])[0]
+            if action == 'measure':
+                with self.app.lock:
+                    busy = self.app.auto_running
+                self.send_json({'ok': not busy and self.app.prealign_measure() is not None})
+            elif action == 'target':
+                with self.app.lock:
+                    busy = self.app.auto_running
+                self.send_json({'ok': not busy and self.app.prealign_set_target()})
+            elif action == 'start':
+                self.send_json({'ok': self.app.start_prealign()})
+            else:
+                self.send_json({'ok': False, 'error': 'action measure/target/start'}, 400)
+            return
         if parsed.path == '/api/transfer':
             if not TRANSFER_SEQUENCE:
                 self.send_json({'ok': False, 'error': 'TRANSFER_SEQUENCE is empty (rig_config.json)'}, 400)
                 return
-            commands = [(line, 'DONE*', 120.0, 0.3) for line in TRANSFER_SEQUENCE]
-            self.send_json({'ok': self.app.run_commands('transfer', commands)})
+            self.send_json({'ok': self.app.start_worker('transfer', self.app.transfer_run)})
             return
         self.send_error(404)
 
@@ -1558,13 +2042,17 @@ def load_calibration(path):
           ', '.join(f'{k}={data[k]}' for k in CALIBRATED_KEYS if k in data))
 
 
-RIG_CONFIG_KEYS = ('Z_WHICH', 'Z_MODES', 'TRANSFER_SEQUENCE', 'THETA_TOL_DEG')
+RIG_CONFIG_KEYS = ('Z_WHICH', 'Z_MODES', 'TRANSFER_SEQUENCE', 'THETA_TOL_DEG',
+                   'PREALIGN_CAMERA', 'PREALIGN_TARGET_DEG', 'PREALIGN_TOL_DEG', 'PREALIGN_DEG_PER_MS',
+                   'PREALIGN_NET_MS', 'Y_RAIL_AXIS', 'Y_FINE_AXIS', 'Y_RAIL_MAX_STEPS', 'Y_RAIL_CORRECTION',
+                   'Y_RAIL_PER_FINE', 'Y_PROBE_STEPS', 'Y_FEEDBACK', 'ALIGN_Z_DOWN_MS', 'ALIGN_Z_UP_MS')
 
 
 def load_rig_config(path):
     """Z mode times and the transfer sequence, tuned on the rig without editing code."""
     from pathlib import Path
     path = Path(path)
+    globals()['RIG_CONFIG_PATH'] = path
     if not path.is_file():
         return
     data = json.loads(path.read_text())
@@ -1572,7 +2060,8 @@ def load_rig_config(path):
         if key in data:
             globals()[key] = data[key]
     globals()['Z_MODES'] = {k: tuple(v) for k, v in Z_MODES.items()}
-    print(f'Loaded {path.name}: Z_MODES={Z_MODES}, transfer {len(TRANSFER_SEQUENCE)} steps, THETA_TOL_DEG={THETA_TOL_DEG}')
+    print(f'Loaded {path.name}: Z_MODES={Z_MODES}, transfer {len(TRANSFER_SEQUENCE)} steps, THETA_TOL_DEG={THETA_TOL_DEG}, '
+          f'pre-align camera {PREALIGN_CAMERA} target {PREALIGN_TARGET_DEG}')
 
 
 def find_key_camera(max_index=4):
@@ -1614,8 +2103,10 @@ def main():
                         help='Z mode times and transfer sequence (optional)')
     parser.add_argument('--calibration', default=str(Path(__file__).resolve().parent/'calibration.json'),
                         help='calibrate_xy.py output to load (default: calibration.json next to this file)')
-    parser.add_argument('--detector', choices=('opencv', 'opencv-v4', 'sam2', 'hybrid', 'yolo-sam2', 'opencv-sam2'), default='opencv',
-                        help='opencv: rule-based squares + subpixel edge fit; opencv-v4: original integer-pixel; sam2/hybrid: SAM2.1 hiera-small segmentation; yolo-sam2/opencv-sam2: YOLO or OpenCV boxes -> SAM2')
+    parser.add_argument('--detector', choices=('opencv', 'opencv-v4', 'sam2', 'hybrid', 'yolo-sam2', 'opencv-sam2', 'yolo-2pair'), default='opencv',
+                        help='opencv: rule-based squares + subpixel edge fit; opencv-v4: original integer-pixel; sam2/hybrid: SAM2.1 hiera-small segmentation; yolo-sam2/opencv-sam2: YOLO or OpenCV boxes -> SAM2; yolo-2pair: two mask/wafer key pairs in one view (two_pair.py)')
+    parser.add_argument('--frame', default=None,
+                        help='capture size WxH, e.g. 1920x1080 for small keys (default 640x480)')
     parser.add_argument('--cache-mb', type=int, default=PATTERN_CACHE_MB,
                         help='Template array cache limit in MiB (default: 64)')
     parser.add_argument('--preview-fps', type=int, default=PREVIEW_FPS,
@@ -1632,6 +2123,9 @@ def main():
     if args.opencv_threads:
         cv2.setNumThreads(args.opencv_threads)
     load_calibration(args.calibration)
+    if args.frame:
+        global FRAME_WIDTH, FRAME_HEIGHT
+        FRAME_WIDTH, FRAME_HEIGHT = (int(v) for v in args.frame.lower().split('x'))
     load_rig_config(args.rig_config)
     if args.arduino_port:
         global ARDUINO_PORT
@@ -1679,6 +2173,7 @@ pre{white-space:pre-wrap;line-height:1.7}small{display:block;margin-top:16px;lin
 <button class="stop" onclick="post('/api/stop')">STOP</button>
 <button onclick="post('/api/reset')">RESET</button>
 <button onclick="post('/api/camera_next')">NEXT CAMERA</button>
+<div id="alignError" role="alert" hidden style="padding:14px;margin:12px 0;background:#fee2e2;color:#991b1b;border:1px solid #fca5a5;border-radius:6px;font-weight:bold"></div>
 <div id="thetaDone" role="status" hidden style="padding:14px;margin:12px 0;background:#dcfce7;color:#166534;border:1px solid #86efac;border-radius:6px;font-weight:bold"></div>
 <pre id="status">연결 중...</pre>
 <small id="performance"></small>
@@ -1699,16 +2194,23 @@ pre{white-space:pre-wrap;line-height:1.7}small{display:block;margin-top:16px;lin
 <div id="rig">
 <p><b>학습 데이터 녹화</b> (0.5초마다 원본 프레임 저장)</p>
 <button onclick="post('/api/record?on=1')">녹화 시작</button><button onclick="post('/api/record?on=0')">녹화 정지</button>
-<p><b>Z 노광 모드</b> (마스크 Z1+Z2: 내림 → 유지 → 올림)</p>
+<p><b>Z 노광 모드</b> (정밀부 Z1: 내림 → 유지 → 올림)</p>
 <button onclick="post('/api/zmode?mode=contact')">CONTACT</button>
-<button onclick="post('/api/zmode?mode=proximity')">PROXIMITY</button>
+<button onclick="post('/api/zmode?mode=proximity')">PROXIMITY</button><br>
+<small>위 두 버튼은 내림 → 유지 → 올림을 한 번에 합니다. 내린 채로 두려면 아래 버튼을 쓰세요.</small>
+<button onclick="post('/api/zstep?mode=contact&dir=-1')">CONTACT 내림</button><button onclick="post('/api/zstep?mode=contact&dir=1')">CONTACT 올림</button><br>
+<button onclick="post('/api/zstep?mode=proximity&dir=-1')">PROXIMITY 내림</button><button onclick="post('/api/zstep?mode=proximity&dir=1')">PROXIMITY 올림</button>
 <p><b>전자석</b></p>
-<button onclick="post('/api/magnet?n=1&on=1')">자석1 ON</button><button onclick="post('/api/magnet?n=1&on=0')">자석1 OFF</button><br>
-<button onclick="post('/api/magnet?n=2&on=1')">자석2 ON</button><button onclick="post('/api/magnet?n=2&on=0')">자석2 OFF</button>
+<button onclick="post('/api/magnet?n=1&on=1')">자석 ON</button><button onclick="post('/api/magnet?n=1&on=0')">자석 OFF</button>
 <p><b>이송부 수동</b></p>
-<select id="laxis"><option value="R1">레일1 (R1)</option><option value="R2">레일2 (R2)</option><option value="FY">포유테크 X (FY)</option></select>
+<select id="laxis"><option value="R1">레일1 (R1)</option><option value="R2">레일2 (R2)</option></select>
 <input id="lsteps" type="number" value="1000" min="1" style="width:90px"> steps<br>
 <button onclick="loader(-1)">− 방향</button><button onclick="loader(1)">+ 방향</button>
+<p><b>프리얼라인</b> (로더 카메라 · 노치)</p>
+<img id="pimg" alt="로더 카메라: 측정을 누르세요" style="max-width:100%;background:#111;border-radius:6px">
+<button onclick="pre('measure')">노치 측정</button><button onclick="pre('target')">기준 저장</button>
+<button class="start" onclick="pre('start')">PREALIGN</button>
+<small>기준 저장: 정밀 정렬이 끝난 웨이퍼의 노치 각도를 목표로 저장합니다 (rig_config.json). PREALIGN은 노치가 목표 각도에 올 때까지 프리얼라인 서보를 돌리고 다시 재기를 반복합니다.</small>
 <p><b>센서 · 이송</b></p>
 <button onclick="post('/api/dist')">거리 측정</button>
 <button onclick="post('/api/transfer')">이송 실행</button>
@@ -1719,17 +2221,21 @@ pre{white-space:pre-wrap;line-height:1.7}small{display:block;margin-top:16px;lin
 <script>
 async function post(path){await fetch(path,{method:'POST'});await refresh()}
 function manual(axis,steps){return post(`/api/manual?axis=${axis}&steps=${steps}`)}
+async function pre(a){await post(`/api/prealign?action=${a}`);document.getElementById('pimg').src='/prealign.jpg?t='+Date.now()}
 function loader(dir){const a=document.getElementById('laxis').value,n=parseInt(document.getElementById('lsteps').value||'0');if(n>0)return post(`/api/loader?axis=${a}&steps=${dir*n}`)}
 function jog(axis,dir){const px=document.querySelector('input[name=px]:checked').value;return post(`/api/manual?axis=${axis}&dir=${dir}&px=${px}`)}
 let refreshing=false;
 async function refresh(){if(refreshing)return;refreshing=true;try{
 const d=await(await fetch('/api/status',{cache:'no-store',signal:AbortSignal.timeout(3000)})).json();
 const n=x=>x==null?'-':x.toFixed(2);
+const alarm=document.getElementById('alignError');
+alarm.hidden=d.phase!=='FAULT';alarm.textContent=d.status;
 const banner=document.getElementById('thetaDone');
 banner.hidden=!d.theta_aligned;
 banner.textContent=d.phase==='DONE'?'세타 정렬 완료 · X·Y 정렬 완료':'세타 정렬 완료 — X·Y 정렬 시작 / 진행 중';
-document.getElementById('status').textContent=`${d.phase}: ${d.status}\nCamera: ${d.camera_index}\nArduino: ${d.arduino_connected?d.arduino_port:'OFF'}\nStage: ${d.motion_stage}\nRX: ${d.last_rx||'-'}\n녹화: ${d.recording?'● '+d.record_count+'장':'꺼짐'}\n거리: ${d.distance??'-'} mm · Z 모드: ${d.z_mode||'-'} · 이송 단계: ${d.transfer_steps}\nSerial: ${d.serial_error||'OK'}\nTheta: ${d.theta_aligned?'완료 시 '+n(d.theta_done_error):n(d.theta_error)} deg\nMASK 중심: ${d.mask_center?d.mask_center.map(n).join(', '):'-'}\nWAFER 중심: ${d.wafer_center?d.wafer_center.map(n).join(', '):'-'}\n중심 정렬 확인: ${d.wafer_lost_count}/8\ndx: ${n(d.dx)} px / dy: ${n(d.dy)} px\n축 매핑: ${d.axis_mapping}\n화면 X 보정: ${d.steps_x} / 화면 Y 보정: ${d.steps_y}\nMASK: ${d.mask_detected?'OK':'NO'}\nWAFER: ${d.wafer_detected?'OK':'NO'}\nStable: ${d.stable} (${d.history_len}/${d.stable_history})`;
+document.getElementById('status').textContent=`${d.phase}: ${d.status}\nCamera: ${d.camera_index}\nArduino: ${d.arduino_connected?d.arduino_port:'OFF'}\nStage: ${d.motion_stage}\nRX: ${d.last_rx||'-'}\n녹화: ${d.recording?'● '+d.record_count+'장':'꺼짐'}\n노치: ${d.prealign_angle==null?'-':n(d.prealign_angle)} deg · 목표: ${d.prealign_target==null?'미설정':n(d.prealign_target)} deg (카메라 ${d.prealign_camera})\n거리: ${d.distance??'-'} mm · Z 모드: ${d.z_mode||'-'} · 이송 단계: ${d.transfer_steps}\nSerial: ${d.serial_error||'OK'}\nTheta: ${d.theta_aligned?'완료 시 '+n(d.theta_done_error):n(d.theta_error)} deg\nMASK 중심: ${d.mask_center?d.mask_center.map(n).join(', '):'-'}\nWAFER 중심: ${d.wafer_center?d.wafer_center.map(n).join(', '):'-'}\n중심 정렬 확인: ${d.wafer_lost_count}/8\ndx: ${n(d.dx)} px / dy: ${n(d.dy)} px\n축 매핑: ${d.axis_mapping}\n화면 X 보정: ${d.steps_x} / 화면 Y 보정: ${d.steps_y}\nMASK: ${d.mask_detected?'OK':'NO'}\nWAFER: ${d.wafer_detected?'OK':'NO'}\nStable: ${d.stable} (${d.history_len}/${d.stable_history})`;
 document.getElementById('finish').style.display=d.align_finished?'flex':'none';
+if(d.auto_running&&d.status.startsWith('PREALIGN'))document.getElementById('pimg').src='/prealign.jpg?t='+Date.now();
 document.getElementById('performance').textContent=`촬영 ${n(d.capture_fps)} / 화면 ${n(d.preview_fps)} / 인식 ${n(d.vision_fps)} FPS · 인식 ${n(d.vision_ms)} ms · 패턴 캐시 ${n(d.cache_mb)} / ${d.cache_limit_mb} MiB · 해상도 ${d.camera_shape?d.camera_shape.join('×'):'-'} · 촬영 후 ${n(d.measurement_age_ms)} ms / 결과 갱신 후 ${n(d.result_age_ms)} ms · 표시 완화 ${d.overlay_smoothing_ms} ms`;
 }catch(e){document.getElementById('status').textContent='UI disconnected'}finally{refreshing=false}}
 setInterval(refresh,300);refresh();

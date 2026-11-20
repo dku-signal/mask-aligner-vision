@@ -38,6 +38,7 @@ class World:
         self.A = np.array([[0.40, -14.34], [13.77, -0.98]])/30.0
         self.backlash = 2.0  # steps lost on each direction reversal
         self.pos = np.zeros(2)      # commanded steps
+        self.notch, self.loader_y = 0.0, 0.0  # loader camera: notch angle, disc offset (px)
         self.eff = np.zeros(2)      # effective (after backlash/noise) steps
         self.last_dir = np.zeros(2)
 
@@ -138,9 +139,12 @@ class FakeFirmware(threading.Thread):
             time.sleep(abs(n)*200e-6+.05)
             self.world.step(axis, n)
             self.reply('DONE')
-        elif line[:3] in ('R1 ', 'R2 ', 'FY '):
+        elif line[:3] in ('R1 ', 'R2 '):
             self.reply(f'MOVE {line}')
-            time.sleep(.05)
+            n = int(line[3:])
+            time.sleep(abs(n)/5000+.05)  # rails ~5000 steps/s
+            if line[:2] == 'R2':
+                self.world.loader_y += n/250  # R2 moves the disc down the loader image, 250 steps/px
             self.reply('DONE')
         elif line.startswith('Z '):
             _, which, d, ms = line.split()
@@ -150,6 +154,18 @@ class FakeFirmware(threading.Thread):
             self.reply(f'DONE {line}')
         elif line == 'DIST':
             self.reply('DIST 1.58')
+        elif line.startswith('PT '):
+            # Continuous servo, non-blocking like the firmware: dead zone ~40 ms, then ~0.09 deg/ms,
+            # turning the notch backwards. Rotation is applied gradually so frames see it turn.
+            _, seq, d, ms = line.split()[:4]
+            self.reply(f'START PT {seq}')
+
+            def turn():
+                for _ in range(10):
+                    time.sleep(int(ms)/10000)
+                    self.world.notch = (self.world.notch-int(d)*0.09*max(0, int(ms)-40)/10) % 360
+                self.reply(f'DONE PT {seq}')
+            threading.Thread(target=turn, daemon=True).start()
         elif line.startswith('T'):
             self.reply('ERR T disabled')
         else:
@@ -180,6 +196,10 @@ def main():
     app_mod.load_calibration(SIM_CAL)
     app = app_mod.MaskAlignerApp(camera_index=0, detector='opencv', skip_theta=True)
     app.start()
+    app.start_align()  # no frame yet: both keys unseen, so START must refuse and move nothing
+    with app.lock:
+        print(f'  START before any frame -> {app.phase}: {app.status}')
+        assert app.phase == 'FAULT' and not app.auto_running
     time.sleep(2.0)
     t0 = time.time()
     app.start_align()
@@ -197,6 +217,13 @@ def main():
     true = world.wafer()-world.mask
     moves = [l for l in fw.log if l[:2] in ('X ', 'Y ')]
     xy_result = (app.phase, len(moves), time.time()-t0, true.copy())
+    time.sleep(0.6)  # the Z up worker starts 0.3 s after ALIGN FINISH
+    while True:  # the mask plate goes back up after ALIGN FINISH
+        time.sleep(.1)
+        with app.lock:
+            if not app.moving:
+                break
+    print('  Z after align:', [l for l in fw.log if l.startswith('Z ')][-2:])
 
     print('\n=== 3. Z mode, magnet, loader, distance, transfer (aligner_mega lines)')
     app_mod.Z_MODES = {'contact': (200, 300, 200), 'proximity': (100, 300, 100)}
@@ -218,6 +245,47 @@ def main():
     run('transfer', lambda: app.run_commands('transfer', [(l, 'DONE*', 5.0, 0.0) for l in app_mod.TRANSFER_SEQUENCE]))
     print('  sent:', fw.log[start:])
     print(f'  distance shown: {app.distance} mm, z mode: {app.z_last_mode}')
+    print('\n=== 4. pre-align: notch on a synthetic loader frame, PT pulses')
+    world.notch = 250.0
+    rng = np.random.default_rng(1)
+
+    def loader_frame():
+        img = rng.normal(30, 6, (480, 640)).clip(0, 255).astype(np.uint8)
+        c, r, a = (330, int(round(235+world.loader_y))), 170, np.radians(world.notch)
+        cv2.circle(img, c, r, 225, -1, cv2.LINE_AA)
+        tip = (c[0]+r*np.cos(a), c[1]+r*np.sin(a))
+        side = np.array([-np.sin(a), np.cos(a)])*14
+        notch = np.array([tip+side, tip-side, (c[0]+(r-22)*np.cos(a), c[1]+(r-22)*np.sin(a))])
+        cv2.fillPoly(img, [np.round(notch*16).astype(np.int32)], 30, cv2.LINE_AA, shift=4)
+        return cv2.cvtColor(cv2.GaussianBlur(img, (3, 3), 0), cv2.COLOR_GRAY2BGR)
+    app.prealign_grab = loader_frame
+    app_mod.PREALIGN_TARGET_DEG = 30.0
+    start = len(fw.log)
+    run('prealign', app.start_prealign)
+    pts = [l for l in fw.log[start:] if l.startswith('PT ')]
+    print(f'  pulses: {pts}')
+    print(f'  TRUE notch {world.notch:.2f} deg, target 30.00 -> err {(world.notch-30+180)%360-180:+.2f} deg')
+    print('\n=== 5. transfer (method 2): unwind, measure, turn while R1 carries, fine theta, Y rail by feedback')
+    world.notch = 140.0
+    app_mod.Y_RAIL_MAX_STEPS = 20000
+    app_mod.TRANSFER_SEQUENCE = ['@UNWIND', '@STAGE_HOME', 'MAG 1 1', '@MEASURE', '@TURN', 'R1 -6000', '@THETA',
+                                 '@Y', 'R1 -3000', 'MAG 1 0']
+    start = len(fw.log)
+    t0 = time.time()
+    run('transfer', lambda: app.start_worker('transfer', app.transfer_run))
+    print(f'  sent: {fw.log[start:]}  ({time.time()-t0:.1f} s)')
+    print(f'  TRUE notch err {(world.notch-30+180)%360-180:+.2f} deg, net PT ms {app_mod.PREALIGN_NET_MS}')
+    # Feedback loop: the fine stage needs 0.8 fine steps per rail step the rail is off the ideal 17500.
+    print('  method 2 feedback over 5 wafers (ideal rail 17500, fine = -0.8 * (rail - 17500)):')
+    for k in range(5):
+        rail = app_mod.Y_RAIL_MAX_STEPS-app_mod.Y_RAIL_CORRECTION
+        app.y_rail_sent = rail
+        fine = int(round(-0.8*(rail-17500)))
+        note = app.y_feedback(fine)
+        print(f'    wafer {k+1}: rail {rail:6d} -> fine Y needed {fine:+6d}   {note}  ratio {app_mod.Y_RAIL_PER_FINE}')
+    run('unwind', lambda: app.start_worker('unwind', lambda g: 'unwound' if app.unwind(g) else 'stopped'))
+    print(f'  after unwind: net PT ms {app_mod.PREALIGN_NET_MS}')
+
     phase, nmoves, elapsed, true = xy_result
     print(f'\nresult: phase={phase}  moves={nmoves}  time={elapsed:.1f}s')
     print(f'TRUE remaining offset: dx={true[0]:+.3f} px  dy={true[1]:+.3f} px  |e|={np.linalg.norm(true):.3f} px')

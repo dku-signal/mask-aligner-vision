@@ -1,41 +1,43 @@
 // Mask aligner + wafer loader, one Arduino Mega 2560 (SW protocol + HW team's manual letters)
 //
 // Merges firmware/xy_tb6560 (finite moves with replies, used by the Python app) with the
-// HW team's Mega_Actuator_Laser sketch (2026-11, manual single-letter control + laser).
+// HW team's Mega_All_Control sketch (2026-11-11, manual single-letter control + laser).
 //
-// Pins (HW team sketch, 2026-11):
-//   Aligner X  : STEP D10, DIR D11 (upper rail)   Aligner Y : STEP D8, DIR D9 (lower rail)
-//   Rail 1     : STEP D24, DIR D25                Rail 2    : STEP D26, DIR D27   (TB6560, STEP idles HIGH)
-//   Foyu X     : IN1..IN4 = D2..D5 (4-wire stepper driver, 8 ms per phase)
-//   Z1         : IN1 D22, IN2 D23                 Z2        : IN1 D36, IN2 D37    (DC, LOW/LOW = stop)
-//   Theta      : servo D30                        Pre-align : servo D31
-//   Magnet 1/2 : D32 / D33 (HIGH = ON)
+// Pins (HW team's Mega_All_Control, 2026-11-11; the Foyu axis is gone):
+//   Aligner X  : STEP D48, DIR D49                Aligner Y : STEP D22, DIR D23
+//   Rail 1     : STEP D52, DIR D53                Rail 2    : STEP D26, DIR D27   (TB6560, STEP idles HIGH)
+//   Z1         : IN1 D2,  IN2 D3  ("original Z")  (DC H-bridge, LOW/LOW = stop)
+//   Z2         : IN1 D34, IN2 D35                 Z3        : IN1 D38, IN2 D39
+//   Theta      : servo D5                         Pre-align : servo D6
+//   Magnet     : D7 (HIGH = ON)
 //   Laser      : HG-C1050 voltage out -> 30k/30k divider -> ADS1115 A0 (I2C D20/D21, addr 0x48)
 //
 // Line commands (newline terminated). The first group is unchanged from xy_tb6560, so
 // mask_aligner_optimized_v4.py, calibrate_xy.py and preflight.py work as before.
 //   X <steps> / Y <steps>      move aligner axis, reply "MOVE X <n>" ... "DONE" (soft limit applies)
-//   PING -> PONG   POS -> "POS X= Y= LIM= R1= R2= FY="   ZERO   LIM <steps>   SPD <us>
+//   PING -> PONG   POS -> "POS X= Y= LIM= R1= R2="   ZERO   LIM <steps>   SPD <us>
 //   T <id> <dir> <ms> [speed]  continuous theta servo: timed turn, reply "DONE T <id>"
 //   P <us>                     hold a theta pulse width (servo test), reply "DONE P <us>"
 //   s | STOP                   stop everything that moves, reply "STOP"
 // Added for the loader / Z / sensor:
 //   R1 <steps> / R2 <steps>    move rail 1 / rail 2, reply "MOVE R1 <n>" ... "DONE"
-//   FY <steps>                 move the Foyu X axis, reply "MOVE FY <n>" ... "DONE"
-//   Z <1|2|3> <dir> <ms>       run Z1, Z2 or both (3); dir +1 = up; reply "DONE Z"
-//   MAG <1|2> <0|1>            magnet off/on, reply "DONE MAG <n> <v>"
+//   Z <mask> <dir> <ms>        run Z1 (1), Z2 (2), Z3 (4) or a sum of them; dir +1 = up; reply "DONE Z"
+//   MAG 1 <0|1>                magnet off/on, reply "DONE MAG 1 <v>"
 //   TA <deg> / PA <deg>        theta / pre-align angle (positional servo only), reply "DONE TA <deg>"
-//   PT <id> <dir> <ms> [speed] pre-align continuous servo timed turn, reply "DONE PT <id>"
+//   PT <id> <dir> <ms> [speed] pre-align continuous servo timed turn, NON-BLOCKING: reply "START PT <id>"
+//                              at once, "DONE PT <id>" when the time is up. Other commands (a rail
+//                              move R1/R2) run meanwhile, so the wafer turns while it is carried.
 //   DIST                       one laser reading, reply "DIST <mm>" | "DIST ERR" | "DIST NOSENSOR"
 //   STREAM <0|1>               print "D <mm>" every 200 ms while idle (HW manual use; app keeps it 0)
 //
 // HW team's manual letters (a single letter on its own line, as in their sketch):
-//   F/B X jog   f/b Y jog   Q/W rail 1 jog   E/R rail 2 jog   O/P Foyu jog
-//   u/d Z1 up/down   A/S Z2 up/down   T/G theta 90/0   t pre-align 0/90   M/m magnet 1/2 toggle
+//   F/B X jog   f/b Y jog   Q/W rail 1 jog   E/R rail 2 jog
+//   u/d Z1 up/down   O/P Z2 up/down   K/L Z3 up/down   T/G theta 90/0   t pre-align 0/90   M magnet toggle
 //   X or x stops all motion (magnets and servo angles are kept).
 // Jogs run until a stop letter (s S x X) or a timeout: rails JOG_MAX_MS, Z ZJOG_MAX_MS.
 //
-// One thing moves at a time; every move checks for a stop letter between steps.
+// One blocking move at a time, except the pre-align servo turn (PT), which runs in the background
+// alongside it. Every move checks for a stop letter between steps.
 
 #include <EEPROM.h>
 #include <Servo.h>
@@ -52,27 +54,22 @@
 const bool THETA_POSITIONAL = false;
 const bool PREALIGN_POSITIONAL = false;
 
-const byte Y_STEP_PIN = 8;
-const byte Y_DIR_PIN = 9;
-const byte X_STEP_PIN = 10;
-const byte X_DIR_PIN = 11;
-const byte R1_STEP_PIN = 24;
-const byte R1_DIR_PIN = 25;
+const byte X_STEP_PIN = 48;
+const byte X_DIR_PIN = 49;
+const byte Y_STEP_PIN = 22;
+const byte Y_DIR_PIN = 23;
+const byte R1_STEP_PIN = 52;
+const byte R1_DIR_PIN = 53;
 const byte R2_STEP_PIN = 26;
 const byte R2_DIR_PIN = 27;
 
-const byte FOYU_PINS[4] = {2, 3, 4, 5};
-const byte FOYU_PHASES[4][4] = {{1, 0, 1, 0}, {0, 1, 1, 0}, {0, 1, 0, 1}, {1, 0, 0, 1}};
-const unsigned long FOYU_STEP_US = 8000;
-
-const byte Z1_IN1_PIN = 22;
-const byte Z1_IN2_PIN = 23;
-const byte Z2_IN1_PIN = 36;
-const byte Z2_IN2_PIN = 37;
+// Z H-bridges: {IN1, IN2}; Z command bit i drives Z_PINS[i].
+const byte Z_COUNT = 3;
+const byte Z_PINS[Z_COUNT][2] = {{2, 3}, {34, 35}, {38, 39}};
 const unsigned long Z_MAX_MS = 15000;
 
-const byte THETA_PIN = 30;
-const byte PREALIGN_PIN = 31;
+const byte THETA_PIN = 5;
+const byte PREALIGN_PIN = 6;
 const int SERVO_NEUTRAL_US = 1500;  // stop for a continuous servo, 90 deg for a positional one
 const int THETA_SPEED_US = 100;
 const unsigned long THETA_MAX_MS = 250;
@@ -82,8 +79,9 @@ Servo prealignServo;
 bool thetaAtB = false;
 bool prealignAtB = false;
 
-const byte MAGNET_PINS[2] = {32, 33};
-bool magnetOn[2] = {false, false};
+const byte MAGNET_COUNT = 1;
+const byte MAGNET_PINS[MAGNET_COUNT] = {7};
+bool magnetOn[MAGNET_COUNT] = {false};
 
 // Laser (HW team's calibration, 2026-11)
 Adafruit_ADS1115 ads;
@@ -108,8 +106,7 @@ const long RAIL_MAX_MOVE_STEPS = 400000; // loader rails per command
 const unsigned long JOG_MAX_MS = 3000;
 const unsigned long ZJOG_MAX_MS = 10000;
 
-long posX = 0, posY = 0, posR1 = 0, posR2 = 0, posFY = 0;
-int foyuPhase = 0;
+long posX = 0, posY = 0, posR1 = 0, posR2 = 0;
 
 char lineBuf[48];
 byte lineLen = 0;
@@ -152,6 +149,11 @@ void loadPosition() {
   }
 }
 
+// Background pre-align turn (PT): the servo is driven for ptMs, then released.
+bool ptActive = false;
+long ptId = 0;
+unsigned long ptStart = 0, ptMs = 0;
+
 // ---------------------------------------------------------------- stop helpers
 
 void idleRails() {
@@ -161,15 +163,11 @@ void idleRails() {
   digitalWrite(R2_STEP_PIN, HIGH);
 }
 
-void foyuOff() {
-  for (byte i = 0; i < 4; i++) digitalWrite(FOYU_PINS[i], LOW);
-}
-
 void zStop() {
-  digitalWrite(Z1_IN1_PIN, LOW);
-  digitalWrite(Z1_IN2_PIN, LOW);
-  digitalWrite(Z2_IN1_PIN, LOW);
-  digitalWrite(Z2_IN2_PIN, LOW);
+  for (byte i = 0; i < Z_COUNT; i++) {
+    digitalWrite(Z_PINS[i][0], LOW);
+    digitalWrite(Z_PINS[i][1], LOW);
+  }
 }
 
 // A continuous servo creeps at "neutral" 1500 us (2026-11-05: the disc turned ~2 deg and
@@ -193,10 +191,19 @@ void continuousServosStop() {
 
 // Stops motion only: magnets stay as they are, positional servos keep their angle.
 void stopAll() {
+  ptActive = false;
   idleRails();
-  foyuOff();
   zStop();
   continuousServosStop();
+}
+
+void ptService() {
+  if (ptActive && millis() - ptStart >= ptMs) {
+    ptActive = false;
+    servoRelease(prealignServo, PREALIGN_POSITIONAL);
+    Serial.print("DONE PT ");
+    Serial.println(ptId);
+  }
 }
 
 bool isStopChar(char c) {
@@ -205,6 +212,7 @@ bool isStopChar(char c) {
 
 // True if a stop letter arrived (consumed). Other input waits until the move ends.
 bool stopRequested() {
+  ptService();  // every blocking loop passes here, so a background PT ends on time
   while (Serial.available() > 0) {
     char c = Serial.peek();
     if (isStopChar(c)) {
@@ -304,57 +312,14 @@ void jog(Axis &a, int dir) {
   if (a.limited) savePosition();
 }
 
-// ---------------------------------------------------------------- Foyu 4-wire stepper
-
-void foyuStep(int dir) {
-  foyuPhase = (foyuPhase + dir + 4) % 4;
-  for (byte i = 0; i < 4; i++) digitalWrite(FOYU_PINS[i], FOYU_PHASES[foyuPhase][i]);
-  posFY += dir;
-}
-
-// Runs |steps| phases (or until timeoutMs when steps == 0). Returns false if stopped.
-bool runFoyu(long steps, int dir, unsigned long timeoutMs) {
-  unsigned long start = millis();
-  unsigned long last = micros() - FOYU_STEP_US;
-  long done = 0;
-  while (steps == 0 || done < steps) {
-    if (stopRequested()) {
-      foyuOff();
-      return false;
-    }
-    if (steps == 0 && millis() - start > timeoutMs) break;
-    if (micros() - last >= FOYU_STEP_US) {
-      last = micros();
-      foyuStep(dir);
-      done++;
-    }
-  }
-  foyuOff();  // as in the HW sketch: coils off when stopped
-  return true;
-}
-
-void moveFoyu(long steps) {
-  if (steps == 0 || labs(steps) > RAIL_MAX_MOVE_STEPS) {
-    Serial.println("ERR FY range");
-    return;
-  }
-  Serial.print("MOVE FY ");
-  Serial.println(steps);
-  bool completed = runFoyu(labs(steps), steps > 0 ? 1 : -1, 0);
-  Serial.println(completed ? "DONE" : "STOP");
-}
-
 // ---------------------------------------------------------------- Z (DC actuators)
 
 void zDrive(byte which, int dir) {
-  // which: 1 = Z1, 2 = Z2, 3 = both. dir +1 = up (IN1 HIGH), -1 = down.
-  if (which & 1) {
-    digitalWrite(Z1_IN1_PIN, dir > 0 ? HIGH : LOW);
-    digitalWrite(Z1_IN2_PIN, dir > 0 ? LOW : HIGH);
-  }
-  if (which & 2) {
-    digitalWrite(Z2_IN1_PIN, dir > 0 ? HIGH : LOW);
-    digitalWrite(Z2_IN2_PIN, dir > 0 ? LOW : HIGH);
+  // which: bit 0 = Z1, bit 1 = Z2, bit 2 = Z3. dir +1 = up (IN1 HIGH), -1 = down.
+  for (byte i = 0; i < Z_COUNT; i++) {
+    if (!(which & (1 << i))) continue;
+    digitalWrite(Z_PINS[i][0], dir > 0 ? HIGH : LOW);
+    digitalWrite(Z_PINS[i][1], dir > 0 ? LOW : HIGH);
   }
 }
 
@@ -377,7 +342,7 @@ void moveZ(char *line) {
   long which = 0, ms = 0;
   int dir = 0;
   char extra;
-  if (sscanf(line, "Z %ld %d %ld %c", &which, &dir, &ms, &extra) != 3 || which < 1 || which > 3 ||
+  if (sscanf(line, "Z %ld %d %ld %c", &which, &dir, &ms, &extra) != 3 || which < 1 || which >= (1 << Z_COUNT) ||
       (dir != 1 && dir != -1) || ms < 1 || ms > (long)Z_MAX_MS) {
     Serial.println("ERR Z range");
     return;
@@ -387,7 +352,7 @@ void moveZ(char *line) {
 }
 
 void jogZ(byte which, int dir) {
-  Serial.print(which == 1 ? "Z1" : "Z2");
+  Serial.print(which == 1 ? "Z1" : which == 2 ? "Z2" : "Z3");
   Serial.println(dir > 0 ? " Up" : " Down");
   bool completed = runZ(which, dir, ZJOG_MAX_MS);
   Serial.println(completed ? "STOP jog timeout" : "STOP");
@@ -433,8 +398,21 @@ void turnCommand(char *line, bool prealign) {
     Serial.println(" range");
     return;
   }
-  bool completed = timedTurn(prealign ? prealignServo : thetaServo, prealign ? PREALIGN_PIN : THETA_PIN,
-                             dir, (unsigned long)ms, (int)speed);
+  if (prealign) {
+    if (ptActive) {
+      Serial.println("ERR PT busy");
+      return;
+    }
+    servoDrive(prealignServo, PREALIGN_PIN, SERVO_NEUTRAL_US + dir * (int)speed);
+    ptActive = true;
+    ptId = id;
+    ptStart = millis();
+    ptMs = (unsigned long)ms;
+    Serial.print("START PT ");
+    Serial.println(id);
+    return;
+  }
+  bool completed = timedTurn(thetaServo, THETA_PIN, dir, (unsigned long)ms, (int)speed);
   if (!completed) {
     Serial.println("STOP");
     return;
@@ -524,15 +502,12 @@ bool manualLetter(char c) {
     case 'W': jog(axisR1, -1); return true;
     case 'E': jog(axisR2, 1); return true;
     case 'R': jog(axisR2, -1); return true;
-    case 'O':
-    case 'P':
-      Serial.println(c == 'O' ? "FY Forward" : "FY Backward");
-      Serial.println(runFoyu(0, c == 'O' ? 1 : -1, JOG_MAX_MS) ? "STOP jog timeout" : "STOP");
-      return true;
     case 'u': jogZ(1, 1); return true;
     case 'd': jogZ(1, -1); return true;
-    case 'A': jogZ(2, 1); return true;
-    case 'S': jogZ(2, -1); return true;
+    case 'O': jogZ(2, 1); return true;
+    case 'P': jogZ(2, -1); return true;
+    case 'K': jogZ(4, 1); return true;
+    case 'L': jogZ(4, -1); return true;
     case 'T':
     case 'G':
       if (!THETA_POSITIONAL) {
@@ -553,14 +528,9 @@ bool manualLetter(char c) {
       }
       return true;
     case 'M':
-    case 'm': {
-      byte i = (c == 'M') ? 0 : 1;
-      setMagnet(i, !magnetOn[i]);
-      Serial.print("MAG ");
-      Serial.print(i + 1);
-      Serial.println(magnetOn[i] ? " ON" : " OFF");
+      setMagnet(0, !magnetOn[0]);
+      Serial.println(magnetOn[0] ? "MAG 1 ON" : "MAG 1 OFF");
       return true;
-    }
     case 'X':
     case 'x':
     case 's':
@@ -572,7 +542,7 @@ bool manualLetter(char c) {
 }
 
 bool isManualLetter(char c) {
-  return strchr("FBfbQWEROPudASTGtMmXxs", c) != NULL;
+  return strchr("FBfbQWERudOPKLTGtMXxs", c) != NULL;
 }
 
 void processLine(char *line) {
@@ -593,9 +563,7 @@ void processLine(char *line) {
     Serial.print(" R1=");
     Serial.print(posR1);
     Serial.print(" R2=");
-    Serial.print(posR2);
-    Serial.print(" FY=");
-    Serial.println(posFY);
+    Serial.println(posR2);
   } else if (strcmp(line, "ZERO") == 0) {
     posX = posY = 0;
     savePosition();
@@ -615,11 +583,9 @@ void processLine(char *line) {
     moveAxis(axisR1, n);
   } else if (sscanf(line, "R2 %ld %c", &n, &extra) == 1) {
     moveAxis(axisR2, n);
-  } else if (sscanf(line, "FY %ld %c", &n, &extra) == 1) {
-    moveFoyu(n);
   } else if (line[0] == 'Z' && line[1] == ' ') {
     moveZ(line);
-  } else if (sscanf(line, "MAG %ld %ld %c", &a, &b, &extra) == 2 && (a == 1 || a == 2) && (b == 0 || b == 1)) {
+  } else if (sscanf(line, "MAG %ld %ld %c", &a, &b, &extra) == 2 && a >= 1 && a <= MAGNET_COUNT && (b == 0 || b == 1)) {
     setMagnet((byte)(a - 1), b == 1);
     Serial.print("DONE MAG ");
     Serial.print(a);
@@ -660,14 +626,15 @@ void setup() {
   digitalWrite(R1_DIR_PIN, LOW);
   digitalWrite(R2_DIR_PIN, LOW);
   const byte outputs[] = {X_STEP_PIN, X_DIR_PIN, Y_STEP_PIN, Y_DIR_PIN,
-                          R1_STEP_PIN, R1_DIR_PIN, R2_STEP_PIN, R2_DIR_PIN,
-                          Z1_IN1_PIN, Z1_IN2_PIN, Z2_IN1_PIN, Z2_IN2_PIN};
+                          R1_STEP_PIN, R1_DIR_PIN, R2_STEP_PIN, R2_DIR_PIN};
   zStop();
-  foyuOff();
-  for (byte i = 0; i < 2; i++) digitalWrite(MAGNET_PINS[i], LOW);
+  for (byte i = 0; i < MAGNET_COUNT; i++) digitalWrite(MAGNET_PINS[i], LOW);
   for (byte i = 0; i < sizeof(outputs); i++) pinMode(outputs[i], OUTPUT);
-  for (byte i = 0; i < 4; i++) pinMode(FOYU_PINS[i], OUTPUT);
-  for (byte i = 0; i < 2; i++) pinMode(MAGNET_PINS[i], OUTPUT);
+  for (byte i = 0; i < Z_COUNT; i++) {
+    pinMode(Z_PINS[i][0], OUTPUT);
+    pinMode(Z_PINS[i][1], OUTPUT);
+  }
+  for (byte i = 0; i < MAGNET_COUNT; i++) pinMode(MAGNET_PINS[i], OUTPUT);
 
   loadPosition();
 
@@ -698,6 +665,7 @@ void setup() {
 }
 
 void loop() {
+  ptService();
   while (Serial.available() > 0) {
     char c = Serial.read();
     if (c == '\n' || c == '\r') {

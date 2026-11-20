@@ -43,6 +43,13 @@ MASK_CONFIRM = 3
 DARK_MARGIN = 60  # grey levels a held square must stay below the gap between the keys
 FIT_RADIUS = 6     # px the model fit may move a cross away from its disc-based place
 NEAR_SIDES = 2.5  # a cross this close to its key (in square widths) may be found without YOLO
+# A square is found by shape, not by darkness: darker than 3 of its 4 sides by this fraction
+# of their brightness (over the black stage the film round a square is ~0.3 brighter, over the
+# white wafer ~0.7) and by this many grey levels.
+SQUARE_CONTRAST = 0.12
+SQUARE_STEP = 8
+FIT_MAX_RMS = 0.12  # square widths: a worse two-key fit (squares merged with cross arms) is no mask
+FIT_RMS_SLACK = 0.3  # px: a fresh full mask replaces the held one unless its fit is clearly worse
 
 
 def fit_overlap(obs, plate, cross, guess, radius):
@@ -139,29 +146,53 @@ class TwoPairKeys:
         return box[order][cls[order] == 0], box[order][cls[order] == 1], conf[order][cls[order] == 1]
 
     @staticmethod
-    def more_squares(gray, boxes, reach=2.5):
-        """Square boxes YOLO missed: dark square blobs of the same size near the YOLO squares."""
+    def square_contrast(gray, size):
+        """(ratio, step) per pixel: how much darker a square-sized patch there is than its sides.
+
+        The reference is the second darkest of the 4 side strips, so one side may lie on the black
+        stage, while a straight edge (one bright side only) is no square.
+        """
+        g = gray.astype(np.float32)
+        s = max(3, int(round(0.8*size)))  # inside the square, clear of its blurred border
+        w = max(3, int(round(0.35*size)))
+        off = int(round(size/2+w/2+0.1*size))
+        inner = cv2.boxFilter(g, -1, (s, s))
+        sides = []
+        for dx, dy, k in ((-off, 0, (w, s)), (off, 0, (w, s)), (0, -off, (s, w)), (0, off, (s, w))):
+            shift = np.float32([[1, 0, -dx], [0, 1, -dy]])
+            sides.append(cv2.warpAffine(cv2.boxFilter(g, -1, k), shift, g.shape[::-1], borderMode=cv2.BORDER_REPLICATE))
+        sides = np.sort(sides, 0)
+        side = sides[1]
+        ratio = (side-inner)/np.maximum(side, 10)
+        # A darker side as dark as the patch is the same dark shape going on (a cross arm), no square;
+        # a square at the black stage has that side clearly darker than itself.
+        ratio[(sides[0] < side-SQUARE_STEP) & (abs(sides[0]-inner) < SQUARE_STEP)] = 0
+        return ratio, side-inner
+
+    @classmethod
+    def more_squares(cls, gray, boxes, reach=4.0):
+        """YOLO square boxes plus the squares it missed nearby, and the contrast of each.
+
+        YOLO misses squares over the black stage (the film there is only ~25 grey levels
+        brighter than the square), so the others are found by their shape: local contrast peaks.
+        """
         size = float(np.median(np.r_[boxes[:, 2]-boxes[:, 0], boxes[:, 3]-boxes[:, 1]]))
         x0, y0 = (boxes[:, :2].min(0)-reach*size).astype(int).clip(0)
-        x1, y1 = (boxes[:, 2:].max(0)+reach*size).astype(int)
-        roi = gray[y0:y1, x0:x1]
-        # Local threshold: the squares sit on bright and dark backgrounds alike.
-        block = int(4*size) | 1
-        dark = cv2.adaptiveThreshold(roi, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, block, 15)
-        found = []
-        for c in cv2.findContours(dark, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)[0]:
-            x, y, w, h = cv2.boundingRect(c)
-            area = cv2.contourArea(c)
-            if not (0.6*size <= w <= 1.5*size and 0.6*size <= h <= 1.5*size and area >= 0.6*w*h):
-                continue
-            found.append([x0+x, y0+y, x0+x+w, y0+y+h])
-        found = np.array(found, float).reshape(-1, 4)
+        x1, y1 = np.minimum((boxes[:, 2:].max(0)+reach*size).astype(int), gray.shape[::-1])
+        ratio, step = cls.square_contrast(gray[y0:y1, x0:x1], size)
+        k = int(size) | 1
+        peak = (ratio == cv2.dilate(ratio, np.ones((k, k), np.uint8))) & (ratio > SQUARE_CONTRAST) & (step > SQUARE_STEP)
+        near = cv2.dilate(ratio, np.ones((k//2 | 1,)*2, np.uint8))
         centers = lambda b: (b[:, :2]+b[:, 2:])/2
         merged = list(boxes)
-        for b, c in zip(found, centers(found)):
+        contrast = [float(near[int(np.clip(y-y0, 0, y1-y0-1)), int(np.clip(x-x0, 0, x1-x0-1))]) for x, y in centers(boxes)]
+        ys, xs = np.nonzero(peak)
+        for i in np.argsort(-ratio[ys, xs]):
+            c = np.array([x0+xs[i], y0+ys[i]], float)
             if min(np.linalg.norm(centers(np.array(merged))-c, axis=1)) > size/2:
-                merged.append(b)
-        return np.array(merged)
+                merged.append(np.r_[c-size/2, c+size/2])
+                contrast.append(float(ratio[ys[i], xs[i]]))
+        return np.array(merged), np.array(contrast)
 
     @staticmethod
     def is_grid(pts, tol=0.25):
@@ -172,12 +203,13 @@ class TwoPairKeys:
         return bool(side > 0 and d[3] < 1.2*d[0] and np.all(abs(d[4:]-side*np.sqrt(2)) < tol*side))
 
     @classmethod
-    def complete_groups(cls, pts):
+    def complete_groups(cls, pts, hidden_ok=None):
         """Two 2x2 groups from 6-8 square centres: (group1, group2, measured flags) or None.
 
         One group must be fully seen; the other may miss a corner (parallelogram rule) or a whole
         row of two (shifted by the seen group's edge that points towards it). Every frame is
-        measured afresh: nothing comes from an earlier frame.
+        measured afresh: nothing comes from an earlier frame. hidden_ok(point) may veto a filled-in
+        square (one that would have been seen there).
         """
         from itertools import combinations
         n = len(pts)
@@ -191,6 +223,9 @@ class TwoPairKeys:
             for k in (4, 3, 2):
                 for sub in combinations(range(len(others)), k):
                     found = cls.second_group(a, others[list(sub)])
+                    if found is not None and hidden_ok is not None and \
+                            not all(hidden_ok(q) for q in np.vstack(found[:2])[~found[2]]):
+                        found = None
                     if found is not None and (best is None or found[2].sum() > best[2].sum()):
                         best = found
                 if best is not None and best[2].sum() == 4+k:
@@ -221,6 +256,8 @@ class TwoPairKeys:
         if len(rest) == 2 and abs(np.linalg.norm(rest[1]-rest[0])-side) < .25*side:
             edge = rest[1]-rest[0]
             away = rest.mean(0)-a.mean(0)
+            if abs(edge@away) > 0.5*np.linalg.norm(edge)*np.linalg.norm(away):
+                return None  # the seen row must face key a; a column pointing at it gives no side to grow
             v = np.array([-edge[1], edge[0]])
             v *= side/np.linalg.norm(v)*np.sign(v@away)
             b = np.vstack([rest, rest+v])
@@ -228,23 +265,69 @@ class TwoPairKeys:
                 return a, b, np.r_[np.ones(6, bool), False, False]
         return None
 
+    @staticmethod
+    def fit_keys(ga, gb, measured, weight):
+        """Both keys refitted as two equal 2x2 squares through the measured ones: (ga, gb, rms).
+
+        One plate carries both keys, so they share one side vector u and every square is
+        c_k + a*u + b*u_perp (a, b = +-1/2): 6 unknowns, linear. Weighted by contrast, the
+        clear squares fix the fit and the faint ones over the black stage only nudge it.
+        """
+        pts = np.vstack([ga, gb])
+        c = [ga.mean(0), gb.mean(0)]
+        r = ga[0]-c[0]
+        u = np.array([r[0]+r[1], r[1]-r[0]])  # ga[0] = c + (u + u_perp)/2
+        basis = np.linalg.inv(np.array([[u[0], -u[1]], [u[1], u[0]]]))
+        rows, rhs, w = [], [], []
+        for i in np.nonzero(measured)[0]:
+            k = int(i >= 4)
+            a, b = 0.5*np.sign(basis@(pts[i]-c[k]))
+            rows += [[1-k, 0, k, 0, a, -b], [0, 1-k, 0, k, b, a]]
+            rhs += list(pts[i])
+            w += [weight[i]]*2
+        A, y, sw = np.array(rows), np.array(rhs), np.sqrt(np.array(w))
+        x = np.linalg.lstsq(A*sw[:, None], y*sw, rcond=None)[0]
+        res = (A@x-y).reshape(-1, 2)
+        rms = float(np.sqrt((np.linalg.norm(res, axis=1)**2*w[::2]).sum()/sum(w[::2])))
+        model = []
+        for i, p in enumerate(pts):
+            k = int(i >= 4)
+            a, b = 0.5*np.sign(basis@(p-c[k]))
+            model.append(x[2*k:2*k+2]+a*x[4:]+b*np.array([-x[5], x[4]]))
+        model = np.array(model)
+        return model[:4], model[4:], rms
+
     def measure_mask(self, gray, square_boxes):
         """Two square groups from 6-8 squares (YOLO + nearby blobs) in this frame, or None."""
         if len(square_boxes) < 2:
             return None
-        boxes = self.more_squares(gray, square_boxes)
+        boxes, contrast = self.more_squares(gray, square_boxes)
+        # The combination search below is meant for 6-12 blobs: YOLO's first, then the clearest.
+        keep = np.argsort(-(contrast+(np.arange(len(boxes)) < len(square_boxes))), kind='stable')[:12]
+        boxes, contrast = boxes[keep], contrast[keep]
         if len(boxes) < MASK_MIN_SEEN:
             return None
         centers = [blob_center(gray, b) for b in boxes]
         if any(c is None for c in centers):
             return None
         pts = np.array(centers)
-        if len(pts) > 12:
-            return None  # clutter: the combination search below is meant for 6-10 blobs
-        found = self.complete_groups(pts)
+        size = float(np.median(np.r_[boxes[:, 2]-boxes[:, 0], boxes[:, 3]-boxes[:, 1]]))
+        h = max(1, int(size/4))
+        inner = lambda q: float(gray[int(q[1])-h:int(q[1])+h+1, int(q[0])-h:int(q[0])+h+1].mean())
+        x0, y0 = (pts.min(0)-2*size).astype(int).clip(0)
+        x1, y1 = (pts.max(0)+2*size).astype(int)
+        # A filled-in square must be hidden (under a cross, or dark over the black stage): one on a
+        # bright spot would have been seen, so that grouping is wrong (keys this close have two).
+        cut = (np.median([inner(q) for q in pts])+np.percentile(gray[y0:y1, x0:x1], 75))/2
+        inside = lambda q: h <= q[0] < gray.shape[1]-h and h <= q[1] < gray.shape[0]-h
+        found = self.complete_groups(pts, lambda q: inside(q) and inner(q) < cut)
         if found is None:
             return None  # stray dark blobs, not the 2 x (2x2) mask pattern
         ga, gb, measured = found
+        weight = [contrast[np.argmin(np.linalg.norm(pts-p, axis=1))] for p in np.vstack([ga, gb])]
+        ga, gb, rms = self.fit_keys(ga, gb, measured, np.clip(weight, 0.05, 1)**2)
+        if rms > FIT_MAX_RMS*size:
+            return None  # squares merged with cross arms: their centres are off
         mean = np.vstack([ga, gb]).mean(0)
         axis = gb.mean(0)-ga.mean(0)
         axis /= np.linalg.norm(axis)
@@ -253,12 +336,11 @@ class TwoPairKeys:
             measured = np.r_[measured[4:], measured[:4]] if not measured.all() else measured
         groups = ga, gb
         g1, g2 = ga.mean(0), gb.mean(0)
-        size = float(np.median(np.r_[boxes[:, 2]-boxes[:, 0], boxes[:, 3]-boxes[:, 1]]))
         keys = [np.r_[g.min(0), g.max(0)]+[-size*0.7, -size*0.7, size*0.7, size*0.7] for g in groups]
         squares = np.vstack(groups)
         order = np.argsort(~measured, kind='stable')  # measured first: the app draws the rest dimmer
         return dict(groups=(g1, g2), squares=squares[order], boxes=boxes, axis=axis, size=size, keys=keys,
-                    observed=int(measured.sum()))
+                    observed=int(measured.sum()), rms=rms)
 
     def confirm_held(self, gray, square_boxes):
         if self.mask is None:
@@ -452,7 +534,14 @@ class TwoPairKeys:
         square_boxes, cross_boxes, cross_conf = self.detect(frame)
         fresh = self.measure_mask(gray, square_boxes)
         if not KEEP_MASK:
-            if fresh is not None and (self.mask is None or fresh['observed'] == MASK_SQUARES):
+            # A cross on the keys merges with the squares and pulls their centres (now that faint
+            # squares are found too, all 8 may be), so such a frame never replaces the held mask;
+            # otherwise the cleaner fit wins (the plate does not move within a run).
+            clear = fresh is not None and not any(
+                min(np.linalg.norm(fresh['squares']-c, axis=1)) < NEAR_SIDES*fresh['size']
+                for c in (cross_boxes[:, :2]+cross_boxes[:, 2:])/2)
+            if fresh is not None and (self.mask is None or fresh['observed'] == MASK_SQUARES and clear
+                                      and fresh['rms'] <= self.mask.get('rms', np.inf)+FIT_RMS_SLACK):
                 self.keep_mask(gray, fresh, save=False)
                 mask = fresh
             else:

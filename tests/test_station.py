@@ -155,3 +155,31 @@ def test_pipeline_waits_for_operator_to_clear_stage(board, tmp_path, monkeypatch
     pipe.mark_cleared()
     pipe.thread.join(20)
     assert pipe.state["error"] is None and pipe.state["delivered"] == 2
+
+
+def test_align_failure_is_not_taken_as_empty_box(board, tmp_path, monkeypatch):
+    """정밀 얼라인 실패(키 미검출)는 '박스 빔'으로 조용히 끝내지 않고 오류로 멈춘다."""
+    from tools import station
+    monkeypatch.setattr(prealign_sequence, "CALIBRATION", tmp_path / "cal.json")
+    monkeypatch.setattr(station, "PIPELINE_FILE", tmp_path / "pipe.json")
+    seq = prealign_sequence.Sequence(board)
+    seq.vision.stable = lambda *a, **k: dict(mask=dict(angle=90), wafer=dict(angle=90), turn_deg=0.0, error=None)
+    monkeypatch.setattr(seq.stop_evt, "wait", lambda _: seq.stop_evt.is_set())
+    app = FakeFine(align_s=30)      # 정상 완료 전에 FAULT가 난다
+    orig = app.start_align
+
+    def failing():
+        orig()
+
+        def fault():
+            time.sleep(0.15)
+            app.phase, app.status = "FAULT", "정렬 중단: 마스크 키 · 웨이퍼 키 5초 이상 미검출"
+            app.auto_running = False
+        threading.Thread(target=fault, daemon=True).start()
+    app.start_align = failing
+    pipe = station.Pipeline(seq, app, board)
+    pipe.cfg.update(max_wafers=2, auto_clear=True)
+    pipe.start()
+    pipe.thread.join(20)
+    assert pipe.state["error"] and "정밀 얼라인 실패" in pipe.state["error"]
+    assert not any("박스가 빈" in line for line in pipe.state["log"])

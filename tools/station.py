@@ -185,6 +185,10 @@ def share_camera(cams, app, index):
 # ---------------------------------------------------------------------------
 # 연속 운전
 # ---------------------------------------------------------------------------
+class AlignFailed(RuntimeError):
+    """정밀 얼라인 실패 — 박스가 빈 것(8단계 미검출)과 구별한다."""
+
+
 class Pipeline:
     def __init__(self, seq, app, board):
         self.seq, self.app, self.board = seq, app, board
@@ -274,7 +278,7 @@ class Pipeline:
                                                  at=time.strftime("%H:%M:%S")))
             self._log(f"정밀 얼라인 {'완료' if ok else '실패'}: {app.status}")
             if not ok:
-                raise RuntimeError(f"정밀 얼라인 실패 — 연속 운전을 멈춥니다: {app.status}")
+                raise AlignFailed(f"정밀 얼라인 실패 — 연속 운전을 멈춥니다: {app.status}")
 
     def _start_fine(self):
         app = self.app
@@ -306,6 +310,8 @@ class Pipeline:
                         self._wait(lambda: self._fine_idle(), "정밀 얼라인 종료 대기")
                         self._note_align_result()
                         self._transfer(MEASURE_STEPS, "각도 측정 (8단계)")
+                    except AlignFailed:
+                        raise
                     except RuntimeError as exc:
                         if "웨이퍼" in str(exc) and ("검출" in str(exc) or "못" in str(exc)):
                             self._log(f"웨이퍼를 찾지 못함 → 박스가 빈 것으로 보고 종료: {exc}")

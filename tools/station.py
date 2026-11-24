@@ -211,7 +211,7 @@ class Pipeline:
         self.cleared = threading.Event()
         self.cfg = dict(max_wafers=0, auto_clear=False, start_timeout_s=20.0, soft_down_ms=3500)
         try:
-            self.cfg.update(json.loads(PIPELINE_FILE.read_text()))
+            self.cfg.update(json.loads(PIPELINE_FILE.read_text(encoding="utf-8")))
         except Exception:
             pass
         self.state = dict(running=False, phase="대기", error=None, log=[],
@@ -226,7 +226,7 @@ class Pipeline:
             raise ValueError(f"소프트 컨택 내림 시간은 0보다 크고 하드 컨택({self.hard_ms[0]}ms)보다 작아야 합니다")
         self.cfg = new
         PIPELINE_FILE.parent.mkdir(exist_ok=True)
-        PIPELINE_FILE.write_text(json.dumps(self.cfg))
+        PIPELINE_FILE.write_text(json.dumps(self.cfg), encoding="utf-8")
 
     def _log(self, s):
         self.state["log"].insert(0, time.strftime("%H:%M:%S ") + s)

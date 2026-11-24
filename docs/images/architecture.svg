@@ -1,0 +1,139 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="800" viewBox="0 0 1200 800" role="img" aria-labelledby="title desc">
+<title id="title">시스템 아키텍처 · 프리얼라인에서 정밀 얼라인까지</title>
+<desc id="desc">카메라 두 대의 영상이 프리얼라인(YOLO 두 키 각도)과 정밀 얼라인(YOLO, SAM2 분할, 서브픽셀 기하 측정) 파이프라인을 거쳐, 하나의 공용 보드 연결로 Arduino Mega 펌웨어에 명령을 보내고 이송부와 정밀 스테이지 모터를 구동한다.</desc>
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#8fa6b3"/></marker>
+  <marker id="arrowA" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#6ce6ca"/></marker>
+  <pattern id="grid" width="30" height="30" patternUnits="userSpaceOnUse"><path d="M30 0H0V30" fill="none" stroke="#1b2c38" stroke-width=".6"/></pattern>
+  <style>
+    text { font-family: "Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", Arial, sans-serif; }
+    .h { font-size: 15px; font-weight: 700; fill: #f4f8fa; }
+    .t { font-size: 13px; fill: #d9e3eb; }
+    .s { font-size: 11.5px; fill: #8fa6b3; }
+    .k { font-size: 11px; font-weight: 700; letter-spacing: 2px; fill: #6ce6ca; }
+    .lane { fill: #132431; stroke: #263946; }
+    .box { fill: #182c3a; stroke: #334853; }
+    .ai { fill: #13332f; stroke: #6ce6ca; }
+    .opt { fill: #182c3a; stroke: #6ce6ca; stroke-dasharray: 5 4; }
+    .hw { fill: #1f2a33; stroke: #4a5b66; }
+    .ln { stroke: #8fa6b3; stroke-width: 1.4; fill: none; }
+    .la { stroke: #6ce6ca; stroke-width: 1.6; fill: none; }
+  </style>
+</defs>
+<rect width="1200" height="800" fill="#101d28"/>
+<rect width="1200" height="800" fill="url(#grid)"/>
+
+<!-- 제목 -->
+<path d="M40 38h26" stroke="#6ce6ca" stroke-width="4"/>
+<text x="78" y="44" class="k">SYSTEM ARCHITECTURE</text>
+<text x="40" y="78" style="font-size:24px;font-weight:700;fill:#f4f8fa">프리얼라인 → 정밀 얼라인 · 한 프로그램, 한 보드</text>
+<text x="40" y="102" class="s">tools/station.py · 웨이퍼 N을 정밀 정렬하는 동안 이송부는 웨이퍼 N+1을 가져와 각도까지 측정해 둔다</text>
+
+<!-- 1. 입력 -->
+<text x="40" y="140" class="k">1 · INPUT</text>
+<rect x="40" y="150" width="540" height="58" rx="10" class="hw"/>
+<text x="60" y="175" class="h">카메라 1 · 로더</text>
+<text x="60" y="195" class="s">프리얼라인 웨이퍼 키 (640×480)</text>
+<rect x="620" y="150" width="540" height="58" rx="10" class="hw"/>
+<text x="640" y="175" class="h">카메라 0 · 정밀 (위에서)</text>
+<text x="640" y="195" class="s">마스크 사각 키 4개 + 웨이퍼 십자 · 8단계 마스크 각도 측정도 같은 영상을 빌려 씀</text>
+
+<!-- 2. 인식·판단 -->
+<text x="40" y="246" class="k">2 · PERCEPTION &amp; DECISION</text>
+<rect x="40" y="256" width="540" height="300" rx="12" class="lane"/>
+<text x="60" y="284" class="h">프리얼라인 · 이송</text>
+<text x="200" y="284" class="s">prealign_sequence.py · key_prealign.py</text>
+
+<rect x="60" y="300" width="500" height="44" rx="8" class="box"/>
+<text x="76" y="327" class="t">0–7단계 · 박스에서 웨이퍼 가져오기 (레일·리니어·전자석)</text>
+
+<rect x="60" y="358" width="500" height="58" rx="8" class="ai"/>
+<text x="76" y="382" class="t">8단계 · YOLO 두 키 검출 → 각도 측정</text>
+<text x="76" y="402" class="s">정지 상태에서 마스크 축(카메라 0)과 웨이퍼 축(카메라 1)의 차이 = 돌릴 각도</text>
+
+<rect x="60" y="430" width="500" height="44" rx="8" class="box"/>
+<text x="76" y="457" class="t">9단계 · X 이송 중 D8 서보 한 번 회전 (θ 보정) · 정밀 X 32,000</text>
+
+<rect x="60" y="488" width="500" height="44" rx="8" class="box"/>
+<text x="76" y="515" class="t">10–14단계 · 정밀 스테이지에 내려놓고 전자석 OFF</text>
+
+<path d="M310 344v12" class="ln" marker-end="url(#arrow)"/>
+<path d="M310 416v12" class="ln" marker-end="url(#arrow)"/>
+<path d="M310 474v12" class="ln" marker-end="url(#arrow)"/>
+
+<rect x="620" y="256" width="540" height="300" rx="12" class="lane"/>
+<text x="640" y="284" class="h">정밀 얼라인</text>
+<text x="740" y="284" class="s">mask_aligner_optimized_v4.py · MaskAlignerApp</text>
+
+<rect x="640" y="300" width="160" height="70" rx="8" class="ai"/>
+<text x="656" y="326" class="h">YOLO</text>
+<text x="656" y="346" class="s">키 후보 박스</text>
+<text x="656" y="362" class="s">마스크 사각 · 웨이퍼 십자</text>
+
+<rect x="820" y="300" width="160" height="70" rx="8" class="ai"/>
+<text x="836" y="326" class="h">SAM2</text>
+<text x="836" y="346" class="s">박스 안 픽셀 분할</text>
+<text x="836" y="362" class="s">2.1 Hiera Small</text>
+
+<rect x="1000" y="300" width="140" height="70" rx="8" class="ai"/>
+<text x="1014" y="326" class="h">기하 측정</text>
+<text x="1014" y="346" class="s">원본 경계 서브픽셀</text>
+<text x="1014" y="362" class="s">중심 · 각도</text>
+
+<path d="M800 335h18" class="la" marker-end="url(#arrowA)"/>
+<path d="M980 335h18" class="la" marker-end="url(#arrowA)"/>
+<!-- SAM2를 건너뛰는 경로 -->
+<path d="M720 370v18h350v-16" class="la" stroke-dasharray="5 4" marker-end="url(#arrowA)"/>
+<text x="800" y="404" class="s">yolo-2pair: SAM2 대신 OpenCV 사각점 탐색 (현재 장비 기본)</text>
+
+<rect x="640" y="420" width="500" height="120" rx="8" class="box"/>
+<text x="656" y="444" class="t">제어 루프 · 새 영상으로 다시 재고 다시 움직임</text>
+<g transform="translate(656 458)">
+  <rect width="62" height="30" rx="6" fill="#101d28" stroke="#334853"/><text x="31" y="20" text-anchor="middle" class="t">Z ↓</text>
+  <path d="M64 15h12" class="ln" marker-end="url(#arrow)"/>
+  <rect x="78" width="62" height="30" rx="6" fill="#101d28" stroke="#334853"/><text x="109" y="20" text-anchor="middle" class="t">θ</text>
+  <path d="M142 15h12" class="ln" marker-end="url(#arrow)"/>
+  <rect x="156" width="62" height="30" rx="6" fill="#101d28" stroke="#334853"/><text x="187" y="20" text-anchor="middle" class="t">X · Y</text>
+  <path d="M220 15h12" class="ln" marker-end="url(#arrow)"/>
+  <rect x="234" width="78" height="30" rx="6" fill="#13332f" stroke="#6ce6ca"/><text x="273" y="20" text-anchor="middle" class="t">FINISH</text>
+  <path d="M314 15h12" class="ln" marker-end="url(#arrow)"/>
+  <rect x="328" width="62" height="30" rx="6" fill="#101d28" stroke="#334853"/><text x="359" y="20" text-anchor="middle" class="t">Z ↑</text>
+  <path d="M392 15h12" class="ln" marker-end="url(#arrow)"/>
+  <rect x="406" width="62" height="30" rx="6" fill="#101d28" stroke="#334853"/><text x="437" y="20" text-anchor="middle" class="t">복귀</text>
+</g>
+<text x="656" y="512" class="s">θ·X·Y는 측정 → 이동 → 재측정 반복 · 중심 오차가 기준 안에 연속으로 들어오면 FINISH</text>
+<text x="656" y="530" class="s">복귀 = 정밀 θ·X·Y를 다음 웨이퍼 받을 자세로</text>
+
+<!-- 카메라 → 파이프라인 -->
+<path d="M310 208v46" class="ln" marker-end="url(#arrow)"/>
+<path d="M890 208v46" class="ln" marker-end="url(#arrow)"/>
+<path d="M700 208C700 232 600 236 562 372" class="ln" stroke-dasharray="4 4" marker-end="url(#arrow)"/>
+<!-- 넘기기 -->
+<path d="M580 510H618" class="la" marker-end="url(#arrowA)"/>
+<text x="584" y="502" class="s" style="fill:#6ce6ca">넘김</text>
+
+<!-- 3. 공용 보드 -->
+<text x="40" y="594" class="k">3 · SHARED BOARD</text>
+<rect x="40" y="604" width="1120" height="62" rx="10" class="box"/>
+<text x="60" y="630" class="h">station.py · Board 하나가 시리얼 포트를 가짐</text>
+<text x="60" y="650" class="s">정밀 앱은 BusLink로 같은 보드에 명령 · 응답은 축 글자별 우편함으로 분리 · 정지는 한쪽 축만 (#X FBfbAud / #X QWERJHKLOPtM)</text>
+<text x="880" y="630" class="t">웹 화면 127.0.0.1:8790</text>
+<text x="880" y="650" class="s">연속 운전 + 정밀 화면(8765) 한 화면</text>
+<path d="M310 556v46" class="ln" marker-end="url(#arrow)"/>
+<path d="M890 556v46" class="ln" marker-end="url(#arrow)"/>
+
+<!-- 4. 하드웨어 -->
+<text x="40" y="700" class="k">4 · HARDWARE</text>
+<rect x="40" y="710" width="300" height="62" rx="10" class="hw"/>
+<text x="60" y="736" class="h">Arduino Mega</text>
+<text x="60" y="756" class="s">mega_previous v2 · 축별 동시 구동 · DONE 응답</text>
+<rect x="380" y="710" width="380" height="62" rx="10" class="hw"/>
+<text x="400" y="736" class="h">이송부</text>
+<text x="400" y="756" class="s">X·Y 레일 · Y·Z 리니어 · 전자석 · 프리얼라인 서보 D8</text>
+<rect x="800" y="710" width="360" height="62" rx="10" class="hw"/>
+<text x="820" y="736" class="h">정밀 스테이지</text>
+<text x="820" y="756" class="s">정밀 X·Y 스텝모터 · θ 서보 D5 · 마스크 Z1</text>
+<path d="M190 666v42" class="ln" marker-end="url(#arrow)"/>
+<path d="M340 741h38" class="ln" marker-end="url(#arrow)"/>
+<path d="M190 772v16H980v-14" class="ln" marker-end="url(#arrow)"/>
+</svg>

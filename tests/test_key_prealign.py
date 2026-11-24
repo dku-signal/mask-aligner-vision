@@ -98,7 +98,7 @@ def rig(tmp_path, monkeypatch):
     timing = tmp_path / "timing.json"
     monkeypatch.setattr(quarter_turn, "TIMING", timing)
     timing.write_text(json.dumps(dict(wafer_increasing_direction=-1, directions={
-        "1": dict(ms=574, samples=[89,91]), "-1": dict(ms=543, samples=[90,90])})))
+        "1": dict(ms=574, samples=[89,91]), "-1": dict(ms=543, samples=[90,90])})), encoding="utf-8")
     board = motor_panel.Board()
     seq = prealign_sequence.Sequence(board)
     board.connect("mock")

@@ -261,6 +261,9 @@ class Pipeline:
         self.mode = mode
         self.stop_evt.clear()
         self.state.update(running=True, error=None, phase="시작")
+        if not self.app.auto_running:
+            # 시작할 때 정밀 스테이지는 비어 있다. 이전 실행(정밀 얼라인만·수동 정지)의 상태를 넘겨받지 않는다
+            self.state["stage"] = "비어 있음"
         down, up = self.z_ms()
         self._log(f"연속 운전 시작: {self.MODES[mode]} (마스크 판 내림 {down}ms · 올림 {up}ms)")
         self.thread = threading.Thread(target=self._run, name="pipeline", daemon=True)

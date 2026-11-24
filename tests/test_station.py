@@ -222,3 +222,21 @@ def test_align_only_applies_contact_mode(board, tmp_path, monkeypatch):
                             z_setter=lambda d, u: seen.append((d, u)), hard_ms=(5000, 5000))
     pipe.align_only("soft")
     assert seen == [(3500, 3500)] and len(app.starts) == 1 and not board.ser.sent
+
+
+def test_start_ignores_leftover_stop_from_earlier_run(board, tmp_path, monkeypatch):
+    """이전 정밀 얼라인만 실행이 수동 정지(STOP)로 끝나 있어도 새 연속 운전은 그것을 실패로 읽지 않는다."""
+    from tools import station
+    monkeypatch.setattr(prealign_sequence, "CALIBRATION", tmp_path / "cal.json")
+    monkeypatch.setattr(station, "PIPELINE_FILE", tmp_path / "pipe.json")
+    seq = prealign_sequence.Sequence(board)
+    seq.vision.stable = lambda *a, **k: dict(mask=dict(angle=90), wafer=dict(angle=90), turn_deg=0.0, error=None)
+    monkeypatch.setattr(seq.stop_evt, "wait", lambda _: seq.stop_evt.is_set())
+    app = FakeFine(align_s=0.1)
+    pipe = station.Pipeline(seq, app, board)
+    pipe.state["stage"] = "정렬 중"
+    app.phase, app.status = "STOP", "STOP"
+    pipe.cfg.update(max_wafers=1, auto_clear=True)
+    pipe.start()
+    pipe.thread.join(20)
+    assert pipe.state["error"] is None and pipe.state["aligned"] == 1

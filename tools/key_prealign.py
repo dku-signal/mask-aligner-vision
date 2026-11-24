@@ -61,6 +61,8 @@ class KeyPrealign:
             view = crop if angle == 0 else cv2.warpAffine(crop, transform, tuple(size), borderValue=(114, 114, 114))
             raw = self.model.predict(view, classes=[1], conf=max(confidence, 0.55),
                                      imgsz=640, device="cpu", verbose=False)[0].boxes.xyxy.cpu().numpy()
+            if len(raw) > 2:
+                raw = self._outer_pair(raw)
             if len(raw) != 2:
                 continue
             quads = np.array([[(l,t), (r,t), (r,b), (l,b)] for l,t,r,b in raw])
@@ -98,6 +100,20 @@ class KeyPrealign:
                 return None
             refined.append(np.r_[centre - half, centre + half])
         return np.array(refined)
+
+    @staticmethod
+    def _outer_pair(raw):
+        """세로로 붙은 두 십자 사이에 YOLO가 상자를 더 그릴 때: 한 쌍으로 볼 수 있는 거리(상자 2.5개 이내)
+        안에서 가장 멀리 떨어진 두 상자 = 양 끝 십자."""
+        centres = (raw[:, :2] + raw[:, 2:]) / 2
+        reach = 2.5 * np.median(raw[:, 2:] - raw[:, :2])
+        best, pair = 0.0, raw[:0]
+        for i in range(len(raw)):
+            for j in range(i + 1, len(raw)):
+                d = float(np.linalg.norm(centres[i] - centres[j]))
+                if best < d <= reach:
+                    best, pair = d, raw[[i, j]]
+        return pair
 
     def _detect(self, frame, camera, role, class_id, confidence, preview):
         h, w = frame.shape[:2]

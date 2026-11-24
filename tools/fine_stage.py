@@ -37,6 +37,12 @@ class FineStage:
             self.data = dict(device=self.device, offset={"X": 0, "Y": 0}, pending=None, known=True)
             self.save()
 
+    def set_position(self, x, y):
+        """오른쪽 위 기준으로 지금 위치가 (x, y)스텝이라고 기록 (연속 운전: 넘겨받은 수취 위치)."""
+        with self.lock:
+            self.data = dict(device=self.device, offset={"X": int(x), "Y": int(y)}, pending=None, known=True)
+            self.save()
+
     def invalidate(self):
         with self.lock:
             if self.data.get("known"):

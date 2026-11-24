@@ -19,6 +19,32 @@ ROOT = Path(__file__).resolve().parents[1]
 WEIGHTS = ROOT / "runs/keys_real/weights/best.pt"
 
 
+def wafer_disc(frame):
+    """웨이퍼 원 (x, y, r) 또는 None. 크기(화면 높이의 0.32~0.5)와 밝은 안쪽으로 가짜 원을 거른다."""
+    gray = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (9, 9), 2)
+    h, w = gray.shape
+    found = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, dp=1.5, minDist=w, param1=80, param2=40,
+                             minRadius=int(0.32 * h), maxRadius=int(0.5 * h))
+    if found is None:
+        return None
+    x, y, r = found[0][0]
+    inside = np.zeros_like(gray)
+    cv2.circle(inside, (int(x), int(y)), int(r * 0.8), 255, -1)
+    if cv2.mean(gray, mask=inside)[0] < 150:
+        return None
+    return np.array([x, y, r], float)
+
+
+def cross_side_turn(turn, side, camera_sign, want_y):
+    """축 정렬 회전량 turn(°)을 돌렸을 때 십자(웨이퍼 중심 기준 side=(dx, dy))가 want_y 쪽
+    (-1 = 카메라 1 화면 위)에 오도록, 아니면 180° 반대로 돌린다. 영상 각도는 camera_sign × turn만큼 바뀐다."""
+    a = math.radians(camera_sign * turn)
+    dy = math.sin(a) * side[0] + math.cos(a) * side[1]
+    if dy * want_y >= 0:
+        return turn
+    return round(turn - 180 if turn > 0 else turn + 180, 2)
+
+
 def key_axis(boxes, role, shape, min_span=0):
     """An individual square or cross has 90-degree symmetry. Use their centres."""
     if len(boxes) < 2:
@@ -61,6 +87,8 @@ class KeyPrealign:
             view = crop if angle == 0 else cv2.warpAffine(crop, transform, tuple(size), borderValue=(114, 114, 114))
             raw = self.model.predict(view, classes=[1], conf=max(confidence, 0.55),
                                      imgsz=640, device="cpu", verbose=False)[0].boxes.xyxy.cpu().numpy()
+            if len(raw) > 2:
+                raw = self._outer_pair(raw)
             if len(raw) != 2:
                 continue
             quads = np.array([[(l,t), (r,t), (r,b), (l,b)] for l,t,r,b in raw])
@@ -98,6 +126,20 @@ class KeyPrealign:
                 return None
             refined.append(np.r_[centre - half, centre + half])
         return np.array(refined)
+
+    @staticmethod
+    def _outer_pair(raw):
+        """세로로 붙은 두 십자 사이에 YOLO가 상자를 더 그릴 때: 한 쌍으로 볼 수 있는 거리(상자 2.5개 이내)
+        안에서 가장 멀리 떨어진 두 상자 = 양 끝 십자."""
+        centres = (raw[:, :2] + raw[:, 2:]) / 2
+        reach = 2.5 * np.median(raw[:, 2:] - raw[:, :2])
+        best, pair = 0.0, raw[:0]
+        for i in range(len(raw)):
+            for j in range(i + 1, len(raw)):
+                d = float(np.linalg.norm(centres[i] - centres[j]))
+                if best < d <= reach:
+                    best, pair = d, raw[[i, j]]
+        return pair
 
     def _detect(self, frame, camera, role, class_id, confidence, preview):
         h, w = frame.shape[:2]
@@ -145,6 +187,12 @@ class KeyPrealign:
                     raise ValueError(detection_error)
                 line, angle = key_axis(boxes, role, frame.shape, min_span=0.6 * guide_span)
                 result["angle"] = round(angle, 2)
+                if class_id == 1:
+                    # 각도는 0~180°(선의 기울기)라 십자가 웨이퍼의 어느 쪽에 있는지는 웨이퍼 원 중심으로 따로 본다
+                    disc = wafer_disc(frame)
+                    if disc is not None:
+                        centre = (boxes[:, :2] + boxes[:, 2:4]).mean(axis=0) / 2
+                        result["side"] = [round(float(v), 1) for v in centre - disc[:2]]
                 break
             except ValueError as exc:
                 result["error"] = str(exc)
@@ -241,7 +289,13 @@ class KeyPrealign:
             result.update(turn_deg=None, error=" / ".join(errors) or None)
             if not errors:
                 mapped = settings["camera_sign"] * result["wafer"]["angle"] + settings["camera_offset_deg"]
-                result["turn_deg"] = round(axis_difference(result["mask"]["angle"], mapped), 2)
+                turn = round(axis_difference(result["mask"]["angle"], mapped), 2)
+                want = settings.get("wafer_cross_side_y")
+                if want and result["wafer"].get("side"):
+                    flipped = cross_side_turn(turn, result["wafer"]["side"], settings["camera_sign"], want)
+                    result["side_flip"] = flipped != turn
+                    turn = flipped
+                result["turn_deg"] = turn
             return result
 
     def stable(self, cameras, settings, stop_evt, preview=False):
@@ -264,6 +318,9 @@ class KeyPrealign:
             if any(max(abs(axis_difference(r[key]["angle"], result[key]["angle"]))
                        for _, r in samples) > 1.5 for key in ("mask", "wafer")):
                 detail = "키 방향이 움직이고 있습니다"
+                continue
+            if any(r.get("side_flip") != result.get("side_flip") for _, r in samples):
+                detail = "웨이퍼 십자 방향(180°) 판별이 흔들립니다"
                 continue
             errors = [axis_difference(r["turn_deg"], result["turn_deg"]) for _, r in samples]
             mid = statistics.median(errors)

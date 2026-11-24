@@ -68,12 +68,11 @@
 <div class="tab" data-tab="run">
   <section class="card" id="pipeCard" style="grid-column:1/-1;display:none;border:2px solid var(--btnon)">
     <h2>연속 운전 · 프리얼라인 → 정밀 얼라인 반복</h2>
-    <p>웨이퍼를 가져와(0~8단계, 두 키 측정) 정밀 스테이지가 비면 넘겨주고(9~14단계) 정밀 얼라인을 시작합니다. 정렬하는 동안 다음 웨이퍼를 가져옵니다.
-       정렬된 웨이퍼는 작업자가 치운 뒤 <b>스테이지 비움 확인</b>을 누르세요 (자동 진행을 켜면 확인 없이 다음 웨이퍼를 넘깁니다).</p>
-    <div class="row"><button class="tog" id="pipeStart">▶ 연속 운전 시작<small>하드 컨택 · 마스크 판 끝까지</small></button><button class="tog" id="pipeStartSoft">▶ 연속 운전 시작<small>소프트 컨택 · 덜 내림</small></button><button class="tog" id="pipeStop">■ 연속 운전 정지</button><button class="tog" id="pipeCleared">✔ 스테이지 비움 확인</button></div>
+    <p>정밀 얼라인이 도는 동안 다음 웨이퍼를 가져와 각도까지 재 두고(0~8단계), 정렬이 끝나 정밀 X·Y가 오른쪽 위로 돌아오면 바로 넘겨줍니다(9~14단계, 이동하며 회전). 멈추지 않고 반복합니다.</p>
+    <div class="row"><button class="tog" id="pipeStart">▶ 연속 운전 시작<small>하드 컨택 · 마스크 판 끝까지</small></button><button class="tog" id="pipeStartSoft">▶ 연속 운전 시작<small>소프트 컨택 · 덜 내림</small></button><button class="tog" id="pipeStop">■ 연속 운전 정지</button></div>
     <div class="row"><span class="lbl">최대 장수</span><input id="pipeMax" type="number" min="0" value="0" style="flex:1;padding:10px;font:inherit;border-radius:8px;border:1px solid var(--line);background:var(--btn);color:var(--ink)"> <span>(0 = 박스가 빌 때까지)</span>
       <span class="lbl">소프트 내림</span><input id="pipeSoft" type="number" min="100" step="100" value="3500" style="width:90px;padding:10px;font:inherit;border-radius:8px;border:1px solid var(--line);background:var(--btn);color:var(--ink)"> <span>ms</span>
-      <label style="flex:1"><input type="checkbox" id="pipeAuto"> 스테이지 비움 확인 없이 자동 진행</label><button class="tog" id="pipeSave" style="flex:0 0 auto">저장</button></div>
+      <button class="tog" id="pipeSave" style="flex:0 0 auto">저장</button></div>
     <pre id="pipeState" style="font-size:13px;color:var(--ink)"></pre>
     <pre id="pipeLog"></pre>
     <details open><summary>정밀 얼라인 화면</summary><iframe id="fineFrame" style="width:100%;height:720px;border:1px solid var(--line);border-radius:10px;margin-top:8px"></iframe></details>
@@ -496,7 +495,7 @@ async function pipePoll() {
   const p = await r.json();
   $('#pipeCard').style.display = '';
   if (!pipeInit) {
-    $('#fineFrame').src = p.fine_url; $('#pipeMax').value = p.cfg.max_wafers; $('#pipeAuto').checked = p.cfg.auto_clear; $('#pipeSoft').value = p.cfg.soft_down_ms; pipeInit = true;
+    $('#fineFrame').src = p.fine_url; $('#pipeMax').value = p.cfg.max_wafers; $('#pipeSoft').value = p.cfg.soft_down_ms; pipeInit = true;
   }
   $('#pipeStart').classList.toggle('on', p.running && p.mode === 'hard');
   $('#pipeStartSoft').classList.toggle('on', p.running && p.mode === 'soft');
@@ -514,8 +513,7 @@ function pipeGo(mode) {
 $('#pipeStart').onclick = () => pipeGo('hard');
 $('#pipeStartSoft').onclick = () => pipeGo('soft');
 $('#pipeStop').onclick = () => post('/pipeline/stop', {});
-$('#pipeCleared').onclick = () => post('/pipeline/cleared', {});
-$('#pipeSave').onclick = () => post('/pipeline/config', {max_wafers: Number($('#pipeMax').value), auto_clear: $('#pipeAuto').checked, soft_down_ms: Number($('#pipeSoft').value)});
+$('#pipeSave').onclick = () => post('/pipeline/config', {max_wafers: Number($('#pipeMax').value), soft_down_ms: Number($('#pipeSoft').value)});
 pipePoll(); setInterval(pipePoll, 500);
 loadPorts(); loadPrealign(); poll(); cams(); seqPoll(); setInterval(poll, 300); setInterval(cams, 300); setInterval(seqPoll, 500);
 

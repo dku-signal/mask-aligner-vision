@@ -14,8 +14,7 @@ CONFIG = Path(__file__).resolve().parents[1] / "config" / "prealign_sequence.jso
 CALIBRATION = CONFIG.parents[1] / "out" / "prealign_camera_calibration.json"
 STEP_RATE = 10_000          # 펌웨어 레일 펄스: 50us 토글 = 10,000 스텝/초
 TRANSFER_LETTERS = "QWERJHKLOPtM"   # 이 시퀀스가 움직이는 축 (정지할 때 정밀 얼라인 축은 건드리지 않는다)
-FETCH_STEPS = (0, 1, 2, 3, 4, 5, 7)   # 연속 운전: 박스에서 웨이퍼를 가져와 인출 완료 위치까지 (정밀 얼라인과 겹침)
-MEASURE_STEPS = (8,)                    # 연속 운전: 8단계 각도 측정 — 정밀 얼라인이 끝나 마스크 Z가 올라간 뒤
+FETCH_STEPS = (0, 1, 2, 3, 4, 5, 7, 8)   # 연속 운전: 박스에서 가져와 8단계 각도 측정까지 (정밀 얼라인과 겹침)
 DELIVER_STEPS = (9, 9.5, 10, 11, 12, 13, 14)   # 연속 운전: 정밀 스테이지에 넘겨주고 빠지기
 AXIS_OF = {}                # 명령 글자 -> 축 이름
 
@@ -399,12 +398,23 @@ class Sequence:
                     self.station = (self.board.ser, self.board.revision)
                     self.state["current"] = "각도 측정"
                     self._log("8단계 Y 후퇴 완료 · 정지 상태에서 두 키 측정")
-                    result = self.measure_angle(self.cfg["prealign"])
-                    if self.stop_evt.is_set():
-                        self.invalidate()
-                        raise InterruptedError("정지됨")
+                    # 두 키가 모두 잡혀 각도가 나올 때까지 재시도 (한 번 = 최대 15초 안정 측정)
+                    attempts = int(self.cfg["prealign"].get("measure_attempts", 5))
+                    for attempt in range(1, attempts + 1):
+                        try:
+                            result = self.measure_angle(self.cfg["prealign"])
+                        except ValueError as exc:
+                            result = {"error": str(exc)}
+                        if self.stop_evt.is_set():
+                            self.invalidate()
+                            raise InterruptedError("정지됨")
+                        if not result["error"]:
+                            break
+                        self._log(f"  각도 측정 {attempt}/{attempts}회 실패: {result['error']}")
+                        if attempt < attempts and self.stop_evt.wait(1.0):
+                            raise InterruptedError("정지됨")
                     if result["error"]:
-                        raise ValueError(result["error"])
+                        raise ValueError(f"{attempts}회 시도 실패 · {result['error']}")
                 if st["no"] == 1 and self.board.ledger.d.get("box_x") is None:
                     # 원상 복구에서 사용할 박스 쪽 기준을 기억한다.
                     self.board.ledger.snapshot("box_x", self.board.ledger.d["pos"]["x_rail"])

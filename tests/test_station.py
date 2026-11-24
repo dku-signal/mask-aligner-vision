@@ -79,7 +79,7 @@ class FakeFine:
         self.align_s, self.auto_running, self.moving = align_s, False, False
         self.phase, self.status = "IDLE", "대기"
         self.mask_detected = self.wafer_detected = True
-        self.starts = []
+        self.starts, self.finishes = [], []
 
     def start_align(self):
         if self.auto_running:
@@ -90,6 +90,7 @@ class FakeFine:
         def finish():
             time.sleep(self.align_s)
             self.phase, self.status, self.auto_running = "DONE", "정밀 얼라인 완료", False
+            self.finishes.append(time.time())
         threading.Thread(target=finish, daemon=True).start()
 
     def stop_align(self):
@@ -101,7 +102,12 @@ def test_pipeline_fetches_next_wafer_while_aligning(board, tmp_path, monkeypatch
     monkeypatch.setattr(prealign_sequence, "CALIBRATION", tmp_path / "cal.json")
     monkeypatch.setattr(station, "PIPELINE_FILE", tmp_path / "pipe.json")
     seq = prealign_sequence.Sequence(board)
-    seq.vision.stable = lambda *a, **k: dict(mask=dict(angle=90), wafer=dict(angle=90), turn_deg=0.0, error=None)
+    measured = []
+
+    def stable(*a, **k):
+        measured.append(time.time())
+        return dict(mask=dict(angle=90), wafer=dict(angle=90), turn_deg=0.0, error=None)
+    seq.vision.stable = stable
     monkeypatch.setattr(seq.stop_evt, "wait", lambda _: seq.stop_evt.is_set())
     app = FakeFine(align_s=0.6)
     pipe = station.Pipeline(seq, app, board)
@@ -123,6 +129,10 @@ def test_pipeline_fetches_next_wafer_while_aligning(board, tmp_path, monkeypatch
     first_start = app.starts[0]
     q_after = [t for t, cmd in sent_log if cmd.startswith("Q ") and t > first_start]
     assert q_after and q_after[0] < first_start + app.align_s
+    # 8단계(마스크 측정)는 앞 웨이퍼의 정밀 얼라인이 끝난(마스크 Z 상승) 뒤에만
+    for n, finish in enumerate(app.finishes[:2]):
+        later = [t for t in measured if t > app.starts[n]]
+        assert later and later[0] >= finish
 
 
 def test_pipeline_waits_for_operator_to_clear_stage(board, tmp_path, monkeypatch):

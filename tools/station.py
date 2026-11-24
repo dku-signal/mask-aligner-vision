@@ -35,7 +35,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))
 
 import motor_panel as panel                       # noqa: E402  이송 패널 (Board·CAMS·Handler)
-from prealign_sequence import DELIVER_STEPS, FETCH_STEPS, TRANSFER_LETTERS   # noqa: E402
+from prealign_sequence import DELIVER_STEPS, FETCH_STEPS, MEASURE_STEPS, TRANSFER_LETTERS   # noqa: E402
 
 FINE_LETTERS = "FBfbAud"     # 정밀 얼라인이 쓰는 축: 정밀 X·Y, θ 서보(D5), 정밀 Z(Z1)
 PIPELINE_FILE = ROOT / "out" / "pipeline.json"
@@ -301,6 +301,11 @@ class Pipeline:
                         break
                     try:
                         self._transfer(FETCH_STEPS, "웨이퍼 가져오기")
+                        # 8단계는 카메라 0에서 마스크를 재므로 정밀 얼라인이 끝나 마스크 Z가 올라간 뒤에 한다
+                        self.state["phase"] = "정밀 얼라인 종료 대기 (끝나면 8단계 측정)"
+                        self._wait(lambda: self._fine_idle(), "정밀 얼라인 종료 대기")
+                        self._note_align_result()
+                        self._transfer(MEASURE_STEPS, "각도 측정 (8단계)")
                     except RuntimeError as exc:
                         if "웨이퍼" in str(exc) and ("검출" in str(exc) or "못" in str(exc)):
                             self._log(f"웨이퍼를 찾지 못함 → 박스가 빈 것으로 보고 종료: {exc}")
@@ -415,6 +420,10 @@ def main():
     ap.add_argument("--fine-camera", type=int, default=0, help="정밀 얼라인 카메라 (프리얼라인 마스크 측정도 이 영상)")
     ap.add_argument("--cameras", type=int, nargs="*", default=[0, 1], help="이송 패널에 보일 카메라")
     ap.add_argument("--camera-size", type=int, nargs=2, default=[640, 480], metavar=("W", "H"))
+    ap.add_argument("--finish-frames", type=int, default=3,
+                    help="정밀 얼라인 완료: 중심 일치를 연속 몇 번 확인할지 (정밀 앱 단독 기본 8)")
+    ap.add_argument("--finish-px", type=float, default=1.0,
+                    help="정밀 얼라인 완료: 마스크·웨이퍼 중심 차이 허용 px (calibration.json 기본 0.65)")
     ap.add_argument("--detector", default="yolo-2pair", help="정밀 얼라인 검출기 (mask_aligner_optimized_v4 --detector)")
     ap.add_argument("--frame", default=None, help="정밀 카메라 해상도 WxH")
     ap.add_argument("--skip-theta", action="store_true")
@@ -423,6 +432,11 @@ def main():
 
     import mask_aligner_optimized_v4 as fine
     fine.load_calibration(str(ROOT / "calibration.json"))
+    # 연속 운전용 정밀 얼라인 완료 기준 (다음 웨이퍼의 8단계가 정밀 종료를 기다리므로 빨리 끝낸다)
+    fine.WAFER_LOST_DONE_FRAMES = a.finish_frames
+    fine.DEAD_BAND_PX = a.finish_px
+    fine.HTML_PAGE = fine.HTML_PAGE.replace("${d.wafer_lost_count}/8", "${d.wafer_lost_count}/%d" % a.finish_frames)
+    print(f"정밀 얼라인 완료 기준: 중심 {a.finish_px:g}px 이내 {a.finish_frames}회 연속")
     fine.load_rig_config(str(ROOT / "rig_config.json"))
     if a.frame:
         fine.FRAME_WIDTH, fine.FRAME_HEIGHT = (int(v) for v in a.frame.lower().split("x"))

@@ -14,7 +14,8 @@ CONFIG = Path(__file__).resolve().parents[1] / "config" / "prealign_sequence.jso
 CALIBRATION = CONFIG.parents[1] / "out" / "prealign_camera_calibration.json"
 STEP_RATE = 10_000          # 펌웨어 레일 펄스: 50us 토글 = 10,000 스텝/초
 TRANSFER_LETTERS = "QWERJHKLOPtM"   # 이 시퀀스가 움직이는 축 (정지할 때 정밀 얼라인 축은 건드리지 않는다)
-FETCH_STEPS = (0, 1, 2, 3, 4, 5, 7, 8)   # 연속 운전: 박스에서 웨이퍼를 가져와 8단계 측정까지
+FETCH_STEPS = (0, 1, 2, 3, 4, 5, 7)   # 연속 운전: 박스에서 웨이퍼를 가져와 인출 완료 위치까지 (정밀 얼라인과 겹침)
+MEASURE_STEPS = (8,)                    # 연속 운전: 8단계 각도 측정 — 정밀 얼라인이 끝나 마스크 Z가 올라간 뒤
 DELIVER_STEPS = (9, 9.5, 10, 11, 12, 13, 14)   # 연속 운전: 정밀 스테이지에 넘겨주고 빠지기
 AXIS_OF = {}                # 명령 글자 -> 축 이름
 

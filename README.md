@@ -191,7 +191,7 @@ python tools/sim_rig.py
 python tools/station.py --detector yolo-2pair
 ```
 
-`http://127.0.0.1:8790`의 **▶ 연속 운전 시작**. 자세한 사용법은 [docs/station.md](docs/station.md).
+`http://127.0.0.1:8790`의 **▶ 연속 운전 시작**. 자세한 사용법은 [docs/station.md](docs/station.md). 윈도우 노트북 세팅은 [docs/windows-setup.md](docs/windows-setup.md).
 
 **두 카메라로 프리얼라인 시험**
 

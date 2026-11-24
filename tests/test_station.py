@@ -183,3 +183,31 @@ def test_align_failure_is_not_taken_as_empty_box(board, tmp_path, monkeypatch):
     pipe.thread.join(20)
     assert pipe.state["error"] and "정밀 얼라인 실패" in pipe.state["error"]
     assert not any("박스가 빈" in line for line in pipe.state["log"])
+
+
+@pytest.mark.parametrize("mode,expected", [("hard", (5000, 5000)), ("soft", (3500, 3500))])
+def test_contact_mode_sets_mask_plate_travel(board, tmp_path, monkeypatch, mode, expected):
+    """하드 컨택은 마스크 판을 끝까지(정밀 앱 기본), 소프트 컨택은 설정한 만큼만 내리고 같은 만큼 올린다."""
+    from tools import station
+    monkeypatch.setattr(prealign_sequence, "CALIBRATION", tmp_path / "cal.json")
+    monkeypatch.setattr(station, "PIPELINE_FILE", tmp_path / "pipe.json")
+    seq = prealign_sequence.Sequence(board)
+    seq.vision.stable = lambda *a, **k: dict(mask=dict(angle=90), wafer=dict(angle=90), turn_deg=0.0, error=None)
+    monkeypatch.setattr(seq.stop_evt, "wait", lambda _: seq.stop_evt.is_set())
+    app = FakeFine(align_s=0.1)
+    seen = []
+    pipe = station.Pipeline(seq, app, board, z_setter=lambda d, u: seen.append((d, u)), hard_ms=(5000, 5000))
+    pipe.save_cfg(dict(max_wafers=1, auto_clear=True, soft_down_ms=3500))
+    pipe.start(mode)
+    pipe.thread.join(20)
+    assert pipe.state["error"] is None and seen == [expected]
+    assert pipe.status()["mode"] == mode
+
+
+def test_soft_contact_must_be_less_than_hard(board, tmp_path, monkeypatch):
+    from tools import station
+    monkeypatch.setattr(station, "PIPELINE_FILE", tmp_path / "pipe.json")
+    pipe = station.Pipeline(prealign_sequence.Sequence(board), FakeFine(), board, hard_ms=(5000, 5000))
+    with pytest.raises(ValueError):
+        pipe.save_cfg(dict(soft_down_ms=6000))
+    assert pipe.cfg["soft_down_ms"] == 4000      # 잘못된 값은 저장하지 않는다

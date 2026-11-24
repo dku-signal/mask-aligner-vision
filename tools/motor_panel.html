@@ -70,8 +70,9 @@
     <h2>연속 운전 · 프리얼라인 → 정밀 얼라인 반복</h2>
     <p>웨이퍼를 가져와(0~8단계, 두 키 측정) 정밀 스테이지가 비면 넘겨주고(9~14단계) 정밀 얼라인을 시작합니다. 정렬하는 동안 다음 웨이퍼를 가져옵니다.
        정렬된 웨이퍼는 작업자가 치운 뒤 <b>스테이지 비움 확인</b>을 누르세요 (자동 진행을 켜면 확인 없이 다음 웨이퍼를 넘깁니다).</p>
-    <div class="row"><button class="tog" id="pipeStart">▶ 연속 운전 시작</button><button class="tog" id="pipeStop">■ 연속 운전 정지</button><button class="tog" id="pipeCleared">✔ 스테이지 비움 확인</button></div>
+    <div class="row"><button class="tog" id="pipeStart">▶ 연속 운전 시작<small>하드 컨택 · 마스크 판 끝까지</small></button><button class="tog" id="pipeStartSoft">▶ 연속 운전 시작<small>소프트 컨택 · 덜 내림</small></button><button class="tog" id="pipeStop">■ 연속 운전 정지</button><button class="tog" id="pipeCleared">✔ 스테이지 비움 확인</button></div>
     <div class="row"><span class="lbl">최대 장수</span><input id="pipeMax" type="number" min="0" value="0" style="flex:1;padding:10px;font:inherit;border-radius:8px;border:1px solid var(--line);background:var(--btn);color:var(--ink)"> <span>(0 = 박스가 빌 때까지)</span>
+      <span class="lbl">소프트 내림</span><input id="pipeSoft" type="number" min="100" step="100" value="4000" style="width:90px;padding:10px;font:inherit;border-radius:8px;border:1px solid var(--line);background:var(--btn);color:var(--ink)"> <span>ms</span>
       <label style="flex:1"><input type="checkbox" id="pipeAuto"> 스테이지 비움 확인 없이 자동 진행</label><button class="tog" id="pipeSave" style="flex:0 0 auto">저장</button></div>
     <pre id="pipeState" style="font-size:13px;color:var(--ink)"></pre>
     <pre id="pipeLog"></pre>
@@ -495,20 +496,26 @@ async function pipePoll() {
   const p = await r.json();
   $('#pipeCard').style.display = '';
   if (!pipeInit) {
-    $('#fineFrame').src = p.fine_url; $('#pipeMax').value = p.cfg.max_wafers; $('#pipeAuto').checked = p.cfg.auto_clear; pipeInit = true;
+    $('#fineFrame').src = p.fine_url; $('#pipeMax').value = p.cfg.max_wafers; $('#pipeAuto').checked = p.cfg.auto_clear; $('#pipeSoft').value = p.cfg.soft_down_ms; pipeInit = true;
   }
-  $('#pipeStart').classList.toggle('on', p.running);
+  $('#pipeStart').classList.toggle('on', p.running && p.mode === 'hard');
+  $('#pipeStartSoft').classList.toggle('on', p.running && p.mode === 'soft');
   $('#pipeState').textContent =
-    `상태: ${p.phase}${p.error ? '  ⚠ ' + p.error : ''}\n` +
+    `상태: ${p.phase}${p.error ? '  ⚠ ' + p.error : ''} · ${p.mode_name} (마스크 판 내림 ${p.z_down_ms}ms · 하드 ${p.hard_down_ms}ms)\n` +
     `가져옴 ${p.fetched} · 넘김 ${p.delivered} · 정렬 완료 ${p.aligned} · 이송 팔 ${p.holding ? '웨이퍼 들고 있음' : '비어 있음'} · 정밀 스테이지: ${p.stage}\n` +
     `정밀 얼라인: ${p.fine.phase} · ${p.fine.status} (MASK ${p.fine.mask ? 'OK' : 'NO'} / WAFER ${p.fine.wafer ? 'OK' : 'NO'})\n` +
     `이송: ${p.transfer.running ? p.transfer.current + '단계 진행 중' : '대기'}${p.transfer.error ? ' · ' + p.transfer.error : ''}`;
   $('#pipeLog').textContent = p.log.slice(0, 12).join('\n');
 }
-$('#pipeStart').onclick = () => { if (confirm('연속 운전을 시작합니다. 장비 주변을 비우고, 정밀 스테이지가 비어 있는지 확인하세요.')) post('/pipeline/start', {}); };
+function pipeGo(mode) {
+  const name = mode === 'soft' ? `소프트 컨택 (마스크 판 ${$('#pipeSoft').value}ms 내림)` : '하드 컨택 (마스크 판 끝까지 내림)';
+  if (confirm(`연속 운전을 ${name}으로 시작합니다. 장비 주변을 비우고, 정밀 스테이지가 비어 있는지 확인하세요.`)) post('/pipeline/start', {mode, soft_down_ms: Number($('#pipeSoft').value)});
+}
+$('#pipeStart').onclick = () => pipeGo('hard');
+$('#pipeStartSoft').onclick = () => pipeGo('soft');
 $('#pipeStop').onclick = () => post('/pipeline/stop', {});
 $('#pipeCleared').onclick = () => post('/pipeline/cleared', {});
-$('#pipeSave').onclick = () => post('/pipeline/config', {max_wafers: Number($('#pipeMax').value), auto_clear: $('#pipeAuto').checked});
+$('#pipeSave').onclick = () => post('/pipeline/config', {max_wafers: Number($('#pipeMax').value), auto_clear: $('#pipeAuto').checked, soft_down_ms: Number($('#pipeSoft').value)});
 pipePoll(); setInterval(pipePoll, 500);
 loadPorts(); loadPrealign(); poll(); cams(); seqPoll(); setInterval(poll, 300); setInterval(cams, 300); setInterval(seqPoll, 500);
 

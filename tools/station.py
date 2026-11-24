@@ -198,12 +198,18 @@ class AlignFailed(RuntimeError):
 
 
 class Pipeline:
-    def __init__(self, seq, app, board):
+    # 정밀 얼라인의 마스크 판(정밀 Z) 내림: hard = 끝까지(정밀 앱 기본 ALIGN_Z_DOWN_MS),
+    # soft = hard보다 덜 내림(cfg soft_down_ms). 올림은 내린 만큼.
+    MODES = {"hard": "하드 컨택", "soft": "소프트 컨택"}
+
+    def __init__(self, seq, app, board, z_setter=None, hard_ms=(5000, 5000)):
         self.seq, self.app, self.board = seq, app, board
+        self.z_setter, self.hard_ms = z_setter, tuple(hard_ms)
+        self.mode = "hard"
         self.thread = None
         self.stop_evt = threading.Event()
         self.cleared = threading.Event()
-        self.cfg = dict(max_wafers=0, auto_clear=False, start_timeout_s=20.0)
+        self.cfg = dict(max_wafers=0, auto_clear=False, start_timeout_s=20.0, soft_down_ms=4000)
         try:
             self.cfg.update(json.loads(PIPELINE_FILE.read_text()))
         except Exception:
@@ -212,9 +218,13 @@ class Pipeline:
                           fetched=0, delivered=0, aligned=0, holding=False, stage="비어 있음", results=[])
 
     def save_cfg(self, values):
-        for k in ("max_wafers", "auto_clear"):
+        new = dict(self.cfg)
+        for k in ("max_wafers", "auto_clear", "soft_down_ms"):
             if k in values:
-                self.cfg[k] = int(values[k]) if k == "max_wafers" else bool(values[k])
+                new[k] = bool(values[k]) if k == "auto_clear" else int(values[k])
+        if not 0 < new["soft_down_ms"] < self.hard_ms[0]:
+            raise ValueError(f"소프트 컨택 내림 시간은 0보다 크고 하드 컨택({self.hard_ms[0]}ms)보다 작아야 합니다")
+        self.cfg = new
         PIPELINE_FILE.parent.mkdir(exist_ok=True)
         PIPELINE_FILE.write_text(json.dumps(self.cfg))
 
@@ -224,22 +234,35 @@ class Pipeline:
 
     def status(self):
         app = self.app
-        return dict(self.state, cfg=self.cfg,
+        down, up = self.z_ms()
+        return dict(self.state, cfg=self.cfg, mode=self.mode, mode_name=self.MODES[self.mode],
+                    z_down_ms=down, z_up_ms=up, hard_down_ms=self.hard_ms[0],
                     fine=dict(phase=app.phase, status=app.status, auto_running=app.auto_running,
                               mask=app.mask_detected, wafer=app.wafer_detected),
                     transfer=dict(running=self.seq.state["running"], current=self.seq.state["current"],
                                   error=self.seq.state["error"]))
 
+    def z_ms(self):
+        if self.mode == "soft":
+            ms = int(self.cfg["soft_down_ms"])
+            return ms, ms
+        return self.hard_ms
+
     # ---- 시작·정지 ----
-    def start(self):
+    def start(self, mode="hard"):
+        if mode not in self.MODES:
+            raise ValueError(f"알 수 없는 모드 {mode!r}")
         if self.thread and self.thread.is_alive():
             raise RuntimeError("연속 운전이 이미 실행 중")
         if self.seq.state["running"]:
             raise RuntimeError("이송 시퀀스가 실행 중입니다")
         if not self.board.port:
             raise RuntimeError("먼저 아두이노 포트를 연결하세요")
+        self.mode = mode
         self.stop_evt.clear()
         self.state.update(running=True, error=None, phase="시작")
+        down, up = self.z_ms()
+        self._log(f"연속 운전 시작: {self.MODES[mode]} (마스크 판 내림 {down}ms · 올림 {up}ms)")
         self.thread = threading.Thread(target=self._run, name="pipeline", daemon=True)
         self.thread.start()
 
@@ -290,6 +313,8 @@ class Pipeline:
 
     def _start_fine(self):
         app = self.app
+        if self.z_setter:
+            self.z_setter(*self.z_ms())
         self.state["phase"] = "정밀 얼라인 START"
         deadline = time.time() + self.cfg["start_timeout_s"]
         while time.time() < deadline:
@@ -380,7 +405,9 @@ class StationHandler(panel.Handler):
             data = json.loads(self.rfile.read(n) or b"{}")
             try:
                 if self.path == "/pipeline/start":
-                    PIPE.start()
+                    if "soft_down_ms" in data:
+                        PIPE.save_cfg({"soft_down_ms": data["soft_down_ms"]})
+                    PIPE.start(data.get("mode", "hard"))
                 elif self.path == "/pipeline/stop":
                     PIPE.stop()
                 elif self.path == "/pipeline/cleared":
@@ -480,7 +507,10 @@ def main():
     for c in panel.CAMS.state():
         print(f"  카메라 {c['index']}:", c["error"] or "열림")
 
-    PIPE = Pipeline(seq, app, panel.BOARD)
+    def set_align_z(down, up):
+        fine.ALIGN_Z_DOWN_MS, fine.ALIGN_Z_UP_MS = int(down), int(up)
+    PIPE = Pipeline(seq, app, panel.BOARD, z_setter=set_align_z,
+                    hard_ms=(fine.ALIGN_Z_DOWN_MS, fine.ALIGN_Z_UP_MS))
     FINE_PORT = a.fine_http
 
     fine_srv = ThreadingHTTPServer(("127.0.0.1", a.fine_http), fine.RequestHandler)

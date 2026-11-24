@@ -398,12 +398,23 @@ class Sequence:
                     self.station = (self.board.ser, self.board.revision)
                     self.state["current"] = "각도 측정"
                     self._log("8단계 Y 후퇴 완료 · 정지 상태에서 두 키 측정")
-                    result = self.measure_angle(self.cfg["prealign"])
-                    if self.stop_evt.is_set():
-                        self.invalidate()
-                        raise InterruptedError("정지됨")
+                    # 두 키가 모두 잡혀 각도가 나올 때까지 재시도 (한 번 = 최대 15초 안정 측정)
+                    attempts = int(self.cfg["prealign"].get("measure_attempts", 5))
+                    for attempt in range(1, attempts + 1):
+                        try:
+                            result = self.measure_angle(self.cfg["prealign"])
+                        except ValueError as exc:
+                            result = {"error": str(exc)}
+                        if self.stop_evt.is_set():
+                            self.invalidate()
+                            raise InterruptedError("정지됨")
+                        if not result["error"]:
+                            break
+                        self._log(f"  각도 측정 {attempt}/{attempts}회 실패: {result['error']}")
+                        if attempt < attempts and self.stop_evt.wait(1.0):
+                            raise InterruptedError("정지됨")
                     if result["error"]:
-                        raise ValueError(result["error"])
+                        raise ValueError(f"{attempts}회 시도 실패 · {result['error']}")
                 if st["no"] == 1 and self.board.ledger.d.get("box_x") is None:
                     # 원상 복구에서 사용할 박스 쪽 기준을 기억한다.
                     self.board.ledger.snapshot("box_x", self.board.ledger.d["pos"]["x_rail"])

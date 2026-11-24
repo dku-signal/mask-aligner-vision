@@ -319,6 +319,9 @@ class KeyPrealign:
                        for _, r in samples) > 1.5 for key in ("mask", "wafer")):
                 detail = "키 방향이 움직이고 있습니다"
                 continue
+            if any(r.get("side_flip") != result.get("side_flip") for _, r in samples):
+                detail = "웨이퍼 십자 방향(180°) 판별이 흔들립니다"
+                continue
             errors = [axis_difference(r["turn_deg"], result["turn_deg"]) for _, r in samples]
             mid = statistics.median(errors)
             return min(samples, key=lambda pair: abs(axis_difference(pair[1]["turn_deg"], result["turn_deg"]) - mid))[1]

@@ -50,6 +50,18 @@
   <span id="mv" class="pill">정지</span>
 </header>
 <main>
+  <section class="card" id="pipeCard" style="grid-column:1/-1;display:none;border:2px solid var(--btnon)">
+    <h2>연속 운전 · 프리얼라인 → 정밀 얼라인 반복</h2>
+    <p>웨이퍼를 가져와(0~8단계, 두 키 측정) 정밀 스테이지가 비면 넘겨주고(9~14단계) 정밀 얼라인을 시작합니다. 정렬하는 동안 다음 웨이퍼를 가져옵니다.
+       정렬된 웨이퍼는 작업자가 치운 뒤 <b>스테이지 비움 확인</b>을 누르세요 (자동 진행을 켜면 확인 없이 다음 웨이퍼를 넘깁니다).</p>
+    <div class="row"><button class="tog" id="pipeStart">▶ 연속 운전 시작</button><button class="tog" id="pipeStop">■ 연속 운전 정지</button><button class="tog" id="pipeCleared">✔ 스테이지 비움 확인</button></div>
+    <div class="row"><span class="lbl">최대 장수</span><input id="pipeMax" type="number" min="0" value="0" style="flex:1;padding:10px;font:inherit;border-radius:8px;border:1px solid var(--line);background:var(--btn);color:var(--ink)"> <span>(0 = 박스가 빌 때까지)</span>
+      <label style="flex:1"><input type="checkbox" id="pipeAuto"> 스테이지 비움 확인 없이 자동 진행</label><button class="tog" id="pipeSave" style="flex:0 0 auto">저장</button></div>
+    <pre id="pipeState" style="font-size:13px;color:var(--ink)"></pre>
+    <pre id="pipeLog"></pre>
+    <details open><summary>정밀 얼라인 화면</summary><iframe id="fineFrame" style="width:100%;height:720px;border:1px solid var(--line);border-radius:10px;margin-top:8px"></iframe></details>
+  </section>
+
   <section class="card" style="grid-column:1/-1">
     <h2>카메라</h2>
     <p>관찰용 화면(0.3초 갱신 · 0번 정밀 마스크 / 1번 프리얼라인 웨이퍼). 번호는 연결 순서에 따라 바뀔 수 있으니 화면을 보고 역할을 확인하세요.</p>
@@ -457,6 +469,28 @@ $('#lnGo').onclick = async () => {
   const j = await post('/line', {c: $('#lnC').value, n: Number($('#lnN').value)});
   $('#lnOut').textContent = j.ok ? '완료: ' + j.reply : '실패: ' + j.error;
 };
+let pipeInit = false;
+async function pipePoll() {
+  let r; try { r = await fetch('/pipeline'); } catch (e) { return; }
+  if (!r.ok) return;                       // 통합 스테이션이 아니면 카드를 숨긴 채로 둔다
+  const p = await r.json();
+  $('#pipeCard').style.display = '';
+  if (!pipeInit) {
+    $('#fineFrame').src = p.fine_url; $('#pipeMax').value = p.cfg.max_wafers; $('#pipeAuto').checked = p.cfg.auto_clear; pipeInit = true;
+  }
+  $('#pipeStart').classList.toggle('on', p.running);
+  $('#pipeState').textContent =
+    `상태: ${p.phase}${p.error ? '  ⚠ ' + p.error : ''}\n` +
+    `가져옴 ${p.fetched} · 넘김 ${p.delivered} · 정렬 완료 ${p.aligned} · 이송 팔 ${p.holding ? '웨이퍼 들고 있음' : '비어 있음'} · 정밀 스테이지: ${p.stage}\n` +
+    `정밀 얼라인: ${p.fine.phase} · ${p.fine.status} (MASK ${p.fine.mask ? 'OK' : 'NO'} / WAFER ${p.fine.wafer ? 'OK' : 'NO'})\n` +
+    `이송: ${p.transfer.running ? p.transfer.current + '단계 진행 중' : '대기'}${p.transfer.error ? ' · ' + p.transfer.error : ''}`;
+  $('#pipeLog').textContent = p.log.slice(0, 12).join('\n');
+}
+$('#pipeStart').onclick = () => { if (confirm('연속 운전을 시작합니다. 장비 주변을 비우고, 정밀 스테이지가 비어 있는지 확인하세요.')) post('/pipeline/start', {}); };
+$('#pipeStop').onclick = () => post('/pipeline/stop', {});
+$('#pipeCleared').onclick = () => post('/pipeline/cleared', {});
+$('#pipeSave').onclick = () => post('/pipeline/config', {max_wafers: Number($('#pipeMax').value), auto_clear: $('#pipeAuto').checked});
+pipePoll(); setInterval(pipePoll, 500);
 loadPorts(); loadPrealign(); poll(); cams(); seqPoll(); setInterval(poll, 300); setInterval(cams, 300); setInterval(seqPoll, 500);
 </script>
 </body>

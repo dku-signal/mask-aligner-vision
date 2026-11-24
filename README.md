@@ -185,6 +185,14 @@ python -m pip install -r requirements.txt
 python tools/sim_rig.py
 ```
 
+**연속 운전 (통합 스테이션)** — 펌웨어 v2(`firmware/mega_previous`)를 올린 뒤:
+
+```bash
+python tools/station.py --detector yolo-2pair
+```
+
+`http://127.0.0.1:8790`의 **▶ 연속 운전 시작**. 자세한 사용법은 [docs/station.md](docs/station.md). 윈도우 노트북 세팅은 [docs/windows-setup.md](docs/windows-setup.md).
+
 **두 카메라로 프리얼라인 시험**
 
 `firmware/mega_previous` 장비에서는 아래의 YOLO 가중치를 설치한 뒤 이송 패널을 연결 대기 상태로 실행합니다.
@@ -196,7 +204,7 @@ python tools/motor_panel.py --standby --cameras 0 1
 
 1. [이송 패널](http://127.0.0.1:8790/)에서 **카메라 열기 / 다시 연결**을 누릅니다. **두 키 각도 확인 (모션 없음)**으로 카메라 0의 마스크와 카메라 1의 웨이퍼 검출 결과를 확인합니다.
 2. **카메라 설치 각도와 D8 방향 보정**에서 카메라 좌표 대응을 설정합니다. **D8 양방향 90° 실측 기록**은 진단용입니다. 자동 이송은 설정된 양방향 공통 90° 시간(550ms)을 사용합니다.
-3. 장비에서 7단계까지 웨이퍼를 수취한 뒤 **8→9단계 1회 시험**을 실행합니다. 8단계 후퇴가 끝나면 정지 상태에서 각도를 측정합니다. 9단계에서는 W 250,000스텝 이송 중 각도 차이에 비례해 D8을 한 번 구동하며, ±1.5° 이내면 회전을 생략합니다. 보드의 이송·회전 완료 응답을 받으면 남은 W 이송과 F 3,200스텝을 진행합니다.
+3. 장비에서 7단계까지 웨이퍼를 수취한 뒤 **8→9단계 1회 시험**을 실행합니다. 8단계 후퇴가 끝나면 정지 상태에서 각도를 측정합니다. 9단계에서는 W 250,000스텝 이송 중 각도 차이에 비례해 D8을 한 번 구동하며, ±1.5° 이내면 회전을 생략합니다. 보드의 이송·회전 완료 응답을 받으면 남은 W 이송과 F 32,000스텝을 진행합니다.
 
 정밀 얼라인의 FINISH 기준과 세타·X·Y 복귀 순서는 [장비 인계 자료 4.2절](docs/handover-2026-11-20.md)에 있습니다.
 
@@ -227,6 +235,7 @@ gh release download weights-v1 -R dku-signal/mask-aligner-vision -p keys_real_be
 | [`preflight.py`](preflight.py) | 실행 전 카메라·통신·키 인식 점검 |
 | [`firmware/xy_tb6560/xy_tb6560.ino`](firmware/xy_tb6560/xy_tb6560.ino) | Mega의 유한 펄스 이동과 θ 제어 |
 | [`tools/sim_rig.py`](tools/sim_rig.py) | 가상 장비로 제어 흐름 확인 |
+| [`tools/station.py`](tools/station.py) | **통합 스테이션**: 프리얼라인 → 정밀 얼라인 연속 운전 (정렬 중에 다음 웨이퍼 가져오기). [설명](docs/station.md) |
 | [`tools/motor_panel.py`](tools/motor_panel.py) | 이송·프리얼라인 웹 패널: 수동 조작, 정확한 이동, 자동 시퀀스(화이트보드 14단계), 원상 복구 |
 | [`config/prealign_sequence.json`](config/prealign_sequence.json) | 자동 시퀀스 단계·값 (하드코딩 값은 여기서 수정) |
 | [`notch.py`](notch.py) | 별도 웨이퍼 노치 각도 측정 도구 |

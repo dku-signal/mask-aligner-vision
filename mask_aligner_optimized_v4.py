@@ -1416,7 +1416,7 @@ class MaskAlignerApp:
                     'moving': self.moving, 'mask_center': self.mask_center, 'wafer_center': self.wafer_center}
             self.record_count += 1
             self.record_last = captured
-        with open(record_dir/'frames.jsonl', 'a') as f:
+        with open(record_dir/'frames.jsonl', 'a', encoding='utf-8') as f:
             f.write(json.dumps(meta, default=float) + '\n')
 
     def run_commands(self, label, commands):
@@ -1505,9 +1505,9 @@ class MaskAlignerApp:
         globals().update(values)
         if RIG_CONFIG_PATH is None:
             return
-        data = json.loads(RIG_CONFIG_PATH.read_text()) if RIG_CONFIG_PATH.is_file() else {}
+        data = json.loads(RIG_CONFIG_PATH.read_text(encoding='utf-8')) if RIG_CONFIG_PATH.is_file() else {}
         data.update(values)
-        RIG_CONFIG_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False)+'\n')
+        RIG_CONFIG_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False)+'\n', encoding='utf-8')
 
     def prealign_set_target(self):
         """Save the current notch angle as the pre-align target (do this right after a good fine align)."""
@@ -2166,7 +2166,7 @@ def load_calibration(path):
     if not path.is_file():
         print(f'No {path.name}: using built-in stage constants (run calibrate_xy.py)')
         return
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding='utf-8'))
     for key in CALIBRATED_KEYS:
         if key in data:
             globals()[key] = data[key]
@@ -2187,7 +2187,7 @@ def load_rig_config(path):
     globals()['RIG_CONFIG_PATH'] = path
     if not path.is_file():
         return
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding='utf-8'))
     for key in RIG_CONFIG_KEYS:
         if key in data:
             globals()[key] = data[key]

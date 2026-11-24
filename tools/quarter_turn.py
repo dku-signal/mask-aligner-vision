@@ -20,7 +20,7 @@ def quarter_turn_ms(settings):
 
 def read_timing(settings):
     try:
-        data = json.loads(TIMING.read_text())
+        data = json.loads(TIMING.read_text(encoding="utf-8"))
         if data["wafer_increasing_direction"] != settings["wafer_increasing_direction"]:
             raise ValueError
         for direction in ("1", "-1"):
@@ -104,7 +104,7 @@ def calibrate(board, cameras, vision, cfg, stop, report):
                           directions=trials, history=history)
             _stopped(stop)
             TIMING.parent.mkdir(exist_ok=True)
-            with NamedTemporaryFile("w", dir=TIMING.parent, delete=False) as f:
+            with NamedTemporaryFile("w", dir=TIMING.parent, delete=False, encoding="utf-8") as f:
                 json.dump(result, f, indent=2)
             Path(f.name).replace(TIMING)
             return result

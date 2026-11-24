@@ -188,7 +188,7 @@ def main():
     print('report:', report)
     SIM_CAL.parent.mkdir(exist_ok=True)
     import json
-    SIM_CAL.write_text(json.dumps(cal, indent=2))
+    SIM_CAL.write_text(json.dumps(cal, indent=2), encoding='utf-8')
 
     print('\n=== 2. web-app XY loop (skip_theta) on the simulated stage')
     import mask_aligner_optimized_v4 as app_mod

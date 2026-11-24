@@ -14,7 +14,7 @@ class FineStage:
         self.lock = threading.RLock()
         self.data = {}
         if path.is_file():
-            data = json.loads(path.read_text())
+            data = json.loads(path.read_text(encoding="utf-8"))
             if data.get("device") == device:
                 self.data = data
 
@@ -28,7 +28,7 @@ class FineStage:
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with NamedTemporaryFile("w", dir=self.path.parent, delete=False) as f:
+        with NamedTemporaryFile("w", dir=self.path.parent, delete=False, encoding="utf-8") as f:
             json.dump(self.data, f)
         Path(f.name).replace(self.path)
 

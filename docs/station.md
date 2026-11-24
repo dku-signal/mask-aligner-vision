@@ -16,7 +16,7 @@
 
 ```bash
 python tools/station.py                                  # 아두이노 자동, 카메라 0(정밀·마스크) 1(웨이퍼)
-python tools/station.py --detector yolo-2pair --frame 1280x720
+python tools/station.py --detector yolo-2pair   # 정밀 카메라 1920x1080 (기본)
 python tools/station.py --mock                           # 보드 없이 (가상 보드)
 ```
 

@@ -2,7 +2,7 @@
 
     python tools/station.py                      # 아두이노 자동, 카메라 0(정밀·마스크) 1(웨이퍼)
     python tools/station.py --mock               # 보드 없이 (가상 보드, 20배 빠름)
-    python tools/station.py --detector yolo-2pair --frame 1280x720
+    python tools/station.py --detector yolo-2pair --frame 1920x1080   (기본값)
 
 왜 한 프로그램인가
   - 보드(시리얼 포트)는 한 프로그램만 열 수 있다. 예전에는 정밀 앱(8765)과 이송 패널(8790)이
@@ -29,6 +29,8 @@ import time
 import webbrowser
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+
+import cv2
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -153,13 +155,19 @@ class BusLink:
 class _SharedCapture:
     """CAMS(이송 패널 카메라)에 정밀 앱 카메라 프레임을 빌려주는 보기 전용 캡처."""
 
-    def __init__(self, app):
-        self.app = app
+    def __init__(self, app, size=None):
+        self.app, self.size = app, size
 
     @property
     def sample(self):
         latest = self.app.latest_frame
-        return (self.app.capture_time, latest[1]) if latest else None
+        if not latest:
+            return None
+        frame = latest[1]
+        # 정밀 앱은 1920x1080으로 잡지만 패널 화면·8단계 측정은 원래대로 패널 크기(640x480)로 본다
+        if self.size and (frame.shape[1], frame.shape[0]) != tuple(self.size):
+            frame = cv2.resize(frame, tuple(self.size), interpolation=cv2.INTER_AREA)
+        return (self.app.capture_time, frame)
 
     @property
     def error(self):
@@ -176,10 +184,10 @@ def share_camera(cams, app, index):
     def open_without_shared(indices, size=(640, 480)):
         original_open([i for i in indices if i != index], size)
         cams.indices = list(indices)
-        cams.views[index] = dict(capture=_SharedCapture(app), error=None)
+        cams.views[index] = dict(capture=_SharedCapture(app, size), error=None)
 
     cams.open = open_without_shared
-    cams.views[index] = dict(capture=_SharedCapture(app), error=None)
+    cams.views[index] = dict(capture=_SharedCapture(app, getattr(cams, "size", None)), error=None)
 
 
 # ---------------------------------------------------------------------------
@@ -431,7 +439,8 @@ def main():
     ap.add_argument("--finish-px", type=float, default=1.0,
                     help="정밀 얼라인 완료: 마스크·웨이퍼 중심 차이 허용 px (calibration.json 기본 0.65)")
     ap.add_argument("--detector", default="yolo-2pair", help="정밀 얼라인 검출기 (mask_aligner_optimized_v4 --detector)")
-    ap.add_argument("--frame", default=None, help="정밀 카메라 해상도 WxH")
+    ap.add_argument("--frame", default="1920x1080",
+                    help="정밀 카메라 해상도 WxH. calibration.json(스텝/px)과 YOLO 키 크기가 1920x1080 기준")
     ap.add_argument("--skip-theta", action="store_true")
     ap.add_argument("--no-browser", action="store_true")
     a = ap.parse_args()

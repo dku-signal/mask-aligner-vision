@@ -209,7 +209,7 @@ class Pipeline:
         self.thread = None
         self.stop_evt = threading.Event()
         self.cleared = threading.Event()
-        self.cfg = dict(max_wafers=0, auto_clear=False, start_timeout_s=20.0, soft_down_ms=4000)
+        self.cfg = dict(max_wafers=0, auto_clear=False, start_timeout_s=20.0, soft_down_ms=3500)
         try:
             self.cfg.update(json.loads(PIPELINE_FILE.read_text()))
         except Exception:
@@ -311,6 +311,18 @@ class Pipeline:
             if not ok:
                 raise AlignFailed(f"정밀 얼라인 실패 — 연속 운전을 멈춥니다: {app.status}")
 
+    def align_only(self, mode="hard"):
+        """스테이지에 이미 놓인 웨이퍼 하나만 정밀 얼라인 (컨택 모드 적용, 이송 없음)."""
+        if mode not in self.MODES:
+            raise ValueError(f"알 수 없는 모드 {mode!r}")
+        if self.thread and self.thread.is_alive():
+            raise RuntimeError("연속 운전이 실행 중")
+        self.mode = mode
+        self.stop_evt.clear()
+        down, up = self.z_ms()
+        self._log(f"정밀 얼라인만: {self.MODES[mode]} (마스크 판 내림 {down}ms · 올림 {up}ms)")
+        self._start_fine()
+
     def _start_fine(self):
         app = self.app
         if self.z_setter:
@@ -408,6 +420,10 @@ class StationHandler(panel.Handler):
                     if "soft_down_ms" in data:
                         PIPE.save_cfg({"soft_down_ms": data["soft_down_ms"]})
                     PIPE.start(data.get("mode", "hard"))
+                elif self.path == "/pipeline/align":
+                    if "soft_down_ms" in data:
+                        PIPE.save_cfg({"soft_down_ms": data["soft_down_ms"]})
+                    PIPE.align_only(data.get("mode", "hard"))
                 elif self.path == "/pipeline/stop":
                     PIPE.stop()
                 elif self.path == "/pipeline/cleared":

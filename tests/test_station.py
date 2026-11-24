@@ -210,4 +210,15 @@ def test_soft_contact_must_be_less_than_hard(board, tmp_path, monkeypatch):
     pipe = station.Pipeline(prealign_sequence.Sequence(board), FakeFine(), board, hard_ms=(5000, 5000))
     with pytest.raises(ValueError):
         pipe.save_cfg(dict(soft_down_ms=6000))
-    assert pipe.cfg["soft_down_ms"] == 4000      # 잘못된 값은 저장하지 않는다
+    assert pipe.cfg["soft_down_ms"] == 3500      # 잘못된 값은 저장하지 않는다
+
+
+def test_align_only_applies_contact_mode(board, tmp_path, monkeypatch):
+    """스테이지에 놓인 웨이퍼만 정밀 얼라인: 이송 없이 모드의 마스크 판 시간으로 START."""
+    from tools import station
+    monkeypatch.setattr(station, "PIPELINE_FILE", tmp_path / "pipe.json")
+    app, seen = FakeFine(align_s=0.1), []
+    pipe = station.Pipeline(prealign_sequence.Sequence(board), app, board,
+                            z_setter=lambda d, u: seen.append((d, u)), hard_ms=(5000, 5000))
+    pipe.align_only("soft")
+    assert seen == [(3500, 3500)] and len(app.starts) == 1 and not board.ser.sent

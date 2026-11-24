@@ -72,7 +72,7 @@
        정렬된 웨이퍼는 작업자가 치운 뒤 <b>스테이지 비움 확인</b>을 누르세요 (자동 진행을 켜면 확인 없이 다음 웨이퍼를 넘깁니다).</p>
     <div class="row"><button class="tog" id="pipeStart">▶ 연속 운전 시작<small>하드 컨택 · 마스크 판 끝까지</small></button><button class="tog" id="pipeStartSoft">▶ 연속 운전 시작<small>소프트 컨택 · 덜 내림</small></button><button class="tog" id="pipeStop">■ 연속 운전 정지</button><button class="tog" id="pipeCleared">✔ 스테이지 비움 확인</button></div>
     <div class="row"><span class="lbl">최대 장수</span><input id="pipeMax" type="number" min="0" value="0" style="flex:1;padding:10px;font:inherit;border-radius:8px;border:1px solid var(--line);background:var(--btn);color:var(--ink)"> <span>(0 = 박스가 빌 때까지)</span>
-      <span class="lbl">소프트 내림</span><input id="pipeSoft" type="number" min="100" step="100" value="4000" style="width:90px;padding:10px;font:inherit;border-radius:8px;border:1px solid var(--line);background:var(--btn);color:var(--ink)"> <span>ms</span>
+      <span class="lbl">소프트 내림</span><input id="pipeSoft" type="number" min="100" step="100" value="3500" style="width:90px;padding:10px;font:inherit;border-radius:8px;border:1px solid var(--line);background:var(--btn);color:var(--ink)"> <span>ms</span>
       <label style="flex:1"><input type="checkbox" id="pipeAuto"> 스테이지 비움 확인 없이 자동 진행</label><button class="tog" id="pipeSave" style="flex:0 0 auto">저장</button></div>
     <pre id="pipeState" style="font-size:13px;color:var(--ink)"></pre>
     <pre id="pipeLog"></pre>

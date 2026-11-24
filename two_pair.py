@@ -189,8 +189,17 @@ class TwoPairKeys(MaskPairGeometry):
         side = self.mask['size']
         seen = [(blob_center(gray, b, self.mask_pixels), b) for b in cross_boxes[:2]]
         seen = [(c, b) for c, b in seen if c is not None]
-        if len(seen) == 2 and np.linalg.norm(seen[0][0]-seen[1][0]) < 2*side:
-            seen = seen[:1]  # both boxes on the same cross
+        if len(seen) == 2:
+            # Same cross or two? Judge by the YOLO boxes, not the blob centroids: the two wafer
+            # crosses sit ~2.5 square widths apart, so each padded box also takes in part of the
+            # other cross and both centroids are pulled toward the middle (rig 2026-11-24: boxes
+            # 51 px apart, centroids 25 px, side 20 px -> merged and the wafer was "lost").
+            box_mid = [(b[:2]+b[2:])/2 for _, b in seen]
+            box_gap = float(np.linalg.norm(box_mid[0]-box_mid[1]))
+            if box_gap < side:
+                seen = seen[:1]  # both boxes on the same cross
+            elif np.linalg.norm(seen[0][0]-seen[1][0]) < 0.7*box_gap:
+                seen = [(m, b) for m, (_, b) in zip(box_mid, seen)]  # centroids pulled together
         if len(seen) == 2:
             if (seen[1][0]-seen[0][0])@self.mask['axis'] < 0:
                 seen = seen[::-1]

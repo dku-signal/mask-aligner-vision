@@ -138,7 +138,7 @@ def test_transfer_cycle(rig, angle):
     recipe = {
         0: ["K 6500", "O 5000", "M 0"], 1: ["Q 250000"], 2: ["E 90000"],
         3: ["L 6500"], 4: ["M 1"], 5: ["P 1100"], 7: ["K 6500"],
-        8: ["R 90000"], 9: ["W 250000", "F 3200"], 9.5: ["P 5000"],
+        8: ["R 90000"], 9: ["W 250000", "F 32000"], 9.5: ["P 5000"],
         10: ["E 90000"], 11: ["L 2700"], 12: ["O 3000"], 13: ["M 0"],
         14: ["R 90000", "K 6500"],
     }
@@ -156,9 +156,9 @@ def test_transfer_cycle(rig, angle):
     assert seq.state["error"] is None and seq.state["done"][-1] == 14
     assert "#M 1\n" in seen and seen[-1] == "#R 90000\n"
     sent = board.ser.sent
-    assert board.fine_stage.moves() == [("B", 3200)]
+    assert board.fine_stage.moves() == [("B", 32000)]
     if angle:
-        recipe[9] = ["W 5700", "t 550 -1", "W 244300", "F 3200"]
+        recipe[9] = ["W 5700", "t 550 -1", "W 244300", "F 32000"]
     assert sent == [f"#{cmd}\n" for step in recipe.values() for cmd in step]
 
 
@@ -211,7 +211,7 @@ def test_step8_measures_once_at_rest_then_step9_consumes(rig, angle, segment, se
     seq.thread.join(2)
     assert seq.state["error"] is None and calls == [True]
     expected = segment or ["#W 250000\n"]
-    assert board.ser.sent == ["#R 90000\n"] + expected + ["#F 3200\n"]
+    assert board.ser.sent == ["#R 90000\n"] + expected + ["#F 32000\n"]
     assert not seq.prepared
     with pytest.raises(ValueError):
         seq.start(9)
@@ -300,7 +300,7 @@ def test_step9_finishes_transfer_without_post_turn_image(rig):
     seq.thread.join(3)
     assert seq.state["error"] is None and seq.state["done"] == [8, 9]
     assert not seq.state["theta_feedback"]["verified"]
-    assert board.ser.sent == ["#R 90000\n", "#W 2950\n", "#t 275 -1\n", "#W 247050\n", "#F 3200\n"]
+    assert board.ser.sent == ["#R 90000\n", "#W 2950\n", "#t 275 -1\n", "#W 247050\n", "#F 32000\n"]
 
 
 def test_stop_after_turn_blocks_remaining_transfer(rig, monkeypatch):

@@ -111,7 +111,7 @@ def test_pipeline_fetches_next_wafer_while_aligning(board, tmp_path, monkeypatch
     monkeypatch.setattr(seq.stop_evt, "wait", lambda _: seq.stop_evt.is_set())
     app = FakeFine(align_s=0.6)
     pipe = station.Pipeline(seq, app, board)
-    pipe.cfg.update(max_wafers=3, auto_clear=True)
+    pipe.cfg.update(max_wafers=3)
     sent_log = []
     orig_line_nowait = board.line_nowait
 
@@ -129,13 +129,14 @@ def test_pipeline_fetches_next_wafer_while_aligning(board, tmp_path, monkeypatch
     first_start = app.starts[0]
     q_after = [t for t, cmd in sent_log if cmd.startswith("Q ") and t > first_start]
     assert q_after and q_after[0] < first_start + app.align_s
-    # 8단계(마스크 측정)는 앞 웨이퍼의 정밀 얼라인이 끝난(마스크 Z 상승) 뒤에만
+    # 8단계(각도 측정)도 앞 웨이퍼가 정렬되는 동안 끝낸다 — 정렬이 끝나면 바로 넘긴다
     for n, finish in enumerate(app.finishes[:2]):
         later = [t for t in measured if t > app.starts[n]]
-        assert later and later[0] >= finish
+        assert later and later[0] < finish
 
 
-def test_pipeline_waits_for_operator_to_clear_stage(board, tmp_path, monkeypatch):
+def test_pipeline_hands_over_without_waiting_and_sets_return_reference(board, tmp_path, monkeypatch):
+    """비움 확인 없이 바로 다음 장을 넘기고, 정밀 START마다 수취 위치(오른쪽 위 + 32000)를 기준으로 알려 준다."""
     from tools import station
     monkeypatch.setattr(prealign_sequence, "CALIBRATION", tmp_path / "cal.json")
     monkeypatch.setattr(station, "PIPELINE_FILE", tmp_path / "pipe.json")
@@ -143,18 +144,19 @@ def test_pipeline_waits_for_operator_to_clear_stage(board, tmp_path, monkeypatch
     seq.vision.stable = lambda *a, **k: dict(mask=dict(angle=90), wafer=dict(angle=90), turn_deg=0.0, error=None)
     monkeypatch.setattr(seq.stop_evt, "wait", lambda _: seq.stop_evt.is_set())
     app = FakeFine(align_s=0.1)
+    positions = []
+    orig = app.start_align
+
+    def start():
+        positions.append(board.fine_stage.position())
+        orig()
+    app.start_align = start
     pipe = station.Pipeline(seq, app, board)
-    pipe.cfg.update(max_wafers=2, auto_clear=False)
+    pipe.cfg.update(max_wafers=2)
     pipe.start()
-    deadline = time.time() + 20
-    while "비움" not in pipe.state["phase"] and time.time() < deadline:
-        time.sleep(0.05)
-    assert "비움" in pipe.state["phase"] and pipe.state["delivered"] == 1 and pipe.state["holding"]
-    time.sleep(0.3)
-    assert pipe.state["delivered"] == 1          # 확인 전에는 넘기지 않는다
-    pipe.mark_cleared()
-    pipe.thread.join(20)
-    assert pipe.state["error"] is None and pipe.state["delivered"] == 2
+    pipe.thread.join(30)
+    assert pipe.state["error"] is None and pipe.state["delivered"] == 2 and pipe.state["aligned"] == 2
+    assert positions == [(32000, 0), (32000, 0)]
 
 
 def test_align_failure_is_not_taken_as_empty_box(board, tmp_path, monkeypatch):
@@ -178,7 +180,7 @@ def test_align_failure_is_not_taken_as_empty_box(board, tmp_path, monkeypatch):
         threading.Thread(target=fault, daemon=True).start()
     app.start_align = failing
     pipe = station.Pipeline(seq, app, board)
-    pipe.cfg.update(max_wafers=2, auto_clear=True)
+    pipe.cfg.update(max_wafers=2)
     pipe.start()
     pipe.thread.join(20)
     assert pipe.state["error"] and "정밀 얼라인 실패" in pipe.state["error"]
@@ -197,7 +199,7 @@ def test_contact_mode_sets_mask_plate_travel(board, tmp_path, monkeypatch, mode,
     app = FakeFine(align_s=0.1)
     seen = []
     pipe = station.Pipeline(seq, app, board, z_setter=lambda d, u: seen.append((d, u)), hard_ms=(5000, 5000))
-    pipe.save_cfg(dict(max_wafers=1, auto_clear=True, soft_down_ms=3500))
+    pipe.save_cfg(dict(max_wafers=1, soft_down_ms=3500))
     pipe.start(mode)
     pipe.thread.join(20)
     assert pipe.state["error"] is None and seen == [expected]
@@ -236,7 +238,7 @@ def test_start_ignores_leftover_stop_from_earlier_run(board, tmp_path, monkeypat
     pipe = station.Pipeline(seq, app, board)
     pipe.state["stage"] = "정렬 중"
     app.phase, app.status = "STOP", "STOP"
-    pipe.cfg.update(max_wafers=1, auto_clear=True)
+    pipe.cfg.update(max_wafers=1)
     pipe.start()
     pipe.thread.join(20)
     assert pipe.state["error"] is None and pipe.state["aligned"] == 1
@@ -251,7 +253,7 @@ def test_first_wafer_can_start_from_step_2(board, tmp_path, monkeypatch):
     seq.vision.stable = lambda *a, **k: dict(mask=dict(angle=90), wafer=dict(angle=90), turn_deg=0.0, error=None)
     monkeypatch.setattr(seq.stop_evt, "wait", lambda _: seq.stop_evt.is_set())
     pipe = station.Pipeline(seq, FakeFine(align_s=0.1), board)
-    pipe.cfg.update(max_wafers=2, auto_clear=True)
+    pipe.cfg.update(max_wafers=2)
     pipe.start("soft", from_step=2)
     pipe.thread.join(30)
     assert pipe.state["error"] is None, pipe.state["log"]

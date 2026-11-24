@@ -37,7 +37,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))
 
 import motor_panel as panel                       # noqa: E402  이송 패널 (Board·CAMS·Handler)
-from prealign_sequence import DELIVER_STEPS, FETCH_STEPS, MEASURE_STEPS, TRANSFER_LETTERS   # noqa: E402
+from prealign_sequence import DELIVER_STEPS, FETCH_STEPS, TRANSFER_LETTERS   # noqa: E402
 
 FINE_LETTERS = "FBfbAud"     # 정밀 얼라인이 쓰는 축: 정밀 X·Y, θ 서보(D5), 정밀 Z(Z1)
 PIPELINE_FILE = ROOT / "out" / "pipeline.json"
@@ -209,7 +209,7 @@ class Pipeline:
         self.thread = None
         self.stop_evt = threading.Event()
         self.cleared = threading.Event()
-        self.cfg = dict(max_wafers=0, auto_clear=False, start_timeout_s=20.0, soft_down_ms=3500)
+        self.cfg = dict(max_wafers=0, start_timeout_s=20.0, soft_down_ms=3500)
         try:
             self.cfg.update(json.loads(PIPELINE_FILE.read_text(encoding="utf-8")))
         except Exception:
@@ -219,9 +219,9 @@ class Pipeline:
 
     def save_cfg(self, values):
         new = dict(self.cfg)
-        for k in ("max_wafers", "auto_clear", "soft_down_ms"):
+        for k in ("max_wafers", "soft_down_ms"):
             if k in values:
-                new[k] = bool(values[k]) if k == "auto_clear" else int(values[k])
+                new[k] = int(values[k])
         if not 0 < new["soft_down_ms"] < self.hard_ms[0]:
             raise ValueError(f"소프트 컨택 내림 시간은 0보다 크고 하드 컨택({self.hard_ms[0]}ms)보다 작아야 합니다")
         self.cfg = new
@@ -337,6 +337,12 @@ class Pipeline:
         app = self.app
         if self.z_setter:
             self.z_setter(*self.z_ms())
+        # 넘겨받은 직후 정밀 X·Y는 수취 위치(오른쪽 위 + F receive). 정밀 앱이 정렬 끝에
+        # 이 위치에서 receive만큼 왼쪽(= 오른쪽 위)으로 돌아오게 기준을 알려 준다.
+        stage = getattr(self.board, "fine_stage", None)
+        if stage is not None:
+            receive = int(self.seq.cfg["axes"]["align_x"].get("receive_from_right_top", 32000))
+            stage.set_position(receive, 0)
         self.state["phase"] = "정밀 얼라인 START"
         deadline = time.time() + self.cfg["start_timeout_s"]
         while time.time() < deadline:
@@ -360,12 +366,8 @@ class Pipeline:
                         break
                     try:
                         steps, self.first_fetch = self.first_fetch, FETCH_STEPS
-                        self._transfer(steps, "웨이퍼 가져오기")
-                        # 8단계는 카메라 0에서 마스크를 재므로 정밀 얼라인이 끝나 마스크 Z가 올라간 뒤에 한다
-                        self.state["phase"] = "정밀 얼라인 종료 대기 (끝나면 8단계 측정)"
-                        self._wait(lambda: self._fine_idle(), "정밀 얼라인 종료 대기")
-                        self._note_align_result()
-                        self._transfer(MEASURE_STEPS, "각도 측정 (8단계)")
+                        # 정밀 얼라인이 도는 동안 가져와서 8단계 각도까지 바로 잰다
+                        self._transfer(steps, "웨이퍼 가져오기 · 각도 측정")
                     except AlignFailed:
                         raise
                     except RuntimeError as exc:
@@ -379,10 +381,7 @@ class Pipeline:
                 self.state["phase"] = "정밀 스테이지 대기"
                 self._wait(lambda: self._fine_idle(), "정밀 얼라인 종료 대기")
                 self._note_align_result()
-                if self.state["stage"].startswith("정렬 완료") and not self.cfg["auto_clear"]:
-                    self.cleared.clear()
-                    self.state["phase"] = "작업자: 정렬된 웨이퍼를 치우고 '스테이지 비움 확인'"
-                    self._wait(self.cleared.is_set, "스테이지 비움 확인")
+                # 기다리지 않고 바로 넘긴다 (정밀 X·Y는 정렬 끝에 오른쪽 위로 돌아와 있다)
                 self.state["stage"] = "비어 있음"
 
                 self._transfer(DELIVER_STEPS, "웨이퍼 넘겨주기")
@@ -491,6 +490,8 @@ def main():
     ap.add_argument("--camera-size", type=int, nargs=2, default=[640, 480], metavar=("W", "H"))
     ap.add_argument("--finish-frames", type=int, default=3,
                     help="정밀 얼라인 완료: 중심 일치를 연속 몇 번 확인할지 (정밀 앱 단독 기본 8)")
+    ap.add_argument("--return-delay", type=float, default=0.0,
+                    help="정렬 끝(Z 올림 포함)부터 정밀 X·Y·θ 복귀까지 기다리는 초 (정밀 앱 단독 기본 10)")
     ap.add_argument("--finish-px", type=float, default=1.0,
                     help="정밀 얼라인 완료: 마스크·웨이퍼 중심 차이 허용 px (calibration.json 기본 0.65)")
     ap.add_argument("--detector", default="yolo-2pair", help="정밀 얼라인 검출기 (mask_aligner_optimized_v4 --detector)")
@@ -504,6 +505,7 @@ def main():
     fine.load_calibration(str(ROOT / "calibration.json"))
     # 연속 운전용 정밀 얼라인 완료 기준 (다음 웨이퍼의 8단계가 정밀 종료를 기다리므로 빨리 끝낸다)
     fine.WAFER_LOST_DONE_FRAMES = a.finish_frames
+    fine.FINE_RETURN_DELAY_S = a.return_delay
     fine.DEAD_BAND_PX = a.finish_px
     fine.HTML_PAGE = fine.HTML_PAGE.replace("${d.wafer_lost_count}/8", "${d.wafer_lost_count}/%d" % a.finish_frames)
     print(f"정밀 얼라인 완료 기준: 중심 {a.finish_px:g}px 이내 {a.finish_frames}회 연속")

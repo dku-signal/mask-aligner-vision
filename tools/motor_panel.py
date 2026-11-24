@@ -30,6 +30,9 @@ MOVES = {  # 누르고 있는 동안만 움직이는 명령
     "F", "B", "f", "b", "Q", "W", "E", "R", "J", "H", "u", "d", "O", "P", "K", "L",
 }
 ONESHOT = {"T", "G", "t", "M", "X"}
+# 이송·프리얼라인 쪽 글자 (이 축이 움직이면 8단계 측정 위치가 바뀐다) / 정밀 얼라인 쪽 글자
+TRANSFER_LETTERS = "QWERJHKLOPtM"
+FINE_LETTERS = "FBfbAud"
 HOLD_TIMEOUT_S = 0.5
 FINE_JOG_STEPS = 2500
 
@@ -44,6 +47,11 @@ class MockSerial:
         self.sent, self._t = [], time.time()
         self.out = queue.Queue()
         self.buf = ""
+        self.pending = {}   # 축 그룹 -> (글자, 값, 시작 시각, 타이머)  펌웨어 v2처럼 축마다 따로 돈다
+        self.lock = threading.Lock()
+
+    GROUP = {c: g for g, letters in (("X", "FB"), ("Y", "fb"), ("R1", "QW"), ("R2", "ER"), ("Z1", "ud"),
+                                     ("Z2", "OP"), ("Z3", "KL"), ("t", "t"), ("A", "A")) for c in letters}
 
     def write(self, data):
         text = data.decode()
@@ -56,18 +64,42 @@ class MockSerial:
                 else:
                     self.buf += ch
             elif ch in "Xx":
-                self.out.put("STOP")
+                self._stop(self.GROUP.values(), bare=True)
         return len(data)
+
+    def _stop(self, groups, bare=False):
+        with self.lock:
+            hit = [self.pending.pop(g) for g in set(groups) if g in self.pending]
+        for c, n, started, timer in hit:
+            timer.cancel()
+            rate = 10000 if c in "FBfbQWER" else 1000
+            self.out.put(f"STOP {c} {min(n, int((time.time() - started) * self.SPEED * rate))}")
+        if bare and hit:
+            self.out.put("STOP")
 
     def _line(self, line):
         p = line.split()
         if p[0] == "PING":
             return self.out.put("PONG")
+        if p[0] == "X":
+            return self._stop([self.GROUP[c] for c in (p[1] if len(p) > 1 else "") if c in self.GROUP])
         if p[0] == "M":
             return self.out.put(f"DONE M {p[1]}")
         n = int(p[1])
         secs = n / 10000 if p[0] in "FBfbQWERJH" else n / 1000
-        threading.Timer(secs / self.SPEED, lambda: self.out.put(f"DONE {p[0]} {n}")).start()
+        group = self.GROUP.get(p[0], p[0])
+        self._stop([group])
+
+        def done():
+            with self.lock:
+                if self.pending.get(group, (None,))[0] != p[0]:
+                    return
+                self.pending.pop(group)
+            self.out.put(f"DONE {p[0]} {n}")
+        timer = threading.Timer(secs / self.SPEED, done)
+        with self.lock:
+            self.pending[group] = (p[0], n, time.time(), timer)
+        timer.start()
 
     def readline(self):
         try:
@@ -144,6 +176,10 @@ class Board:
         self.ledger = Ledger()
         self.fine_stage = None
         self.unmatched = []
+        self.mail = threading.Condition()
+        self.mailbox = {}          # 글자 -> 아직 안 읽은 "DONE/STOP <c> <n>" 응답 (축마다 따로)
+        self.err_epoch = 0         # ERR/연결 끊김이 올 때마다 증가 → 기다리던 쪽이 모두 실패
+        self.stop_epoch = 0        # 전체 정지(단독 "STOP")가 올 때마다 증가
         self.servo_dir = {"t": 1, "A": 1}   # 회전 명령의 방향 (DONE에는 방향이 없어서 보낼 때 기억)
         self.pulses = deque(maxlen=100)  # 시간 지정 구동 기록 (값 측정용)
 
@@ -184,12 +220,16 @@ class Board:
                         self.ser, self.port, self.moving = None, None, None
                         ser.close()
                         self.replies.put("ERR disconnected")
+                with self.mail:
+                    self.err_epoch += 1
+                    self.last_err = "ERR disconnected"
+                    self.mail.notify_all()
                 break
             line = raw.decode(errors="replace").strip()
             if not line:
                 continue
             self.lines.append(line)
-            if line.split()[0] in ("DONE", "ERR", "STOP", "PONG"):
+            if line.split()[0] in ("DONE", "ERR", "STOP", "PONG") and line != "ERR":   # 단독 "ERR"은 레이저 범위 밖
                 p = line.split()
                 if p[0] in ("DONE", "STOP") and len(p) == 3 and p[1] != "M":
                     # DONE = 끝까지 감, STOP <c> <n> = 중간 정지 시 실제로 간 양 → 둘 다 장부에 반영
@@ -203,8 +243,19 @@ class Board:
                                 if time.time() - self.last_beat < HOLD_TIMEOUT_S:
                                     self.line_nowait(f"{p[1]} {FINE_JOG_STEPS}")
                                 continue
-                    if p[0] == "STOP":
-                        continue   # 이어서 오는 단독 "STOP"이 대기 중인 명령을 끝낸다
+                if p[0] in ("DONE", "STOP") and len(p) == 3:
+                    with self.mail:   # 그 글자를 기다리는 쪽에만 전달 (정밀·이송이 동시에 기다려도 섞이지 않게)
+                        self.mailbox.setdefault(p[1], []).append(line)
+                        self.mail.notify_all()
+                    continue
+                if p[0] in ("ERR", "STOP"):
+                    with self.mail:
+                        if p[0] == "ERR":
+                            self.err_epoch += 1
+                            self.last_err = line
+                        else:
+                            self.stop_epoch += 1
+                        self.mail.notify_all()
                 self.replies.put(line)
                 continue
             try:
@@ -279,65 +330,80 @@ class Board:
             if c in self.servo_dir:
                 self.servo_dir[c] = 1 if int(rest[1]) >= 0 else -1
             self.ser.write(f"#{cmd}\n".encode("ascii"))
-            self.revision += 1
+            if c in TRANSFER_LETTERS:   # 정밀 스테이지 이동은 이송 팔의 측정 위치를 바꾸지 않는다
+                self.revision += 1
             if c == "M":
                 self.magnet = rest[0] == "1"
         self._note(f"보냄 #{cmd}")
 
-    def wait_done(self, c, timeout, stop_evt=None, amount=None):
-        def matches(reply):
-            fields = reply.split()
-            return len(fields) == 3 and fields[:2] == ["DONE", c] and (amount is None or fields[2] == str(amount))
+    def epochs(self):
+        with self.mail:
+            return self.err_epoch, self.stop_epoch
 
+    def wait_done(self, c, timeout, stop_evt=None, amount=None, since=None):
+        """글자 c의 응답만 기다린다. 다른 축의 DONE은 그 축을 기다리는 쪽 몫이라 건드리지 않는다."""
+        err0, stop0 = since if since is not None else self.epochs()
         end = time.time() + timeout
-        while time.time() < end:
-            if stop_evt is not None and stop_evt.is_set():
-                raise InterruptedError("정지됨")
-            early = next((r for r in self.unmatched if matches(r)), None)
-            if early:
-                self.unmatched.remove(early)
-                return early
-            try:
-                r = self.replies.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            if matches(r):
-                return r
-            if r.startswith("DONE"):
-                self.unmatched.append(r)   # 동시에 돌던 다른 명령의 완료 (예: 레일 이동 중 서보 회전)
-                continue
-            if r.startswith("ERR"):
-                raise RuntimeError(f"보드 오류: {r}")
-            if r == "STOP":
-                raise InterruptedError("보드가 정지(STOP)")
-        self.send("X")
-        raise TimeoutError(f"{c}: {timeout:.0f}초 안에 DONE 없음 → 정지")
+        with self.mail:
+            while True:
+                if stop_evt is not None and stop_evt.is_set():
+                    raise InterruptedError("정지됨")
+                box = self.mailbox.get(c, [])
+                for r in list(box):
+                    kind, _, n = r.split()
+                    if kind == "STOP":
+                        box.remove(r)
+                        raise InterruptedError(f"보드가 정지(STOP {c} {n})")
+                    if amount is None or n == str(amount):
+                        box.remove(r)
+                        return r
+                if self.err_epoch != err0:
+                    raise RuntimeError(f"보드 오류: {getattr(self, 'last_err', 'ERR')}")
+                if self.stop_epoch != stop0:
+                    raise InterruptedError("보드가 정지(STOP)")
+                left = end - time.time()
+                if left <= 0:
+                    break
+                self.mail.wait(min(left, 0.1))
+        self.stop_letters(c)
+        raise TimeoutError(f"{c}: {timeout:.0f}초 안에 DONE 없음 → 그 축 정지")
 
-    def clear_replies(self):
-        # 이전 응답 찌꺼기는 버린다 (같은 글자의 옛 DONE을 새 완료로 착각하지 않게)
-        self.unmatched.clear()
-        while not self.replies.empty():
-            self.replies.get_nowait()
+    def clear_replies(self, letters=None):
+        # 그 글자의 옛 응답만 버린다 (다른 쪽이 기다리는 응답은 남긴다)
+        with self.mail:
+            for c in (letters if letters is not None else list(self.mailbox)):
+                self.mailbox.pop(c, None)
+
+    def stop_letters(self, letters):
+        """그 글자들의 축만 정지 (펌웨어 v2 "#X <글자들>"). 다른 쪽 동작은 계속된다."""
+        with self.lock:
+            if self.ser:
+                self.ser.write(f"#X {letters}\n".encode("ascii"))
+                if self.moving and self.moving in letters:
+                    self.moving = None
+        self._note(f"부분 정지 {letters}")
 
     def line(self, cmd, timeout, stop_evt=None):
+        c, amount, *_ = cmd.split()
         with self.lock:
             if stop_evt is not None and stop_evt.is_set():
                 raise InterruptedError("정지됨")
-            self.clear_replies()
+            self.clear_replies([c])
+            since = self.epochs()
             self.line_nowait(cmd)
-        c, amount, *_ = cmd.split()
-        return self.wait_done(c, timeout, stop_evt, amount)
+        return self.wait_done(c, timeout, stop_evt, amount, since)
 
     def transfer_turn(self, rail, steps, ms, direction, stop_evt):
-        # Clear old replies once, before either command. A short rail can finish first.
+        # 레일 이동과 서보 회전을 동시에 보내고 둘 다 기다린다. 짧은 쪽이 먼저 끝나도 우편함에 남는다.
         with self.lock:
             if stop_evt.is_set():
                 raise InterruptedError("정지됨")
-            self.clear_replies()
+            self.clear_replies([rail, "t"])
+            since = self.epochs()
             self.line_nowait(f"{rail} {steps}")
             self.line_nowait(f"t {ms} {direction}")
-        self.wait_done("t", ms / 1000 + 5, stop_evt, ms)
-        self.wait_done(rail, steps / 10000 * 1.5 + 5, stop_evt, steps)
+        self.wait_done("t", ms / 1000 + 5, stop_evt, ms, since)
+        self.wait_done(rail, steps / 10000 * 1.5 + 5, stop_evt, steps, since)
 
     def beat(self):
         self.last_beat = time.time()

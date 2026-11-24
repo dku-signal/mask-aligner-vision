@@ -185,6 +185,14 @@ python -m pip install -r requirements.txt
 python tools/sim_rig.py
 ```
 
+**연속 운전 (통합 스테이션)** — 펌웨어 v2(`firmware/mega_previous`)를 올린 뒤:
+
+```bash
+python tools/station.py --detector yolo-2pair
+```
+
+`http://127.0.0.1:8790`의 **▶ 연속 운전 시작**. 자세한 사용법은 [docs/station.md](docs/station.md).
+
 **두 카메라로 프리얼라인 시험**
 
 `firmware/mega_previous` 장비에서는 아래의 YOLO 가중치를 설치한 뒤 이송 패널을 연결 대기 상태로 실행합니다.
@@ -227,6 +235,7 @@ gh release download weights-v1 -R dku-signal/mask-aligner-vision -p keys_real_be
 | [`preflight.py`](preflight.py) | 실행 전 카메라·통신·키 인식 점검 |
 | [`firmware/xy_tb6560/xy_tb6560.ino`](firmware/xy_tb6560/xy_tb6560.ino) | Mega의 유한 펄스 이동과 θ 제어 |
 | [`tools/sim_rig.py`](tools/sim_rig.py) | 가상 장비로 제어 흐름 확인 |
+| [`tools/station.py`](tools/station.py) | **통합 스테이션**: 프리얼라인 → 정밀 얼라인 연속 운전 (정렬 중에 다음 웨이퍼 가져오기). [설명](docs/station.md) |
 | [`tools/motor_panel.py`](tools/motor_panel.py) | 이송·프리얼라인 웹 패널: 수동 조작, 정확한 이동, 자동 시퀀스(화이트보드 14단계), 원상 복구 |
 | [`config/prealign_sequence.json`](config/prealign_sequence.json) | 자동 시퀀스 단계·값 (하드코딩 값은 여기서 수정) |
 | [`notch.py`](notch.py) | 별도 웨이퍼 노치 각도 측정 도구 |

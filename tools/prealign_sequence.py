@@ -13,6 +13,9 @@ from pathlib import Path
 CONFIG = Path(__file__).resolve().parents[1] / "config" / "prealign_sequence.json"
 CALIBRATION = CONFIG.parents[1] / "out" / "prealign_camera_calibration.json"
 STEP_RATE = 10_000          # 펌웨어 레일 펄스: 50us 토글 = 10,000 스텝/초
+TRANSFER_LETTERS = "QWERJHKLOPtM"   # 이 시퀀스가 움직이는 축 (정지할 때 정밀 얼라인 축은 건드리지 않는다)
+FETCH_STEPS = (0, 1, 2, 3, 4, 5, 7, 8)   # 연속 운전: 박스에서 웨이퍼를 가져와 8단계 측정까지
+DELIVER_STEPS = (9, 9.5, 10, 11, 12, 13, 14)   # 연속 운전: 정밀 스테이지에 넘겨주고 빠지기
 AXIS_OF = {}                # 명령 글자 -> 축 이름
 
 
@@ -140,10 +143,32 @@ class Sequence:
     def invalidate(self):
         self.station = self.measured_settings = self.measured_pair = None
 
+    def _stop_transfer(self):
+        try:
+            self.board.stop_letters(TRANSFER_LETTERS)
+        except Exception:
+            pass   # 보드 미연결이면 보낼 곳이 없다
+
     def start(self, only=None):
         if self.thread and self.thread.is_alive():
             raise RuntimeError("시퀀스가 이미 실행 중")
         self.cfg = load()
+        if isinstance(only, (list, tuple)):
+            # 연속 운전의 구간 실행: 가져오기(0~8) / 넘겨주기(9~14)
+            only = tuple(only)
+            if not self.board.port:
+                raise ValueError("먼저 아두이노 포트를 연결하세요")
+            calibration(self.cfg["prealign"])
+            if only[0] == 9 and (not self.prepared or self.measured_settings != self.cfg["prealign"]):
+                raise ValueError("8단계 인출 완료 위치에서 측정한 각도가 필요합니다")
+            if only[0] != 9:
+                self.invalidate()
+                self.state["rotation_deg"] = None
+            self.stop_evt.clear()
+            self.state.update(running=True, current=None, done=[], error=None, theta_feedback=None)
+            self.thread = threading.Thread(target=self._run, args=(only,), daemon=True)
+            self.thread.start()
+            return
         if only in (None, "fine-home") and "receive_from_right_top" in self.cfg["axes"]["align_x"]:
             self.fine_moves("home")
         if only in (None, 8, 9, "8-9", "theta", "theta-calibrate") and not self.board.port:
@@ -168,10 +193,7 @@ class Sequence:
     def stop(self):
         self.stop_evt.set()
         self.invalidate()
-        try:
-            self.board.send("X")
-        except RuntimeError:
-            pass   # 보드 미연결이면 보낼 곳이 없다
+        self._stop_transfer()   # 이송 축만 정지: 정밀 얼라인이 돌고 있으면 그대로 둔다
 
     def _cmd(self, c, n):
         timeout = expected_s(self.cfg, c, n) * 1.5 + 5
@@ -297,10 +319,7 @@ class Sequence:
         except Exception as e:
             self.state["error"] = str(e)
             self._log(f"복구 중단: {e}")
-            try:
-                self.board.send("X")
-            except Exception:
-                pass
+            self._stop_transfer()
         finally:
             self.state.update(running=False, current=None)
 
@@ -349,7 +368,7 @@ class Sequence:
                 return
             if only is None:
                 self.board.ledger.snapshot("home", dict(self.board.ledger.d["pos"]))
-            selected = (8, 9) if only == "8-9" else (only,)
+            selected = only if isinstance(only, tuple) else (8, 9) if only == "8-9" else (only,)
             for st in self.cfg["steps"]:
                 if only is not None and st["no"] not in selected:
                     continue
@@ -392,9 +411,6 @@ class Sequence:
         except Exception as e:
             self.state["error"] = str(e)
             self._log(f"중단: {e}")
-            try:
-                self.board.send("X")
-            except Exception:
-                pass
+            self._stop_transfer()
         finally:
             self.state.update(running=False, current=None)

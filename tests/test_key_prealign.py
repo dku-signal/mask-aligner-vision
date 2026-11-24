@@ -224,7 +224,11 @@ def test_cannot_use_angle_after_other_motor_movement(rig):
     seq.vision.stable = lambda *a, **k: dict(mask=dict(angle=90), wafer=dict(angle=0), turn_deg=90, error=None)
     seq.start(8)
     seq.thread.join(2)
+    # 정밀 스테이지(F)는 이송 팔 위 웨이퍼를 건드리지 않으므로 측정이 유지된다 (연속 운전의 전제)
     board.line("F 100", 2)
+    assert seq.prepared
+    # 이송 축이 움직이면 측정 위치가 바뀌므로 무효
+    board.line("Q 100", 2)
     assert not seq.prepared
     with pytest.raises(ValueError, match="8단계"):
         seq.start(9)
@@ -262,10 +266,10 @@ def test_overlapping_completions_in_either_order(rig, responses):
     def send(data):
         if data.startswith(b"#t"):
             for r in responses:
-                board.replies.put(r)
+                board.ser.out.put(r)   # 실제 읽기 스레드를 거쳐 축별 우편함으로
     board.ser.write = send
     board.transfer_turn("W", 10000, 500, 1, threading.Event())
-    assert not board.unmatched
+    assert not board.mailbox.get("W") and not board.mailbox.get("t")
 
 @pytest.mark.parametrize("start,direction,ms", [
     (90, -1, 550), (-90, 1, 550), (45, -1, 275), (-45, 1, 275),
@@ -311,7 +315,7 @@ def test_stop_after_turn_blocks_remaining_transfer(rig, monkeypatch):
     seq.start("8-9")
     seq.thread.join(3)
     assert seq.state["error"] == "정지됨"
-    assert board.ser.sent == ["#R 90000\n", "#W 2950\n", "#t 275 -1\n", "X"]
+    assert board.ser.sent == ["#R 90000\n", "#W 2950\n", "#t 275 -1\n", "#X QWERJHKLOPtM\n"]
 
 
 def test_stop_while_measuring_prevents_pulse(rig):
@@ -327,7 +331,7 @@ def test_stop_while_measuring_prevents_pulse(rig):
     seq.stop()
     release.set()
     seq.thread.join(2)
-    assert seq.state["error"] and not any(cmd.startswith("#") for cmd in board.ser.sent)
+    assert seq.state["error"] and not any(cmd.startswith("#") and not cmd.startswith("#X ") for cmd in board.ser.sent)
 
 def test_out_of_tolerance_pulse_stops_without_retry(rig):
     seq, board = rig
@@ -335,7 +339,7 @@ def test_out_of_tolerance_pulse_stops_without_retry(rig):
     seq.vision.stable = lambda *args: next(pairs)
     seq.start("theta")
     seq.thread.join(2)
-    assert "검증 실패" in seq.state["error"] and board.ser.sent == ["#t 275 -1\n", "X"]
+    assert "검증 실패" in seq.state["error"] and board.ser.sent == ["#t 275 -1\n", "#X QWERJHKLOPtM\n"]
 
 
 @pytest.mark.parametrize("error", [-1.5, 0, 1.5])

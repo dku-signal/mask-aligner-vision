@@ -249,7 +249,9 @@ class Pipeline:
         return self.hard_ms
 
     # ---- 시작·정지 ----
-    def start(self, mode="hard"):
+    def start(self, mode="hard", from_step=None):
+        """from_step: 첫 웨이퍼만 그 단계부터 가져오기 (0단계 시작 자세는 항상, 사이 단계는 건너뜀).
+        예: X 레일이 이미 박스 쪽이면 from_step=2로 1단계 Q를 건너뛴다."""
         if mode not in self.MODES:
             raise ValueError(f"알 수 없는 모드 {mode!r}")
         if self.thread and self.thread.is_alive():
@@ -258,14 +260,19 @@ class Pipeline:
             raise RuntimeError("이송 시퀀스가 실행 중입니다")
         if not self.board.port:
             raise RuntimeError("먼저 아두이노 포트를 연결하세요")
+        if from_step is not None and from_step not in FETCH_STEPS:
+            raise ValueError(f"가져오기 단계가 아님: {from_step}")
         self.mode = mode
+        self.first_fetch = FETCH_STEPS if from_step is None else \
+            tuple(s for s in FETCH_STEPS if s == 0 or s >= from_step)
         self.stop_evt.clear()
         self.state.update(running=True, error=None, phase="시작")
         if not self.app.auto_running:
             # 시작할 때 정밀 스테이지는 비어 있다. 이전 실행(정밀 얼라인만·수동 정지)의 상태를 넘겨받지 않는다
             self.state["stage"] = "비어 있음"
         down, up = self.z_ms()
-        self._log(f"연속 운전 시작: {self.MODES[mode]} (마스크 판 내림 {down}ms · 올림 {up}ms)")
+        self._log(f"연속 운전 시작: {self.MODES[mode]} (마스크 판 내림 {down}ms · 올림 {up}ms)"
+                  + ("" if from_step is None else f" · 첫 장은 {self.first_fetch} 단계"))
         self.thread = threading.Thread(target=self._run, name="pipeline", daemon=True)
         self.thread.start()
 
@@ -352,7 +359,8 @@ class Pipeline:
                     if limit and self.state["fetched"] >= limit:
                         break
                     try:
-                        self._transfer(FETCH_STEPS, "웨이퍼 가져오기")
+                        steps, self.first_fetch = self.first_fetch, FETCH_STEPS
+                        self._transfer(steps, "웨이퍼 가져오기")
                         # 8단계는 카메라 0에서 마스크를 재므로 정밀 얼라인이 끝나 마스크 Z가 올라간 뒤에 한다
                         self.state["phase"] = "정밀 얼라인 종료 대기 (끝나면 8단계 측정)"
                         self._wait(lambda: self._fine_idle(), "정밀 얼라인 종료 대기")
@@ -422,7 +430,8 @@ class StationHandler(panel.Handler):
                 if self.path == "/pipeline/start":
                     if "soft_down_ms" in data:
                         PIPE.save_cfg({"soft_down_ms": data["soft_down_ms"]})
-                    PIPE.start(data.get("mode", "hard"))
+                    from_step = data.get("from_step")
+                    PIPE.start(data.get("mode", "hard"), None if from_step in (None, "") else int(from_step))
                 elif self.path == "/pipeline/align":
                     if "soft_down_ms" in data:
                         PIPE.save_cfg({"soft_down_ms": data["soft_down_ms"]})

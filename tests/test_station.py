@@ -240,3 +240,20 @@ def test_start_ignores_leftover_stop_from_earlier_run(board, tmp_path, monkeypat
     pipe.start()
     pipe.thread.join(20)
     assert pipe.state["error"] is None and pipe.state["aligned"] == 1
+
+
+def test_first_wafer_can_start_from_step_2(board, tmp_path, monkeypatch):
+    """X 레일이 이미 박스 쪽이면 첫 장은 1단계(Q)를 건너뛰고, 다음 장부터는 처음부터."""
+    from tools import station
+    monkeypatch.setattr(prealign_sequence, "CALIBRATION", tmp_path / "cal.json")
+    monkeypatch.setattr(station, "PIPELINE_FILE", tmp_path / "pipe.json")
+    seq = prealign_sequence.Sequence(board)
+    seq.vision.stable = lambda *a, **k: dict(mask=dict(angle=90), wafer=dict(angle=90), turn_deg=0.0, error=None)
+    monkeypatch.setattr(seq.stop_evt, "wait", lambda _: seq.stop_evt.is_set())
+    pipe = station.Pipeline(seq, FakeFine(align_s=0.1), board)
+    pipe.cfg.update(max_wafers=2, auto_clear=True)
+    pipe.start("soft", from_step=2)
+    pipe.thread.join(30)
+    assert pipe.state["error"] is None, pipe.state["log"]
+    qs = [c for c in board.ser.sent if c.startswith("#Q ")]
+    assert len(qs) == 1          # 두 장 중 둘째 장만 Q로 박스에 간다

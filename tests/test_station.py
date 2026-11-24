@@ -155,3 +155,70 @@ def test_pipeline_waits_for_operator_to_clear_stage(board, tmp_path, monkeypatch
     pipe.mark_cleared()
     pipe.thread.join(20)
     assert pipe.state["error"] is None and pipe.state["delivered"] == 2
+
+
+def test_align_failure_is_not_taken_as_empty_box(board, tmp_path, monkeypatch):
+    """정밀 얼라인 실패(키 미검출)는 '박스 빔'으로 조용히 끝내지 않고 오류로 멈춘다."""
+    from tools import station
+    monkeypatch.setattr(prealign_sequence, "CALIBRATION", tmp_path / "cal.json")
+    monkeypatch.setattr(station, "PIPELINE_FILE", tmp_path / "pipe.json")
+    seq = prealign_sequence.Sequence(board)
+    seq.vision.stable = lambda *a, **k: dict(mask=dict(angle=90), wafer=dict(angle=90), turn_deg=0.0, error=None)
+    monkeypatch.setattr(seq.stop_evt, "wait", lambda _: seq.stop_evt.is_set())
+    app = FakeFine(align_s=30)      # 정상 완료 전에 FAULT가 난다
+    orig = app.start_align
+
+    def failing():
+        orig()
+
+        def fault():
+            time.sleep(0.15)
+            app.phase, app.status = "FAULT", "정렬 중단: 마스크 키 · 웨이퍼 키 5초 이상 미검출"
+            app.auto_running = False
+        threading.Thread(target=fault, daemon=True).start()
+    app.start_align = failing
+    pipe = station.Pipeline(seq, app, board)
+    pipe.cfg.update(max_wafers=2, auto_clear=True)
+    pipe.start()
+    pipe.thread.join(20)
+    assert pipe.state["error"] and "정밀 얼라인 실패" in pipe.state["error"]
+    assert not any("박스가 빈" in line for line in pipe.state["log"])
+
+
+@pytest.mark.parametrize("mode,expected", [("hard", (5000, 5000)), ("soft", (3500, 3500))])
+def test_contact_mode_sets_mask_plate_travel(board, tmp_path, monkeypatch, mode, expected):
+    """하드 컨택은 마스크 판을 끝까지(정밀 앱 기본), 소프트 컨택은 설정한 만큼만 내리고 같은 만큼 올린다."""
+    from tools import station
+    monkeypatch.setattr(prealign_sequence, "CALIBRATION", tmp_path / "cal.json")
+    monkeypatch.setattr(station, "PIPELINE_FILE", tmp_path / "pipe.json")
+    seq = prealign_sequence.Sequence(board)
+    seq.vision.stable = lambda *a, **k: dict(mask=dict(angle=90), wafer=dict(angle=90), turn_deg=0.0, error=None)
+    monkeypatch.setattr(seq.stop_evt, "wait", lambda _: seq.stop_evt.is_set())
+    app = FakeFine(align_s=0.1)
+    seen = []
+    pipe = station.Pipeline(seq, app, board, z_setter=lambda d, u: seen.append((d, u)), hard_ms=(5000, 5000))
+    pipe.save_cfg(dict(max_wafers=1, auto_clear=True, soft_down_ms=3500))
+    pipe.start(mode)
+    pipe.thread.join(20)
+    assert pipe.state["error"] is None and seen == [expected]
+    assert pipe.status()["mode"] == mode
+
+
+def test_soft_contact_must_be_less_than_hard(board, tmp_path, monkeypatch):
+    from tools import station
+    monkeypatch.setattr(station, "PIPELINE_FILE", tmp_path / "pipe.json")
+    pipe = station.Pipeline(prealign_sequence.Sequence(board), FakeFine(), board, hard_ms=(5000, 5000))
+    with pytest.raises(ValueError):
+        pipe.save_cfg(dict(soft_down_ms=6000))
+    assert pipe.cfg["soft_down_ms"] == 3500      # 잘못된 값은 저장하지 않는다
+
+
+def test_align_only_applies_contact_mode(board, tmp_path, monkeypatch):
+    """스테이지에 놓인 웨이퍼만 정밀 얼라인: 이송 없이 모드의 마스크 판 시간으로 START."""
+    from tools import station
+    monkeypatch.setattr(station, "PIPELINE_FILE", tmp_path / "pipe.json")
+    app, seen = FakeFine(align_s=0.1), []
+    pipe = station.Pipeline(prealign_sequence.Sequence(board), app, board,
+                            z_setter=lambda d, u: seen.append((d, u)), hard_ms=(5000, 5000))
+    pipe.align_only("soft")
+    assert seen == [(3500, 3500)] and len(app.starts) == 1 and not board.ser.sent

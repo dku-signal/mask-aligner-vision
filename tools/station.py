@@ -2,7 +2,7 @@
 
     python tools/station.py                      # 아두이노 자동, 카메라 0(정밀·마스크) 1(웨이퍼)
     python tools/station.py --mock               # 보드 없이 (가상 보드, 20배 빠름)
-    python tools/station.py --detector yolo-2pair --frame 1280x720
+    python tools/station.py --detector yolo-2pair --frame 1920x1080   (기본값)
 
 왜 한 프로그램인가
   - 보드(시리얼 포트)는 한 프로그램만 열 수 있다. 예전에는 정밀 앱(8765)과 이송 패널(8790)이
@@ -29,6 +29,8 @@ import time
 import webbrowser
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+
+import cv2
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -153,13 +155,19 @@ class BusLink:
 class _SharedCapture:
     """CAMS(이송 패널 카메라)에 정밀 앱 카메라 프레임을 빌려주는 보기 전용 캡처."""
 
-    def __init__(self, app):
-        self.app = app
+    def __init__(self, app, size=None):
+        self.app, self.size = app, size
 
     @property
     def sample(self):
         latest = self.app.latest_frame
-        return (self.app.capture_time, latest[1]) if latest else None
+        if not latest:
+            return None
+        frame = latest[1]
+        # 정밀 앱은 1920x1080으로 잡지만 패널 화면·8단계 측정은 원래대로 패널 크기(640x480)로 본다
+        if self.size and (frame.shape[1], frame.shape[0]) != tuple(self.size):
+            frame = cv2.resize(frame, tuple(self.size), interpolation=cv2.INTER_AREA)
+        return (self.app.capture_time, frame)
 
     @property
     def error(self):
@@ -176,22 +184,32 @@ def share_camera(cams, app, index):
     def open_without_shared(indices, size=(640, 480)):
         original_open([i for i in indices if i != index], size)
         cams.indices = list(indices)
-        cams.views[index] = dict(capture=_SharedCapture(app), error=None)
+        cams.views[index] = dict(capture=_SharedCapture(app, size), error=None)
 
     cams.open = open_without_shared
-    cams.views[index] = dict(capture=_SharedCapture(app), error=None)
+    cams.views[index] = dict(capture=_SharedCapture(app, getattr(cams, "size", None)), error=None)
 
 
 # ---------------------------------------------------------------------------
 # 연속 운전
 # ---------------------------------------------------------------------------
+class AlignFailed(RuntimeError):
+    """정밀 얼라인 실패 — 박스가 빈 것(8단계 미검출)과 구별한다."""
+
+
 class Pipeline:
-    def __init__(self, seq, app, board):
+    # 정밀 얼라인의 마스크 판(정밀 Z) 내림: hard = 끝까지(정밀 앱 기본 ALIGN_Z_DOWN_MS),
+    # soft = hard보다 덜 내림(cfg soft_down_ms). 올림은 내린 만큼.
+    MODES = {"hard": "하드 컨택", "soft": "소프트 컨택"}
+
+    def __init__(self, seq, app, board, z_setter=None, hard_ms=(5000, 5000)):
         self.seq, self.app, self.board = seq, app, board
+        self.z_setter, self.hard_ms = z_setter, tuple(hard_ms)
+        self.mode = "hard"
         self.thread = None
         self.stop_evt = threading.Event()
         self.cleared = threading.Event()
-        self.cfg = dict(max_wafers=0, auto_clear=False, start_timeout_s=20.0)
+        self.cfg = dict(max_wafers=0, auto_clear=False, start_timeout_s=20.0, soft_down_ms=3500)
         try:
             self.cfg.update(json.loads(PIPELINE_FILE.read_text(encoding="utf-8")))
         except Exception:
@@ -200,9 +218,13 @@ class Pipeline:
                           fetched=0, delivered=0, aligned=0, holding=False, stage="비어 있음", results=[])
 
     def save_cfg(self, values):
-        for k in ("max_wafers", "auto_clear"):
+        new = dict(self.cfg)
+        for k in ("max_wafers", "auto_clear", "soft_down_ms"):
             if k in values:
-                self.cfg[k] = int(values[k]) if k == "max_wafers" else bool(values[k])
+                new[k] = bool(values[k]) if k == "auto_clear" else int(values[k])
+        if not 0 < new["soft_down_ms"] < self.hard_ms[0]:
+            raise ValueError(f"소프트 컨택 내림 시간은 0보다 크고 하드 컨택({self.hard_ms[0]}ms)보다 작아야 합니다")
+        self.cfg = new
         PIPELINE_FILE.parent.mkdir(exist_ok=True)
         PIPELINE_FILE.write_text(json.dumps(self.cfg), encoding="utf-8")
 
@@ -212,22 +234,35 @@ class Pipeline:
 
     def status(self):
         app = self.app
-        return dict(self.state, cfg=self.cfg,
+        down, up = self.z_ms()
+        return dict(self.state, cfg=self.cfg, mode=self.mode, mode_name=self.MODES[self.mode],
+                    z_down_ms=down, z_up_ms=up, hard_down_ms=self.hard_ms[0],
                     fine=dict(phase=app.phase, status=app.status, auto_running=app.auto_running,
                               mask=app.mask_detected, wafer=app.wafer_detected),
                     transfer=dict(running=self.seq.state["running"], current=self.seq.state["current"],
                                   error=self.seq.state["error"]))
 
+    def z_ms(self):
+        if self.mode == "soft":
+            ms = int(self.cfg["soft_down_ms"])
+            return ms, ms
+        return self.hard_ms
+
     # ---- 시작·정지 ----
-    def start(self):
+    def start(self, mode="hard"):
+        if mode not in self.MODES:
+            raise ValueError(f"알 수 없는 모드 {mode!r}")
         if self.thread and self.thread.is_alive():
             raise RuntimeError("연속 운전이 이미 실행 중")
         if self.seq.state["running"]:
             raise RuntimeError("이송 시퀀스가 실행 중입니다")
         if not self.board.port:
             raise RuntimeError("먼저 아두이노 포트를 연결하세요")
+        self.mode = mode
         self.stop_evt.clear()
         self.state.update(running=True, error=None, phase="시작")
+        down, up = self.z_ms()
+        self._log(f"연속 운전 시작: {self.MODES[mode]} (마스크 판 내림 {down}ms · 올림 {up}ms)")
         self.thread = threading.Thread(target=self._run, name="pipeline", daemon=True)
         self.thread.start()
 
@@ -274,10 +309,24 @@ class Pipeline:
                                                  at=time.strftime("%H:%M:%S")))
             self._log(f"정밀 얼라인 {'완료' if ok else '실패'}: {app.status}")
             if not ok:
-                raise RuntimeError(f"정밀 얼라인 실패 — 연속 운전을 멈춥니다: {app.status}")
+                raise AlignFailed(f"정밀 얼라인 실패 — 연속 운전을 멈춥니다: {app.status}")
+
+    def align_only(self, mode="hard"):
+        """스테이지에 이미 놓인 웨이퍼 하나만 정밀 얼라인 (컨택 모드 적용, 이송 없음)."""
+        if mode not in self.MODES:
+            raise ValueError(f"알 수 없는 모드 {mode!r}")
+        if self.thread and self.thread.is_alive():
+            raise RuntimeError("연속 운전이 실행 중")
+        self.mode = mode
+        self.stop_evt.clear()
+        down, up = self.z_ms()
+        self._log(f"정밀 얼라인만: {self.MODES[mode]} (마스크 판 내림 {down}ms · 올림 {up}ms)")
+        self._start_fine()
 
     def _start_fine(self):
         app = self.app
+        if self.z_setter:
+            self.z_setter(*self.z_ms())
         self.state["phase"] = "정밀 얼라인 START"
         deadline = time.time() + self.cfg["start_timeout_s"]
         while time.time() < deadline:
@@ -306,6 +355,8 @@ class Pipeline:
                         self._wait(lambda: self._fine_idle(), "정밀 얼라인 종료 대기")
                         self._note_align_result()
                         self._transfer(MEASURE_STEPS, "각도 측정 (8단계)")
+                    except AlignFailed:
+                        raise
                     except RuntimeError as exc:
                         if "웨이퍼" in str(exc) and ("검출" in str(exc) or "못" in str(exc)):
                             self._log(f"웨이퍼를 찾지 못함 → 박스가 빈 것으로 보고 종료: {exc}")
@@ -366,7 +417,13 @@ class StationHandler(panel.Handler):
             data = json.loads(self.rfile.read(n) or b"{}")
             try:
                 if self.path == "/pipeline/start":
-                    PIPE.start()
+                    if "soft_down_ms" in data:
+                        PIPE.save_cfg({"soft_down_ms": data["soft_down_ms"]})
+                    PIPE.start(data.get("mode", "hard"))
+                elif self.path == "/pipeline/align":
+                    if "soft_down_ms" in data:
+                        PIPE.save_cfg({"soft_down_ms": data["soft_down_ms"]})
+                    PIPE.align_only(data.get("mode", "hard"))
                 elif self.path == "/pipeline/stop":
                     PIPE.stop()
                 elif self.path == "/pipeline/cleared":
@@ -425,7 +482,8 @@ def main():
     ap.add_argument("--finish-px", type=float, default=1.0,
                     help="정밀 얼라인 완료: 마스크·웨이퍼 중심 차이 허용 px (calibration.json 기본 0.65)")
     ap.add_argument("--detector", default="yolo-2pair", help="정밀 얼라인 검출기 (mask_aligner_optimized_v4 --detector)")
-    ap.add_argument("--frame", default=None, help="정밀 카메라 해상도 WxH")
+    ap.add_argument("--frame", default="1920x1080",
+                    help="정밀 카메라 해상도 WxH. calibration.json(스텝/px)과 YOLO 키 크기가 1920x1080 기준")
     ap.add_argument("--skip-theta", action="store_true")
     ap.add_argument("--no-browser", action="store_true")
     a = ap.parse_args()
@@ -465,7 +523,10 @@ def main():
     for c in panel.CAMS.state():
         print(f"  카메라 {c['index']}:", c["error"] or "열림")
 
-    PIPE = Pipeline(seq, app, panel.BOARD)
+    def set_align_z(down, up):
+        fine.ALIGN_Z_DOWN_MS, fine.ALIGN_Z_UP_MS = int(down), int(up)
+    PIPE = Pipeline(seq, app, panel.BOARD, z_setter=set_align_z,
+                    hard_ms=(fine.ALIGN_Z_DOWN_MS, fine.ALIGN_Z_UP_MS))
     FINE_PORT = a.fine_http
 
     fine_srv = ThreadingHTTPServer(("127.0.0.1", a.fine_http), fine.RequestHandler)

@@ -379,3 +379,24 @@ def test_timing_requires_repeated_real_travel_in_both_directions(rig, monkeypatc
         assert abs(record["ms"]-expected)<=2
         assert len(record["samples"])==2
     assert quarter_turn.read_timing(cfg)["directions"]["-1"]["ms"] == 630
+
+
+def test_cross_side_turn_flips_when_crosses_would_end_on_far_side():
+    """각도는 0~180°라 축만 맞추면 십자가 마스크 반대쪽에 갈 수 있다 → 180° 반대로 돌린다."""
+    from tools.key_prealign import cross_side_turn
+    assert cross_side_turn(-4.24, (72.3, -118.4), 1, -1) == -4.24          # 이미 위쪽
+    assert cross_side_turn(-2.84, (-65.4, 120.5), 1, -1) == 177.16         # 아래쪽 → 뒤집기
+    assert cross_side_turn(-51.86, (-134.7, 23.4), 1, -1) == 128.14        # 축만 맞추면 아래로 감
+    assert cross_side_turn(30.0, (0, -100), 1, -1) == 30.0
+
+
+def test_wafer_disc_rejects_frames_without_a_wafer():
+    import numpy as np
+    from tools.key_prealign import wafer_disc
+    import cv2
+    blank = np.full((480, 640, 3), 60, np.uint8)
+    assert wafer_disc(blank) is None
+    disc = blank.copy()
+    cv2.circle(disc, (400, 280), 185, (235, 235, 235), -1)
+    found = wafer_disc(disc)
+    assert found is not None and abs(found[0] - 400) < 6 and abs(found[1] - 280) < 6

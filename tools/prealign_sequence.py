@@ -21,9 +21,9 @@ AXIS_OF = {}                # 명령 글자 -> 축 이름
 
 
 def load(path=CONFIG):
-    cfg = json.loads(Path(path).read_text())
+    cfg = json.loads(Path(path).read_text(encoding="utf-8"))
     if CALIBRATION.is_file():
-        cfg["prealign"].update(calibration(json.loads(CALIBRATION.read_text())))
+        cfg["prealign"].update(calibration(json.loads(CALIBRATION.read_text(encoding="utf-8"))))
     for name, ax in cfg["axes"].items():
         AXIS_OF[ax["plus"]] = AXIS_OF[ax["minus"]] = name
     return cfg
@@ -47,7 +47,7 @@ def calibration(data):
 def save_calibration(data):
     values = calibration(data)
     CALIBRATION.parent.mkdir(exist_ok=True)
-    with NamedTemporaryFile("w", dir=CALIBRATION.parent, delete=False) as f:
+    with NamedTemporaryFile("w", dir=CALIBRATION.parent, delete=False, encoding="utf-8") as f:
         json.dump(values, f)
     Path(f.name).replace(CALIBRATION)
 

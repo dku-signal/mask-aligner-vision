@@ -95,7 +95,7 @@ def main():
 
     cal = ROOT/'calibration.json'
     if cal.is_file():
-        data = json.loads(cal.read_text())
+        data = json.loads(cal.read_text(encoding='utf-8'))
         report('PASS', 'calibration.json', f'measured {data.get("_measured_at", "?")}')
     else:
         report('WARN', 'calibration.json missing', 'run: python calibrate_xy.py --zero, then python calibrate_xy.py')

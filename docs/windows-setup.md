@@ -69,10 +69,10 @@ Invoke-WebRequest https://github.com/dku-signal/mask-aligner-vision/releases/dow
 ## 5. 장비 없이 설치 확인
 
 ```powershell
-python -m pytest -q
+python -m pytest -q tests
 ```
 
-`62 passed`가 나오면 코드와 패키지는 준비된 것입니다.
+`62 passed`가 나오면 코드와 패키지는 준비된 것입니다. 끝에 `tests`를 빼면 가상환경 안의 다른 패키지 시험까지 돌아 실패가 섞여 나옵니다.
 
 ```powershell
 python tools\station.py --mock --cameras --fine-camera 9

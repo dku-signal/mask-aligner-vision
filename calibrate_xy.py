@@ -220,7 +220,7 @@ def main():
         rig.close()
     cal['_report'] = report
     cal['_measured_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
-    OUT.write_text(json.dumps(cal, indent=2, ensure_ascii=False))
+    OUT.write_text(json.dumps(cal, indent=2, ensure_ascii=False), encoding='utf-8')
     print(json.dumps(cal, indent=2, ensure_ascii=False))
     for a, r in report.items():
         print(f'Arduino {a}: 1 step = {r["px_per_step"]:.4f} px -> 1000 steps = {1000*r["px_per_step"]:.0f} px '

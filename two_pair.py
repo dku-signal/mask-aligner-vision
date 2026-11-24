@@ -110,7 +110,7 @@ class TwoPairKeys(MaskPairGeometry):
         try:
             if not KEEP_MASK:
                 raise OSError
-            d = json.loads(MASK_FILE.read_text())
+            d = json.loads(MASK_FILE.read_text(encoding='utf-8'))
             self.saved = dict(groups=tuple(np.array(g) for g in d['groups']), squares=np.array(d['squares']),
                               boxes=np.array(d['boxes']), axis=np.array(d['axis']), size=d['size'],
                               keys=[np.array(k) for k in d['keys']])
@@ -165,7 +165,7 @@ class TwoPairKeys(MaskPairGeometry):
             try:
                 MASK_FILE.parent.mkdir(exist_ok=True)
                 MASK_FILE.write_text(json.dumps({k: (np.asarray(v).tolist() if k != 'groups' else [g.tolist() for g in v])
-                                                 for k, v in mask.items()}))
+                                                 for k, v in mask.items()}), encoding='utf-8')
             except OSError:
                 pass
         # All 8 squares (also the ones filled in), slightly enlarged: they are no part of a cross.

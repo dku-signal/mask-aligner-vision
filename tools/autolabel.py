@@ -97,7 +97,7 @@ def main():
         if not meta_path.is_file():
             print(f'skip {folder}: no frames.jsonl')
             continue
-        metas = [json.loads(l) for l in meta_path.read_text().splitlines() if l.strip()]
+        metas = [json.loads(l) for l in meta_path.read_text(encoding='utf-8').splitlines() if l.strip()]
         for i, meta in enumerate(metas):
             if meta.get('moving'):
                 stats['moving'] += 1
@@ -117,7 +117,7 @@ def main():
             last = blocks < args.val_every and blocks > 1 and block == blocks-1
             split = 'val' if block % args.val_every == args.val_every-1 or last else 'train'
             shutil.copy(folder/meta['file'], out/'images'/split/f'{name}.jpg')
-            (out/'labels'/split/f'{name}.txt').write_text('\n'.join(lines)+'\n')
+            (out/'labels'/split/f'{name}.txt').write_text('\n'.join(lines)+'\n', encoding='utf-8')
             stats[split] += 1
             if len(tiles) < 2000:
                 tile = cv2.resize(draw(frame, boxes), (320, 240))
@@ -125,8 +125,8 @@ def main():
                 tiles.append(tile)
 
     (out/'data.yaml').write_text(f'path: {out}\ntrain: images/train\nval: images/val\n'
-                                 'names:\n  0: square\n  1: cross\n')
-    (out/'unlabelled.txt').write_text('\n'.join(unlabelled)+('\n' if unlabelled else ''))
+                                 'names:\n  0: square\n  1: cross\n', encoding='utf-8')
+    (out/'unlabelled.txt').write_text('\n'.join(unlabelled)+('\n' if unlabelled else ''), encoding='utf-8')
     for k in range(0, len(tiles), SHEET_TILES):
         chunk = tiles[k:k+SHEET_TILES]
         chunk += [np.zeros_like(tiles[0])]*(SHEET_TILES-len(chunk))

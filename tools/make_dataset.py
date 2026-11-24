@@ -114,7 +114,7 @@ def write_split(name, n, seed):
         frame, labels, _ = render(rng)
         cv2.imwrite(str(img_dir/f'{i:05d}.png'), frame)
         (lbl_dir/f'{i:05d}.txt').write_text(
-            ''.join(f'{c} {x:.6f} {y:.6f} {w:.6f} {h:.6f}\n' for c, x, y, w, h in labels))
+            ''.join(f'{c} {x:.6f} {y:.6f} {w:.6f} {h:.6f}\n' for c, x, y, w, h in labels), encoding='utf-8')
 
 
 def main():
@@ -125,7 +125,7 @@ def main():
     write_split('train', args.train, 1)
     write_split('val', args.val, 2)
     (ROOT/'dataset.yaml').write_text(
-        f'path: {ROOT/"dataset"}\ntrain: images/train\nval: images/val\nnames:\n  0: square\n  1: cross\n')
+        f'path: {ROOT/"dataset"}\ntrain: images/train\nval: images/val\nnames:\n  0: square\n  1: cross\n', encoding='utf-8')
     print(f'wrote {args.train}+{args.val} frames to {ROOT/"dataset"}')
 
 

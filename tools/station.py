@@ -193,7 +193,7 @@ class Pipeline:
         self.cleared = threading.Event()
         self.cfg = dict(max_wafers=0, auto_clear=False, start_timeout_s=20.0)
         try:
-            self.cfg.update(json.loads(PIPELINE_FILE.read_text()))
+            self.cfg.update(json.loads(PIPELINE_FILE.read_text(encoding="utf-8")))
         except Exception:
             pass
         self.state = dict(running=False, phase="대기", error=None, log=[],
@@ -204,7 +204,7 @@ class Pipeline:
             if k in values:
                 self.cfg[k] = int(values[k]) if k == "max_wafers" else bool(values[k])
         PIPELINE_FILE.parent.mkdir(exist_ok=True)
-        PIPELINE_FILE.write_text(json.dumps(self.cfg))
+        PIPELINE_FILE.write_text(json.dumps(self.cfg), encoding="utf-8")
 
     def _log(self, s):
         self.state["log"].insert(0, time.strftime("%H:%M:%S ") + s)

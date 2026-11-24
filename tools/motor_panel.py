@@ -126,13 +126,13 @@ class Ledger:
         self.d = {"pos": {"x_rail": 0, "y_rail": 0, "align_x": 0, "align_y": 0},
                   "servo_ms": {"t": 0, "A": 0}, "home": None, "box_x": None, "align_left": None}
         try:
-            self.d.update(json.loads(LEDGER_FILE.read_text()))
+            self.d.update(json.loads(LEDGER_FILE.read_text(encoding="utf-8")))
         except Exception:
             pass
 
     def save(self):
         LEDGER_FILE.parent.mkdir(exist_ok=True)
-        LEDGER_FILE.write_text(json.dumps(self.d, indent=1))
+        LEDGER_FILE.write_text(json.dumps(self.d, indent=1), encoding="utf-8")
 
     def apply(self, c, n, servo_dir=1):
         with self.lock:

@@ -1834,8 +1834,8 @@ class MaskAlignerApp:
         if not cap.isOpened():
             cap.release()
             return None
-        if sys.platform == 'darwin':
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        # MJPG everywhere: uncompressed YUY2 from several cameras on one USB hub starves the others on Windows.
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
         if sys.platform != 'darwin':

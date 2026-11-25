@@ -439,7 +439,11 @@ class CameraCapture:
     """한 카메라를 백그라운드 스레드로 계속 읽고 최신 프레임(BGR)만 보관한다."""
 
     def __init__(self, index, size):
-        self.cap = cv2.VideoCapture(index)
+        # 정밀 앱과 같은 백엔드로 연다. 윈도우는 MSMF와 DirectShow의 카메라 번호가 다를 수 있다.
+        self.cap = cv2.VideoCapture(index, cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY)
+        if not self.cap.isOpened():
+            self.cap.release()
+            self.cap = cv2.VideoCapture(index)
         if not self.cap.isOpened():
             raise RuntimeError(f"Camera {index} did not open")
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))

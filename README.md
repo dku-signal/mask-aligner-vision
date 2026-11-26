@@ -30,6 +30,14 @@ Lab-Linked 캡스톤 디자인 · Team Si-gnal · 2026
 
 ## 실제 장비와 인식 화면
 
+### 최신 시연 영상 · 정밀 얼라인 v4
+
+[![정밀 얼라인 v4 시연 · θ → X/Y 정렬 완료 화면](docs/images/demo-v4-finish.jpg)](docs/media/alignment-demo-v4.mp4)
+
+**[▶ 시연 영상 보기 · 36초](docs/media/alignment-demo-v4.mp4)** · 마스크 키 두 쌍과 웨이퍼 키를 찾아 **θ 회전 → X/Y 위치**를 맞추고, 정렬 완료 시 중심 오차 dx −0.12 px · dy 0.97 px까지 들어온 화면입니다.
+
+### 초기 시연 영상
+
 [![X/Y/θ 자동 정렬 시연 · 4배속 미리보기](docs/media/alignment-preview.gif)](docs/media/alignment-demo.mp4)
 
 **[▶ 전체 시연 영상 보기 · 74초](docs/media/alignment-demo.mp4)** · 위 미리보기는 원본 12–70초 구간의 4배속입니다.

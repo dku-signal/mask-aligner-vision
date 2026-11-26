@@ -32,9 +32,9 @@ Lab-Linked 캡스톤 디자인 · Team Si-gnal · 2026
 
 ### 최신 시연 영상 · 정밀 얼라인 v4
 
-[![정밀 얼라인 v4 시연 · θ → X/Y 정렬 완료 화면](docs/images/demo-v4-finish.jpg)](docs/media/alignment-demo-v4.mp4)
+![정밀 얼라인 v4 시연 · 2배속 미리보기](docs/media/alignment-demo-v4-preview.gif)
 
-**[▶ 시연 영상 보기 · 36초](docs/media/alignment-demo-v4.mp4)** · 마스크 키 두 쌍과 웨이퍼 키를 찾아 **θ 회전 → X/Y 위치**를 맞추고, 정렬 완료 시 중심 오차 dx −0.12 px · dy 0.97 px까지 들어온 화면입니다.
+**[▶ 원본 영상 받기 · 36초](https://github.com/dku-signal/mask-aligner-vision/raw/main/docs/media/alignment-demo-v4.mp4)** · 위 미리보기는 2배속입니다. 마스크 키 두 쌍과 웨이퍼 키를 찾아 **θ 회전 → X/Y 위치**를 맞추고, 정렬 완료 시 중심 오차 dx −0.12 px · dy 0.97 px까지 들어온 화면입니다.
 
 ### 초기 시연 영상
 

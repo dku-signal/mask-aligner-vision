@@ -446,9 +446,10 @@ class CameraCapture:
             self.cap = cv2.VideoCapture(index)
         if not self.cap.isOpened():
             raise RuntimeError(f"Camera {index} did not open")
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        # Size first: on DirectShow a later size change resets the format to YUY2.
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, size[0])
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, size[1])
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.sample, self.error = None, None
         self.closed = threading.Event()

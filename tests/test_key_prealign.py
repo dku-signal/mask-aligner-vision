@@ -47,7 +47,8 @@ def test_preview_uses_yolo_classes_and_restores_crop_coordinates():
     frame = np.zeros((240, 320, 3), np.uint8)
     result = model.measure(SimpleNamespace(fresh_frames=lambda ids: [frame, frame]), cfg, True)
     assert [role for _,role in calls] == [[0],[1],[1]]
-    assert calls[0][0] == (120,128)     # 마스크 roi 0.45~0.85 x 0.05~0.55 of 320x240
+    x0, y0, x1, y1 = cfg["mask"]["roi"]    # 마스크 roi crop of 320x240
+    assert calls[0][0] == (round(y1*240) - round(y0*240), round(x1*320) - round(x0*320))
     assert abs(result["turn_deg"]) == 90 and result["wafer"]["jpeg"] and result["mask"]["jpeg"]
 
 

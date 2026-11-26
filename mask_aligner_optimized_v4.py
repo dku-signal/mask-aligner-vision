@@ -1835,9 +1835,10 @@ class MaskAlignerApp:
             cap.release()
             return None
         # MJPG everywhere: uncompressed YUY2 from several cameras on one USB hub starves the others on Windows.
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        # Size first: on DirectShow a later size change resets the format to YUY2.
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         if sys.platform != 'darwin':
             cap.set(cv2.CAP_PROP_FPS, 30)
         # Best effort only: some DirectShow drivers ignore this property.
